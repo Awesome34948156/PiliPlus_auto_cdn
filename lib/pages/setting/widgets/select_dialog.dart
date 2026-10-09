@@ -7,6 +7,7 @@ import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
+import 'package:PiliPlus/utils/extension/iterable_ext.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:dio/dio.dart';
@@ -71,6 +72,19 @@ class SelectDialog<T> extends StatelessWidget {
   }
 }
 
+/// Phase 1 screens every mirror for reachability with a small sample and a
+/// short deadline, running [_kProbeConcurrency] at a time.
+const _kProbeConcurrency = 6;
+const _kProbeBytes = 256 * 1024;
+const _kProbeMicros = 3 * 1000 * 1000;
+const _kProbeConnect = Duration(seconds: 3);
+const _kProbeReceive = Duration(seconds: 3);
+
+/// Phase 2 measures the survivors one at a time so the reported MB/s stays
+/// comparable to a single-stream playback.
+const _kMeasureBytes = 2 * 1024 * 1024;
+const _kMeasureMicros = 8 * 1000 * 1000;
+
 class CdnSelectDialog extends StatefulWidget {
   final BaseItem? sample;
 
@@ -87,6 +101,14 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   late final List<ValueNotifier<String?>> _cdnResList;
   late final List<CancelToken?> _tokens;
   late final bool _cdnSpeedTest;
+  late final ValueNotifier<(int, int)> _progress;
+
+  /// Probe outcome per `CDNService` index; `false` means unreachable.
+  late final List<bool> _alive;
+
+  /// [State.mounted] stays true while [dispose] runs, so a cancel-triggered
+  /// callback could otherwise write to a just-disposed [ValueNotifier].
+  bool _disposed = false;
 
   @override
   void initState() {
@@ -109,6 +131,8 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
         (_) => ValueNotifier<String?>(null),
       );
       _tokens = List.generate(length, (_) => CancelToken());
+      _progress = ValueNotifier<(int, int)>((0, 0));
+      _alive = List<bool>.filled(length, false);
       _startSpeedTest();
     }
     super.initState();
@@ -117,15 +141,22 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   @override
   void dispose() {
     if (_cdnSpeedTest) {
+      _disposed = true;
       for (final e in _tokens) {
         e?.cancel();
       }
       for (final notifier in _cdnResList) {
         notifier.dispose();
       }
+      _progress.dispose();
       _dio.close(force: true);
     }
     super.dispose();
+  }
+
+  void _setProgress(int done, int total) {
+    if (_disposed) return;
+    _progress.value = (done, total);
   }
 
   Future<BaseItem> _getSampleUrl() async {
@@ -151,81 +182,163 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   }
 
   Future<void> _testAllCdnServices(BaseItem videoItem) async {
-    for (final item in CDNService.values) {
-      if (!mounted) break;
-      await _testSingleCdn(item, videoItem);
+    // _startSpeedTest awaits the sample fetch first, so the dialog may already
+    // be gone by the time we get here.
+    if (_disposed || !mounted) return;
+    // playUrls is a lazy sync* generator; materialize it once.
+    final urls = videoItem.playUrls.toList();
+    // baseUrl/backupUrl carry no host and are not real mirrors, so there is
+    // nothing to probe.
+    final candidates = CDNService.values
+        .where((e) => e.host != null)
+        .toList(growable: false);
+
+    if (urls.isEmpty) {
+      for (final e in candidates) {
+        _cdnResList[e.index].value = '无法获取视频流';
+      }
+      return;
+    }
+
+    // Phase 1: screen every mirror for reachability, concurrently.
+    _setProgress(0, candidates.length);
+    var done = 0;
+    for (final chunk in candidates.mapChunked(
+      _kProbeConcurrency,
+      (e) => _probeSingle(e, urls),
+    )) {
+      if (_disposed || !mounted) return;
+      for (final (item, alive) in await Future.wait(chunk)) {
+        _alive[item.index] = alive;
+        _cdnResList[item.index].value = alive ? '待测速' : '连接失败';
+      }
+      done += chunk.length;
+      _setProgress(done, candidates.length);
+    }
+    if (_disposed || !mounted) return;
+
+    // Phase 2: measure the survivors one at a time at full bandwidth.
+    final survivors = candidates
+        .where((e) => _alive[e.index])
+        .toList(growable: false);
+    _setProgress(0, survivors.length);
+    var measured = 0;
+    for (final item in survivors) {
+      if (_disposed || !mounted) return;
+      await _testSingleCdn(item, urls);
+      _setProgress(++measured, survivors.length);
+    }
+    _setProgress(0, 0);
+  }
+
+  Future<(CDNService, bool)> _probeSingle(
+    CDNService item,
+    List<String> urls,
+  ) async {
+    try {
+      final url = VideoUtils.getCdnUrl(urls, defaultCDNService: item);
+      if (url.isEmpty) return (item, false);
+      final res = await _measureDownloadSpeed(
+        url,
+        item.index,
+        maxBytes: _kProbeBytes,
+        maxMicros: _kProbeMicros,
+        connectTimeout: _kProbeConnect,
+        receiveTimeout: _kProbeReceive,
+      );
+      return (item, res != null);
+    } catch (e) {
+      if (kDebugMode) debugPrint('CDN probe error [${item.name}]: $e');
+      return (item, false);
     }
   }
 
-  Future<void> _testSingleCdn(CDNService item, BaseItem videoItem) async {
+  Future<void> _testSingleCdn(CDNService item, List<String> urls) async {
+    final index = item.index;
     try {
-      final cdnUrl = VideoUtils.getCdnUrl(
-        videoItem.playUrls,
-        defaultCDNService: item,
+      final cdnUrl = VideoUtils.getCdnUrl(urls, defaultCDNService: item);
+      if (cdnUrl.isEmpty) throw Exception('无法获取视频流');
+      _cdnResList[index].value = '测速中…';
+      final res = await _measureDownloadSpeed(
+        cdnUrl,
+        index,
+        maxBytes: _kMeasureBytes,
+        maxMicros: _kMeasureMicros,
       );
-      await _measureDownloadSpeed(cdnUrl, item.index);
+      if (res == null) throw TimeoutException('测速超时');
+      _updateSpeedResult(index, res.$1, res.$2);
     } catch (e) {
-      _handleSpeedTestError(e, item.index);
+      _handleSpeedTestError(e, index);
     }
   }
 
   late final Dio _dio;
 
-  Future<void> _measureDownloadSpeed(String url, int index) async {
-    const maxSize = 8 * 1024 * 1024;
-    int downloaded = 0;
-
-    final cancelToken = _tokens[index];
+  /// Returns `(bytes downloaded, elapsed microseconds)`, or null when nothing
+  /// arrived. Aborting at a cap is a normal result; a genuine network failure
+  /// rethrows.
+  Future<(int, int)?> _measureDownloadSpeed(
+    String url,
+    int index, {
+    required int maxBytes,
+    required int maxMicros,
+    Duration? connectTimeout,
+    Duration? receiveTimeout,
+  }) async {
+    var downloaded = 0;
+    var stopped = false;
+    final cancelToken = _tokens[index] = CancelToken();
     final start = DateTime.now().microsecondsSinceEpoch;
 
-    void onClose() {
-      cancelToken?.cancel();
-      _tokens[index] = null;
+    void stop() {
+      stopped = true;
+      cancelToken.cancel();
     }
 
-    await _dio.get(
-      url,
-      cancelToken: cancelToken,
-      onReceiveProgress: (count, total) {
-        if (!mounted) {
-          return;
-        }
-
-        final duration = DateTime.now().microsecondsSinceEpoch - start;
-
-        downloaded = count;
-
-        if (duration > 15000000) {
-          onClose();
-          if (downloaded > 0) {
-            _updateSpeedResult(index, downloaded, duration);
-            downloaded = 0;
-          } else {
-            throw TimeoutException('测速超时');
+    try {
+      await _dio.get(
+        url,
+        cancelToken: cancelToken,
+        options: Options(
+          connectTimeout: connectTimeout,
+          receiveTimeout: receiveTimeout,
+        ),
+        onReceiveProgress: (count, _) {
+          if (_disposed || !mounted) {
+            stop();
+            return;
           }
-        } else if (downloaded >= maxSize) {
-          onClose();
-          _updateSpeedResult(index, downloaded, duration);
-          downloaded = 0;
-        }
-      },
-    );
+          downloaded = count;
+          final duration = DateTime.now().microsecondsSinceEpoch - start;
+          if (duration > maxMicros || downloaded >= maxBytes) {
+            stop();
+          }
+        },
+      );
+    } on DioException {
+      // Cancelling ourselves is not a failure.
+      if (!stopped) rethrow;
+    }
+
+    if (downloaded <= 0) return null;
+    return (downloaded, DateTime.now().microsecondsSinceEpoch - start);
   }
 
   void _updateSpeedResult(int index, int downloaded, int duration) {
+    // A dismissal mid-transfer still yields a non-null result, so guard here
+    // rather than at the call site.
+    if (_disposed || !mounted) return;
     final speed = (downloaded / duration).toStringAsPrecision(3);
     _cdnResList[index].value = '${speed}MB/s';
   }
 
   void _handleSpeedTestError(dynamic error, int index) {
+    if (_disposed || !mounted) return;
     _tokens
       ..[index]?.cancel()
       ..[index] = null;
-    final item = _cdnResList[index];
-    if (item.value != null) return;
 
     if (kDebugMode) debugPrint('CDN speed test error: $error');
-    if (!mounted) return;
     String message;
     if (error is DioException) {
       final statusCode = error.response?.statusCode;
@@ -240,13 +353,28 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     if (message.isEmpty) {
       message = '测速失败';
     }
-    item.value = message;
+    _cdnResList[index].value = message;
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!_cdnSpeedTest) {
+      return _buildDialog('CDN 设置');
+    }
+    return ValueListenableBuilder<(int, int)>(
+      valueListenable: _progress,
+      builder: (context, progress, _) {
+        final (done, total) = progress;
+        return _buildDialog(
+          total == 0 ? 'CDN 设置' : 'CDN 设置 (测速中 $done/$total)',
+        );
+      },
+    );
+  }
+
+  Widget _buildDialog(String title) {
     return SelectDialog<CDNService>(
-      title: 'CDN 设置',
+      title: title,
       values: CDNService.values.map((i) => (i, i.desc)).toList(),
       value: VideoUtils.cdnService,
       subtitleBuilder: _cdnSpeedTest
