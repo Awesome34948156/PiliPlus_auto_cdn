@@ -37,10 +37,15 @@ jobs:
       - name: Build iOS
         run: |
           flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub
-          ln -sf ./build/ios/iphoneos Payload
+          # `Payload` must be a real directory so it lands in the archive as the
+          # first entry; a canonical ipa always starts with `Payload/`, and some
+          # installers reject an archive whose first entry is `Payload/Runner.app/`.
+          # zip follows the inner symlink, so the app is still stored as real files.
+          mkdir -p Payload
+          ln -sf "$PWD/build/ios/iphoneos/Runner.app" Payload/Runner.app
           # make AltSign happy...
           find Payload/Runner.app/Frameworks -type d -name "*.framework" -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
-          zip -r9 PiliPlus_ios_${{env.version}}.ipa Payload/Runner.app
+          zip -r9 PiliPlus_ios_${{env.version}}.ipa Payload
 
       - name: Release
         if: ${{ github.event.inputs.tag != '' }}
