@@ -871,12 +871,24 @@ class VideoDetailController extends GetxController
     final limit = await ConnectivityUtils.isWiFi
         ? CdnSpeedTest.autoCandidatesWifi
         : CdnSpeedTest.autoCandidatesCell;
+
+    // 轮换窗口起点，否则永远只测 enum 头部那几个镜像，尾部轮不到。
+    // 起点持久化：控制器随页面销毁，onReset(换P) 也会清状态，轮换要跨这些事件累积。
+    final offset = Pref.cdnMirrorRotation % candidates.length;
+    if (offset != 0) {
+      candidates
+        ..addAll(candidates.sublist(0, offset))
+        ..removeRange(0, offset);
+    }
     if (candidates.length > limit) {
       candidates.removeRange(limit, candidates.length);
     }
+    Pref.cdnMirrorRotation =
+        (Pref.cdnMirrorRotation + limit) % CdnSpeedTest.mirrors.length;
+
     debugPrint(
       'CDN 自动切换: 测速 ${candidates.length} 个候选 '
-      '${candidates.map((e) => e.desc).join(', ')}',
+      '(轮换起点 $offset) ${candidates.map((e) => e.desc).join(', ')}',
     );
 
     // 无论测速成功与否，这一轮候选都不再重复测。

@@ -250,6 +250,7 @@ abstract final class LocalCacheKey {
       danmakuFilterRules = 'danmakuFilterRules',
       mixinKey = 'mixinKey',
       timeStamp = 'timeStamp',
+      cdnMirrorRotation = 'cdnMirrorRotation',
       buvid = 'buvid';
 }
 

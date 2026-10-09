@@ -69,6 +69,14 @@ abstract final class Pref {
   static set blackMids(Set<int> blackMidsSet) =>
       _localCache.put(LocalCacheKey.blackMids, blackMidsSet);
 
+  /// 自动切换 CDN 时测速窗口的轮换起点。存在 localCache 而不是 setting：这是
+  /// 内部状态，不是用户设置。
+  static int get cdnMirrorRotation =>
+      _localCache.get(LocalCacheKey.cdnMirrorRotation, defaultValue: 0);
+
+  static set cdnMirrorRotation(int value) =>
+      _localCache.put(LocalCacheKey.cdnMirrorRotation, value);
+
   static RuleFilter get danmakuFilterRule => _localCache.get(
     LocalCacheKey.danmakuFilterRules,
     defaultValue: RuleFilter.empty(),
