@@ -7,6 +7,7 @@ import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
+import 'package:PiliPlus/utils/cdn_speed_test.dart';
 import 'package:PiliPlus/utils/extension/iterable_ext.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
@@ -284,44 +285,17 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     required int maxMicros,
     Duration? connectTimeout,
     Duration? receiveTimeout,
-  }) async {
-    var downloaded = 0;
-    var stopped = false;
-    final cancelToken = _tokens[index] = CancelToken();
-    final start = DateTime.now().microsecondsSinceEpoch;
-
-    void stop() {
-      stopped = true;
-      cancelToken.cancel();
-    }
-
-    try {
-      await _dio.get(
-        url,
-        cancelToken: cancelToken,
-        options: Options(
-          connectTimeout: connectTimeout,
-          receiveTimeout: receiveTimeout,
-        ),
-        onReceiveProgress: (count, _) {
-          if (_disposed || !mounted) {
-            stop();
-            return;
-          }
-          downloaded = count;
-          final duration = DateTime.now().microsecondsSinceEpoch - start;
-          if (duration > maxMicros || downloaded >= maxBytes) {
-            stop();
-          }
-        },
-      );
-    } on DioException {
-      // Cancelling ourselves is not a failure.
-      if (!stopped) rethrow;
-    }
-
-    if (downloaded <= 0) return null;
-    return (downloaded, DateTime.now().microsecondsSinceEpoch - start);
+  }) {
+    return CdnSpeedTest.measure(
+      _dio,
+      url,
+      _tokens[index] = CancelToken(),
+      maxBytes: maxBytes,
+      maxMicros: maxMicros,
+      connectTimeout: connectTimeout,
+      receiveTimeout: receiveTimeout,
+      isCancelled: () => _disposed || !mounted,
+    );
   }
 
   void _updateSpeedResult(int index, int downloaded, int duration) {

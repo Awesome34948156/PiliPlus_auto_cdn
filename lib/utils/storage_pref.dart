@@ -276,7 +276,11 @@ abstract final class Pref {
 
   static CDNService get defaultCDNService {
     if (_setting.get(SettingBoxKey.CDNService) case final String cdnName) {
-      return CDNService.values.byName(cdnName);
+      // 镜像列表会增删，历史存档里的名字可能已经不存在了。不能直接用
+      // values.byName —— 未知名字会抛异常，而这里是每次打开视频都会走的路径。
+      for (final service in CDNService.values) {
+        if (service.name == cdnName) return service;
+      }
     }
     return CDNService.backupUrl;
   }
@@ -443,6 +447,9 @@ abstract final class Pref {
 
   static bool get cdnSpeedTest =>
       _setting.get(SettingBoxKey.cdnSpeedTest, defaultValue: true);
+
+  static bool get autoSwitchCdnOnStall =>
+      _setting.get(SettingBoxKey.autoSwitchCdnOnStall, defaultValue: true);
 
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);

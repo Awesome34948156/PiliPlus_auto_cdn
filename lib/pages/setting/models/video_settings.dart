@@ -75,6 +75,13 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.cdnSpeedTest,
     defaultVal: true,
   ),
+  const SwitchModel(
+    title: '卡顿自动切换 CDN',
+    leading: Icon(Icons.swap_horiz),
+    subtitle: '播放卡顿时自动测速并切换到更快的 CDN，仅本次播放生效，不会修改默认 CDN 设置，注意流量消耗',
+    setKey: SettingBoxKey.autoSwitchCdnOnStall,
+    defaultVal: true,
+  ),
   SwitchModel(
     title: '音频不跟随 CDN 设置',
     subtitle: '直接采用备用 URL，可解决部分视频无声',

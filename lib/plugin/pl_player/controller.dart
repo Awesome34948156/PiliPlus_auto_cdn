@@ -185,6 +185,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   final RxBool isBuffering = true.obs;
 
+  /// 卡顿回调。播放器本身与 CDN 无关，只上报"播放状态下位置长时间不推进"
+  /// 这一事实，如何恢复由页面决定。每段冻结只触发一次。
+  ValueChanged<Duration>? onStall;
+
+  /// 位置连续冻结多少秒才算卡顿。普通重新缓冲一般 1~3 秒。
+  static const int _kStallSeconds = 8;
+
+  Timer? _stallTicker;
+  int _stallLastSecond = 0;
+  int _stallFrozen = 0;
+
   /// 全屏方向
   // ignore: unnecessary_getters_setters
   bool get isVertical => _isVertical;
@@ -1151,10 +1162,46 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
       }),
     ];
+    _startStallTicker();
+  }
+
+  /// 位置冻结看门狗。
+  ///
+  /// 不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
+  /// 这里要求位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
+  /// 也不能用 `progress`：seek 期间它返回 seekPosition，必须用原始的 [position]。
+  void _startStallTicker() {
+    _stallTicker?.cancel();
+    _stallLastSecond = position.value;
+    _stallFrozen = 0;
+    _stallTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (isLive ||
+          dataSource is FileSource ||
+          !playerStatus.isPlaying ||
+          isSeeking.value ||
+          _processing) {
+        _stallLastSecond = position.value;
+        _stallFrozen = 0;
+        return;
+      }
+      if (position.value != _stallLastSecond) {
+        _stallLastSecond = position.value;
+        _stallFrozen = 0;
+        return;
+      }
+      if (++_stallFrozen >= _kStallSeconds &&
+          isBuffering.value &&
+          buffered.value == 0) {
+        _stallFrozen = 0;
+        onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
+      }
+    });
   }
 
   /// 移除事件监听
   void _removeListeners() {
+    _stallTicker?.cancel();
+    _stallTicker = null;
     _subscriptions?.forEach((e) => e.cancel());
     _subscriptions?.clear();
     _subscriptions = null;

@@ -21,6 +21,7 @@ import 'package:PiliPlus/models/common/sponsor_block/post_segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_type.dart';
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/source_type.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
@@ -52,6 +53,7 @@ import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
 import 'package:PiliPlus/utils/accounts.dart';
+import 'package:PiliPlus/utils/cdn_speed_test.dart';
 import 'package:PiliPlus/utils/connectivity_utils.dart';
 import 'package:PiliPlus/utils/extension/context_ext.dart';
 import 'package:PiliPlus/utils/extension/iterable_ext.dart';
@@ -66,7 +68,7 @@ import 'package:PiliPlus/utils/theme_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:collection/collection.dart';
-import 'package:dio/dio.dart' show Options;
+import 'package:dio/dio.dart' show CancelToken, Dio, Options;
 import 'package:extended_nested_scroll_view/extended_nested_scroll_view.dart'
     show ExtendedNestedScrollViewState;
 import 'package:flutter/foundation.dart' show kDebugMode;
@@ -403,6 +405,8 @@ class VideoDetailController extends GetxController
       vsync: this,
       initialIndex: Pref.defaultShowComment ? 1 : 0,
     );
+
+    plPlayerController.onStall = _onPlayerStall;
   }
 
   Future<void> getMediaList({
@@ -684,6 +688,285 @@ class VideoDetailController extends GetxController
     }
 
     return bestVideo ?? videoList.first;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 卡顿自动切换 CDN
+  //
+  // 触发是纯反应式的：只有播放器的位置看门狗上报卡顿后才测速。卡住的播放器已经
+  // 不再下载，此时测速不会与播放争带宽，结果才可信；健康播放时测速反而会制造
+  // 我们要修的卡顿。
+  //
+  // session-only：绝不写 [VideoUtils.cdnService]，只把目标镜像作为
+  // `defaultCDNService` 显式传给 getCdnUrl，否则会静默改掉用户的手动设置。
+  // ---------------------------------------------------------------------------
+
+  /// 单次卡顿最多尝试几个镜像。
+  static const int _kCdnMaxAttempts = 3;
+
+  /// 切换后等待恢复的最长时间。
+  static const Duration _kCdnRecoverWindow = Duration(seconds: 12);
+
+  /// 切换后位置推进这么多即认为已恢复。
+  static const Duration _kCdnRecoverProgress = Duration(seconds: 2);
+
+  /// 放弃后冷却多久才允许再次自动切换。
+  static const Duration _kCdnGiveUpCooldown = Duration(seconds: 60);
+
+  /// 距上次尝试必须又真实播放了这么久，才允许新的尝试，避免死链无限重试。
+  static const Duration _kCdnMinReProgress = Duration(seconds: 3);
+
+  bool _cdnAutoBusy = false;
+  int _cdnAutoAttempts = 0;
+  int _cdnGeneration = 0;
+  final Set<CDNService> _cdnTried = {};
+  DateTime? _cdnCooldownUntil;
+  Duration _cdnLastAttemptPos = Duration.zero;
+  CDNService? _cdnAutoServiceSnapshot;
+  Dio? _cdnAutoDio;
+
+  bool get _cdnAutoEligible {
+    // 直播、本地文件、durl(edl://) 都不在范围内。
+    if (isFileSource || plPlayerController.isLive) return false;
+    if (data.dash == null) return false;
+    if (!Pref.autoSwitchCdnOnStall) return false;
+    // 听视频 + 音频不跟随 CDN 时，所有候选返回同一个原始 URL，测速没有意义。
+    if (plPlayerController.onlyPlayAudio.value && VideoUtils.disableAudioCDN) {
+      return false;
+    }
+    return true;
+  }
+
+  /// 换集、换 P、重置等用户动作都要让在途的自动切换失效。
+  void _resetCdnAutoSwitch() {
+    _cdnGeneration++;
+    _cdnAutoBusy = false;
+    _cdnAutoAttempts = 0;
+    _cdnTried.clear();
+    _cdnCooldownUntil = null;
+    _cdnLastAttemptPos = Duration.zero;
+    _cdnAutoServiceSnapshot = null;
+  }
+
+  void _onPlayerStall(Duration position) {
+    if (_cdnAutoBusy || isClosed || !_cdnAutoEligible) return;
+
+    final cooldownUntil = _cdnCooldownUntil;
+    if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) return;
+
+    // 距上次尝试没有实质进展 → 这个视频是真的放不动，不要再花钱测速。
+    if (_cdnLastAttemptPos != Duration.zero &&
+        position - _cdnLastAttemptPos < _kCdnMinReProgress) {
+      return;
+    }
+
+    _cdnAutoBusy = true;
+    _cdnAutoServiceSnapshot = VideoUtils.cdnService;
+    final generation = _cdnGeneration;
+    _autoSwitchLoop(generation, position).whenComplete(() {
+      if (!isClosed) _cdnAutoBusy = false;
+    });
+  }
+
+  Future<void> _autoSwitchLoop(int generation, Duration stalledAt) async {
+    var switched = false;
+    for (var attempt = 0; attempt < _kCdnMaxAttempts; attempt++) {
+      if (generation != _cdnGeneration ||
+          isClosed ||
+          isQuerying ||
+          !_cdnAutoEligible) {
+        return;
+      }
+      // 用户中途手动换了 CDN，听他的。
+      if (_cdnAutoServiceSnapshot != VideoUtils.cdnService) return;
+
+      final chosen = await _pickFastestCdn();
+      if (generation != _cdnGeneration || isClosed || isQuerying) return;
+      if (chosen == null) break;
+
+      _cdnAutoAttempts = attempt + 1;
+      _cdnLastAttemptPos = stalledAt;
+      if (kDebugMode) {
+        debugPrint('CDN 自动切换 第$_cdnAutoAttempts次 -> ${chosen.desc}');
+      }
+      SmartDialog.showToast(
+        '卡顿，尝试切换到 ${chosen.desc}',
+        displayTime: const Duration(seconds: 2),
+      );
+
+      switched = true;
+      if (!await _switchTo(chosen, generation)) return;
+      if (await _awaitRecovery(generation, stalledAt)) {
+        _cdnAutoAttempts = 0;
+        _cdnLastAttemptPos = Duration.zero;
+        _cdnTried.clear();
+        _cdnCooldownUntil = null;
+        SmartDialog.showToast(
+          '已切换到 ${chosen.desc}',
+          displayTime: const Duration(seconds: 2),
+        );
+        return;
+      }
+    }
+
+    _cdnCooldownUntil = DateTime.now().add(_kCdnGiveUpCooldown);
+    if (switched) {
+      SmartDialog.showToast(
+        '自动切换 CDN 未能改善，已暂停尝试',
+        displayTime: const Duration(seconds: 3),
+      );
+    }
+  }
+
+  /// 对尚未尝试过的镜像做后台测速，返回吞吐量最高的一个。
+  Future<CDNService?> _pickFastestCdn() async {
+    final urls = firstVideo.playUrls.toList();
+    if (urls.isEmpty) return null;
+
+    // 当前生效的镜像要从 videoUrl 里解析 host —— 默认偏好是 backupUrl，它的
+    // URL 里带的是真实 host，只看 Pref 会漏判。
+    final currentHost = Uri.tryParse(videoUrl ?? '')?.host;
+    final baseUrl = CdnSpeedTest.urlFor(urls, CDNService.baseUrl);
+
+    final candidates = <CDNService>[];
+    for (final service in CdnSpeedTest.mirrors) {
+      if (_cdnTried.contains(service)) continue;
+      final host = service.host;
+      if (host != null && host == currentHost) continue;
+      // host 替换不起作用（mcdn-only / edl:// 合成项），换过去也是同一个 URL。
+      final url = CdnSpeedTest.urlFor(urls, service);
+      if (url.isEmpty || url == baseUrl) continue;
+      candidates.add(service);
+    }
+    if (candidates.isEmpty) return null;
+
+    final limit = await ConnectivityUtils.isWiFi
+        ? CdnSpeedTest.autoCandidatesWifi
+        : CdnSpeedTest.autoCandidatesCell;
+    if (candidates.length > limit) {
+      candidates.removeRange(limit, candidates.length);
+    }
+
+    // 无论测速成功与否，这一轮候选都不再重复测。
+    _cdnTried.addAll(candidates);
+
+    final dio = _cdnAutoDio ??= CdnSpeedTest.createDio();
+    final deadline = DateTime.now().add(CdnSpeedTest.autoDeadline);
+    final tokens = <CancelToken>[];
+    final samples = <(CDNService, int, int)>[];
+
+    try {
+      for (final chunk in candidates.mapChunked(
+        CdnSpeedTest.autoConcurrency,
+        (e) => e,
+      )) {
+        if (isClosed || deadline.difference(DateTime.now()).isNegative) break;
+        final results = await Future.wait(
+          chunk.map((service) async {
+            final token = CancelToken();
+            tokens.add(token);
+            final url = CdnSpeedTest.urlFor(urls, service);
+            if (url.isEmpty) return null;
+            try {
+              final sample = await CdnSpeedTest.measure(
+                dio,
+                url,
+                token,
+                maxBytes: CdnSpeedTest.autoBytes,
+                maxMicros: CdnSpeedTest.autoMicros,
+                connectTimeout: CdnSpeedTest.probeConnect,
+                receiveTimeout: CdnSpeedTest.probeReceive,
+                isCancelled: () => isClosed,
+              );
+              // 太慢的镜像视为不可用，避免"能连上但放不动"被选为最优。
+              if (sample == null || sample.$1 < CdnSpeedTest.autoMinBytes) {
+                return null;
+              }
+              return (service, sample.$1, sample.$2);
+            } catch (e) {
+              if (kDebugMode) debugPrint('CDN 测速失败 ${service.desc}: $e');
+              return null;
+            }
+          }),
+        );
+        samples.addAll(results.whereType<(CDNService, int, int)>());
+      }
+    } finally {
+      for (final token in tokens) {
+        if (!token.isCancelled) token.cancel();
+      }
+    }
+
+    if (samples.isEmpty) return null;
+    samples.sort((a, b) => (b.$2 / b.$3).compareTo(a.$2 / a.$3));
+    if (kDebugMode) {
+      debugPrint(
+        'CDN 自动切换候选: ${samples.map((e) => '${e.$1.desc}=${(e.$2 / e.$3).toStringAsPrecision(3)}MB/s').join(', ')}',
+      );
+    }
+    return samples.first.$1;
+  }
+
+  /// 只换镜像 host：不重新请求 playurl，也不动 codec（updatePlayer 里的
+  /// `findVideoByQa(setCodecs: true)` 会改 codec，这里不需要）。
+  Future<bool> _switchTo(CDNService service, int generation) async {
+    final newVideo = CdnSpeedTest.urlFor(firstVideo.playUrls, service);
+    // 永远不要用空的 source 调 setDataSource。
+    if (newVideo.isEmpty) return false;
+
+    final pos =
+        plPlayerController.videoPlayerController?.state.position ?? playedTime;
+
+    videoUrl = newVideo;
+
+    final audioQa = currentAudioQa;
+    final audioList = data.dash?.audio;
+    if (audioQa != null && audioList != null && audioList.isNotEmpty) {
+      final firstAudio = audioList.firstWhere(
+        (i) => i.id == audioQa.code,
+        orElse: () => audioList.first,
+      );
+      // disableAudioCDN 已在 getCdnUrl 内部处理，这里不用额外分支。
+      final newAudio = CdnSpeedTest.urlFor(firstAudio.playUrls, service);
+      if (newAudio.isNotEmpty) audioUrl = newAudio;
+    }
+
+    _autoPlay.value = true;
+    playedTime = pos;
+    // 清掉它，让 playerInit 走 playedTime 分支 seek 回原位置。
+    defaultST = null;
+
+    await playerInit(autoplay: true);
+    return generation == _cdnGeneration && !isClosed;
+  }
+
+  /// 判断"是否恢复"看的是切换之后位置有没有真的推进，而不是 isBuffering。
+  Future<bool> _awaitRecovery(int generation, Duration from) {
+    final player = plPlayerController;
+    final completer = Completer<bool>();
+    final start = DateTime.now();
+
+    void listener(Duration position) {
+      if (completer.isCompleted) return;
+      if (position - from >= _kCdnRecoverProgress) {
+        completer.complete(true);
+      }
+    }
+
+    player.addPositionListener(listener);
+    final timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (completer.isCompleted) return;
+      if (generation != _cdnGeneration ||
+          isClosed ||
+          DateTime.now().difference(start) >= _kCdnRecoverWindow) {
+        completer.complete(false);
+      }
+    });
+
+    return completer.future.whenComplete(() {
+      timer.cancel();
+      player.removePositionListener(listener);
+    });
   }
 
   /// 更新画质、音质
@@ -1264,6 +1547,11 @@ class VideoDetailController extends GetxController
       ..dispose();
     subtitles.clear();
     vttSubtitles.clear();
+    // 只撤掉自己的回调，别把新页面的覆盖掉。
+    if (plPlayerController.onStall == _onPlayerStall) {
+      plPlayerController.onStall = null;
+    }
+    _resetCdnAutoSwitch();
     super.onClose();
   }
 
@@ -1276,6 +1564,8 @@ class VideoDetailController extends GetxController
     defaultST = null;
     videoUrl = null;
     audioUrl = null;
+
+    _resetCdnAutoSwitch();
 
     // danmaku
     savedDanmaku = null;
