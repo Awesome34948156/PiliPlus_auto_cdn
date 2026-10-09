@@ -748,18 +748,36 @@ class VideoDetailController extends GetxController
     _cdnAutoServiceSnapshot = null;
   }
 
+  /// 下面这些诊断刻意不套 kDebugMode：release 包只走手机测试，套了就看不到。
+  static String _fmtSpeed(int bytes, int micros) =>
+      '${(bytes / micros).toStringAsPrecision(3)}MB/s';
+
   void _onPlayerStall(Duration position) {
-    if (_cdnAutoBusy || isClosed || !_cdnAutoEligible) return;
+    if (_cdnAutoBusy || isClosed || !_cdnAutoEligible) {
+      debugPrint(
+        'CDN 自动切换: 忽略卡顿 @${position.inSeconds}s '
+        '(busy=$_cdnAutoBusy closed=$isClosed eligible=$_cdnAutoEligible)',
+      );
+      return;
+    }
 
     final cooldownUntil = _cdnCooldownUntil;
-    if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) return;
+    if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
+      debugPrint('CDN 自动切换: 冷却中，忽略卡顿 @${position.inSeconds}s');
+      return;
+    }
 
     // 距上次尝试没有实质进展 → 这个视频是真的放不动，不要再花钱测速。
     if (_cdnLastAttemptPos != Duration.zero &&
         position - _cdnLastAttemptPos < _kCdnMinReProgress) {
+      debugPrint(
+        'CDN 自动切换: 距上次尝试只推进了 '
+        '${(position - _cdnLastAttemptPos).inSeconds}s，忽略',
+      );
       return;
     }
 
+    debugPrint('CDN 自动切换: 卡顿 @${position.inSeconds}s，开始找可用镜像');
     _cdnAutoBusy = true;
     _cdnAutoServiceSnapshot = VideoUtils.cdnService;
     final generation = _cdnGeneration;
@@ -780,18 +798,17 @@ class VideoDetailController extends GetxController
       // 用户中途手动换了 CDN，听他的。
       if (_cdnAutoServiceSnapshot != VideoUtils.cdnService) return;
 
-      final chosen = await _pickFastestCdn();
+      final picked = await _pickFastestCdn();
       if (generation != _cdnGeneration || isClosed || isQuerying) return;
-      if (chosen == null) break;
+      if (picked == null) break;
+      final (chosen, speed) = picked;
 
       _cdnAutoAttempts = attempt + 1;
       _cdnLastAttemptPos = stalledAt;
-      if (kDebugMode) {
-        debugPrint('CDN 自动切换 第$_cdnAutoAttempts次 -> ${chosen.desc}');
-      }
+      debugPrint('CDN 自动切换: 第$_cdnAutoAttempts次 -> ${chosen.desc} ($speed)');
       SmartDialog.showToast(
-        '卡顿，尝试切换到 ${chosen.desc}',
-        displayTime: const Duration(seconds: 2),
+        '卡顿，尝试切换到 ${chosen.desc}\n$speed',
+        displayTime: const Duration(seconds: 3),
       );
 
       switched = true;
@@ -801,15 +818,20 @@ class VideoDetailController extends GetxController
         _cdnLastAttemptPos = Duration.zero;
         _cdnTried.clear();
         _cdnCooldownUntil = null;
+        debugPrint('CDN 自动切换: 成功，已切到 ${chosen.desc}');
         SmartDialog.showToast(
           '已切换到 ${chosen.desc}',
           displayTime: const Duration(seconds: 2),
         );
         return;
       }
+      debugPrint('CDN 自动切换: ${chosen.desc} 未恢复，换下一个候选');
     }
 
     _cdnCooldownUntil = DateTime.now().add(_kCdnGiveUpCooldown);
+    debugPrint(
+      'CDN 自动切换: 放弃，${_kCdnGiveUpCooldown.inSeconds}s 内不再尝试',
+    );
     if (switched) {
       SmartDialog.showToast(
         '自动切换 CDN 未能改善，已暂停尝试',
@@ -818,10 +840,13 @@ class VideoDetailController extends GetxController
     }
   }
 
-  /// 对尚未尝试过的镜像做后台测速，返回吞吐量最高的一个。
-  Future<CDNService?> _pickFastestCdn() async {
+  /// 对尚未尝试过的镜像做后台测速，返回吞吐量最高的一个及其速率。
+  Future<(CDNService, String)?> _pickFastestCdn() async {
     final urls = firstVideo.playUrls.toList();
-    if (urls.isEmpty) return null;
+    if (urls.isEmpty) {
+      debugPrint('CDN 自动切换: 拿不到播放地址');
+      return null;
+    }
 
     // 当前生效的镜像要从 videoUrl 里解析 host —— 默认偏好是 backupUrl，它的
     // URL 里带的是真实 host，只看 Pref 会漏判。
@@ -838,7 +863,10 @@ class VideoDetailController extends GetxController
       if (url.isEmpty || url == baseUrl) continue;
       candidates.add(service);
     }
-    if (candidates.isEmpty) return null;
+    if (candidates.isEmpty) {
+      debugPrint('CDN 自动切换: 没有可测的候选镜像');
+      return null;
+    }
 
     final limit = await ConnectivityUtils.isWiFi
         ? CdnSpeedTest.autoCandidatesWifi
@@ -846,6 +874,10 @@ class VideoDetailController extends GetxController
     if (candidates.length > limit) {
       candidates.removeRange(limit, candidates.length);
     }
+    debugPrint(
+      'CDN 自动切换: 测速 ${candidates.length} 个候选 '
+      '${candidates.map((e) => e.desc).join(', ')}',
+    );
 
     // 无论测速成功与否，这一轮候选都不再重复测。
     _cdnTried.addAll(candidates);
@@ -884,7 +916,7 @@ class VideoDetailController extends GetxController
               }
               return (service, sample.$1, sample.$2);
             } catch (e) {
-              if (kDebugMode) debugPrint('CDN 测速失败 ${service.desc}: $e');
+              debugPrint('CDN 测速失败 ${service.desc}: $e');
               return null;
             }
           }),
@@ -897,14 +929,16 @@ class VideoDetailController extends GetxController
       }
     }
 
-    if (samples.isEmpty) return null;
-    samples.sort((a, b) => (b.$2 / b.$3).compareTo(a.$2 / a.$3));
-    if (kDebugMode) {
-      debugPrint(
-        'CDN 自动切换候选: ${samples.map((e) => '${e.$1.desc}=${(e.$2 / e.$3).toStringAsPrecision(3)}MB/s').join(', ')}',
-      );
+    if (samples.isEmpty) {
+      debugPrint('CDN 自动切换: 所有候选都没测出有效速度');
+      return null;
     }
-    return samples.first.$1;
+    samples.sort((a, b) => (b.$2 / b.$3).compareTo(a.$2 / a.$3));
+    debugPrint(
+      'CDN 自动切换候选: '
+      '${samples.map((e) => '${e.$1.desc}=${_fmtSpeed(e.$2, e.$3)}').join(', ')}',
+    );
+    return (samples.first.$1, _fmtSpeed(samples.first.$2, samples.first.$3));
   }
 
   /// 只换镜像 host：不重新请求 playurl，也不动 codec（updatePlayer 里的
