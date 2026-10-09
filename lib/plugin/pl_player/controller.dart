@@ -192,9 +192,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 位置连续冻结多少秒才算卡顿。普通重新缓冲一般 1~3 秒。
   static const int _kStallSeconds = 8;
 
+  /// 短卡顿计数：窗口内"缓冲归零"的上升沿达到阈值同样判定为卡顿。
+  /// 长冻结看门狗看不到"播放 3 秒卡 5 秒"这种反复小卡顿——它只累计连续冻结
+  /// 秒数，位置一恢复就清零，永远到不了 [_kStallSeconds]。
+  static const int _kRebufferTrigger = 3;
+  static const Duration _kRebufferWindow = Duration(seconds: 60);
+
+  /// 加载/换源后的静默期。刚开始缓冲时 `buffered` 本来就是 0，
+  /// 不静默的话每次开播都会白记一次。
+  static const Duration _kRebufferSuppress = Duration(seconds: 8);
+
   Timer? _stallTicker;
   int _stallLastSecond = 0;
   int _stallFrozen = 0;
+  final List<DateTime> _rebufferEvents = [];
+  DateTime _rebufferSuppressUntil = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _wasStalled = false;
 
   /// 全屏方向
   // ignore: unnecessary_getters_setters
@@ -1165,25 +1178,38 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _startStallTicker();
   }
 
-  /// 位置冻结看门狗。
+  /// 卡顿看门狗，两种判据共用一个 [onStall] 回调。
   ///
-  /// 不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
-  /// 这里要求位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
+  /// 1. 位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
+  ///    不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
+  /// 2. [_sampleRebuffer]：窗口内缓冲归零的上升沿达到 [_kRebufferTrigger] 次。
+  ///    判据 1 看不到反复小卡顿（位置一恢复就清零），由判据 2 补上。
+  ///
   /// 也不能用 `progress`：seek 期间它返回 seekPosition，必须用原始的 [position]。
   void _startStallTicker() {
     _stallTicker?.cancel();
     _stallLastSecond = position.value;
     _stallFrozen = 0;
+    // 每次（重新）装载都清空计数并进入静默期：开播和换源后 buffered 本来就是 0。
+    _rebufferEvents.clear();
+    _wasStalled = false;
+    _rebufferSuppressUntil = DateTime.now().add(_kRebufferSuppress);
     _stallTicker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (isLive ||
           dataSource is FileSource ||
           !playerStatus.isPlaying ||
           isSeeking.value ||
           _processing) {
+        // seek 和换源本身就会让缓冲归零，静默一段，别把自己的动作记成卡顿。
+        if (isSeeking.value || _processing) {
+          _rebufferSuppressUntil = DateTime.now().add(_kRebufferSuppress);
+        }
         _stallLastSecond = position.value;
         _stallFrozen = 0;
+        _wasStalled = false;
         return;
       }
+      _sampleRebuffer();
       if (position.value != _stallLastSecond) {
         _stallLastSecond = position.value;
         _stallFrozen = 0;
@@ -1196,6 +1222,33 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
       }
     });
+  }
+
+  /// 统计"缓冲归零"的上升沿 —— 即加载中转圈出现的次数。
+  ///
+  /// 必须数上升沿而不是数采样：`buffered` 每次 stream.buffer 推送都会重写，
+  /// 一秒内可能变几十次，数零值会把一次卡顿记成几十次。
+  void _sampleRebuffer() {
+    final now = DateTime.now();
+    if (now.isBefore(_rebufferSuppressUntil)) {
+      _wasStalled = false;
+      return;
+    }
+    final stalled = isBuffering.value && buffered.value == 0;
+    if (stalled && !_wasStalled) {
+      _rebufferEvents.add(now);
+      _rebufferEvents.removeWhere((t) => now.difference(t) > _kRebufferWindow);
+      debugPrint(
+        'CDN 卡顿计数: ${_rebufferEvents.length}/$_kRebufferTrigger '
+        '(窗口 ${_kRebufferWindow.inSeconds}s)',
+      );
+      if (_rebufferEvents.length >= _kRebufferTrigger) {
+        _rebufferEvents.clear();
+        _stallFrozen = 0;
+        onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
+      }
+    }
+    _wasStalled = stalled;
   }
 
   /// 移除事件监听

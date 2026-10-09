@@ -716,6 +716,9 @@ class VideoDetailController extends GetxController
   /// 距上次尝试必须又真实播放了这么久，才允许新的尝试，避免死链无限重试。
   static const Duration _kCdnMinReProgress = Duration(seconds: 3);
 
+  /// 测到高于这个速率就认为镜像本身不是瓶颈：1MB/s ≈ 8Mbps，远高于 1080P 码率。
+  static const double _kCdnHealthyMBps = 1.0;
+
   bool _cdnAutoBusy = false;
   int _cdnAutoAttempts = 0;
   int _cdnGeneration = 0;
@@ -788,6 +791,9 @@ class VideoDetailController extends GetxController
 
   Future<void> _autoSwitchLoop(int generation, Duration stalledAt) async {
     var switched = false;
+    // 记录本轮测到过的最好速率，用来判断"镜像没问题，是别处卡"。
+    var bestBytes = 0;
+    var bestMicros = 0;
     for (var attempt = 0; attempt < _kCdnMaxAttempts; attempt++) {
       if (generation != _cdnGeneration ||
           isClosed ||
@@ -801,7 +807,12 @@ class VideoDetailController extends GetxController
       final picked = await _pickFastestCdn();
       if (generation != _cdnGeneration || isClosed || isQuerying) return;
       if (picked == null) break;
-      final (chosen, speed) = picked;
+      final (chosen, bytes, micros) = picked;
+      final speed = _fmtSpeed(bytes, micros);
+      if (bestMicros == 0 || bytes / micros > bestBytes / bestMicros) {
+        bestBytes = bytes;
+        bestMicros = micros;
+      }
 
       _cdnAutoAttempts = attempt + 1;
       _cdnLastAttemptPos = stalledAt;
@@ -833,15 +844,20 @@ class VideoDetailController extends GetxController
       'CDN 自动切换: 放弃，${_kCdnGiveUpCooldown.inSeconds}s 内不再尝试',
     );
     if (switched) {
+      // 测速够快说明镜像不是瓶颈，换下一个也不会好——多半是本地网络的问题。
+      final healthy =
+          bestMicros > 0 && bestBytes / bestMicros >= _kCdnHealthyMBps;
       SmartDialog.showToast(
-        '自动切换 CDN 未能改善，已暂停尝试',
+        healthy ? 'CDN 都正常，可能是网络问题' : '自动切换 CDN 未能改善，已暂停尝试',
         displayTime: const Duration(seconds: 3),
       );
     }
   }
 
-  /// 对尚未尝试过的镜像做后台测速，返回吞吐量最高的一个及其速率。
-  Future<(CDNService, String)?> _pickFastestCdn() async {
+  /// 对尚未尝试过的镜像做后台测速，返回吞吐量最高的一个及其原始采样
+  /// (service, bytes, micros)。调用方用 [_fmtSpeed] 格式化，这样还能拿去判断
+  /// "镜像其实够快，问题在别处"。
+  Future<(CDNService, int, int)?> _pickFastestCdn() async {
     final urls = firstVideo.playUrls.toList();
     if (urls.isEmpty) {
       debugPrint('CDN 自动切换: 拿不到播放地址');
@@ -950,7 +966,7 @@ class VideoDetailController extends GetxController
       'CDN 自动切换候选: '
       '${samples.map((e) => '${e.$1.desc}=${_fmtSpeed(e.$2, e.$3)}').join(', ')}',
     );
-    return (samples.first.$1, _fmtSpeed(samples.first.$2, samples.first.$3));
+    return (samples.first.$1, samples.first.$2, samples.first.$3);
   }
 
   /// 只换镜像 host：不重新请求 playurl，也不动 codec（updatePlayer 里的
