@@ -602,6 +602,16 @@ mixin CdnSwitchMixin on GetxController {
   void _onPlayerBufferStarve(Duration position) =>
       _onPlayerStall(position, trigger: _CdnTrigger.starve);
 
+  /// CDN 切换的三个 toast 都走这里，好让设置页一个开关就能全关掉。
+  /// 关掉的只是提示：[debugPrint] 那一路日志不受影响。
+  void _cdnToast(String message, {Duration? displayTime}) {
+    if (!Pref.showCdnSwitchToast) return;
+    SmartDialog.showToast(
+      message,
+      displayTime: displayTime ?? const Duration(seconds: 3),
+    );
+  }
+
   Future<void> _autoSwitchLoop(
     int generation,
     Duration stalledAt, {
@@ -658,10 +668,7 @@ mixin CdnSwitchMixin on GetxController {
       _cdnAutoAttempts = attempt + 1;
       _cdnLastAttemptPos = stalledAt;
       debugPrint('CDN 自动切换: 第$_cdnAutoAttempts次 -> ${chosen.desc} ($speed)');
-      SmartDialog.showToast(
-        '$what，尝试切换到 ${chosen.desc}\n$speed',
-        displayTime: const Duration(seconds: 3),
-      );
+      _cdnToast('$what，尝试切换到 ${chosen.desc}\n$speed');
 
       switched = true;
       if (!await _switchTo(chosen, generation, resumeAt: stalledAt)) return;
@@ -671,7 +678,7 @@ mixin CdnSwitchMixin on GetxController {
         _cdnTriedAt.clear();
         _cdnGiveUpUntil = null;
         debugPrint('CDN 自动切换: 成功，已切到 ${chosen.desc}');
-        SmartDialog.showToast(
+        _cdnToast(
           '已切换到 ${chosen.desc}',
           displayTime: const Duration(seconds: 2),
         );
@@ -706,7 +713,7 @@ mixin CdnSwitchMixin on GetxController {
                   : '自动切换 CDN 未能改善，已暂停尝试')
             : null);
     if (reason != null) {
-      SmartDialog.showToast(reason, displayTime: const Duration(seconds: 3));
+      _cdnToast(reason);
     }
   }
 

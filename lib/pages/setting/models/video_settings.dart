@@ -82,6 +82,13 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.autoSwitchCdnOnStall,
     defaultVal: true,
   ),
+  const SwitchModel(
+    title: 'CDN 切换提示',
+    leading: Icon(Icons.notifications_outlined),
+    subtitle: '自动切换 CDN 时弹 toast 报出测速结果与切换原因，关闭后只写日志，不影响自动切换本身',
+    setKey: SettingBoxKey.showCdnSwitchToast,
+    defaultVal: true,
+  ),
   SwitchModel(
     title: '音频不跟随 CDN 设置',
     subtitle: '直接采用备用 URL，可解决部分视频无声',

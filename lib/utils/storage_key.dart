@@ -90,6 +90,7 @@ abstract final class SettingBoxKey {
       continuePlayingPart = 'continuePlayingPart',
       cdnSpeedTest = 'cdnSpeedTest',
       autoSwitchCdnOnStall = 'autoSwitchCdnOnStall',
+      showCdnSwitchToast = 'showCdnSwitchToast',
       horizontalPreview = 'horizontalPreview',
       banWordForReply = 'banWordForReply',
       banWordForZone = 'banWordForZone',

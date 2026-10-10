@@ -503,6 +503,11 @@ abstract final class Pref {
   static bool get autoSwitchCdnOnStall =>
       _setting.get(SettingBoxKey.autoSwitchCdnOnStall, defaultValue: true);
 
+  /// 自动切换 CDN 时是否弹 toast。只关提示，不动 [debugPrint] 的日志：
+  /// 用户不想被打扰，不等于不想事后能查。
+  static bool get showCdnSwitchToast =>
+      _setting.get(SettingBoxKey.showCdnSwitchToast, defaultValue: true);
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 
