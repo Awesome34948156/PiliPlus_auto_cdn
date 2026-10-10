@@ -80,13 +80,23 @@ abstract final class Pref {
   /// 各镜像历史测到的最高速度，用来把"记得最快的那个"每轮固定送进候选窗口。
   /// 同样存 localCache：内部状态，不是用户设置。
   ///
-  /// 扁平 `List<int>`，长度 `CDNService.values.length * 2`，按 `service.index` 寻址：
+  /// 扁平 `List<int>`，长度 `CDNService.values.length * 3`，按 `service.index` 寻址：
   ///
-  ///     [index * 2]      速度，单位 B/s，0 表示没测过
-  ///     [index * 2 + 1]  记录时刻，epoch 秒
+  ///     [index * 3]      速度，单位 B/s，0 表示没测过
+  ///     [index * 3 + 1]  记录时刻，epoch 秒
+  ///     [index * 3 + 2]  1 = 这个镜像曾经当过候选并测出过样本（冠军资格）
   ///
-  /// 速度为 0 天然可以当"未记录"：真实样本的 bytes 一定大于 0。整个记录在
-  /// 换集/换画质时**不清空** —— 镜像快慢是网络属性，跟放的是哪个视频无关。
+  /// 速度为 0 天然可以当"未记录"：真实样本的 bytes 一定大于 0。第三个格子是
+  /// 必需的：基线样本和候选样本不是同一个测量（基线用原始签名 URL，候选用改写
+  /// host 之后的 URL），有的镜像当基线很能跑、当候选却每次 403。只有当过候选的
+  /// 镜像才允许被送进候选窗口，标志位只置 1、从不回 0。
+  ///
+  /// key 从 `cdnSpeedRecord` 改名为 `cdnSpeedRecordV2`：2 槽布局的旧记录按 3 槽
+  /// 读出的是垃圾（下标整体错位），改名比写迁移代码划算 —— 代价只是重新学一轮。
+  ///
+  /// 整个记录在换集/换画质时**不清空** —— 镜像快慢是网络属性，跟放的是哪个
+  /// 视频无关。但**快档（小卡顿）样本不写**，只由整轮写：快档撞字节上限的短样本
+  /// 会突发偏高，而这里取的是最大值。见 `_recordCdnSample` 的调用点。
   static List<int> get cdnSpeedRecord => List<int>.from(
     _localCache.get(
       LocalCacheKey.cdnSpeedRecord,

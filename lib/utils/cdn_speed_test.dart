@@ -82,6 +82,23 @@ abstract final class CdnSpeedTest {
     return VideoUtils.getCdnUrl(urls, defaultCDNService: service);
   }
 
+  /// What it takes to play [size] bytes spread over [durationMs], expressed in
+  /// **MB/s** — the same unit a measured sample reads as, since every caller
+  /// computes a rate as `bytes / micros` and 1 byte/µs is exactly 1 MB/s.
+  ///
+  /// Below this, buffering is guaranteed to lose ground no matter which mirror
+  /// serves it; it is a hard requirement, unlike the fixed "healthy" line.
+  ///
+  /// The `/ 1000` is the whole point and is easy to get wrong: `size / durationMs`
+  /// alone is bytes per *millisecond*, and `size * 1000 / durationMs` is bytes per
+  /// *second*. Both are 1e3–1e6 off from `bytes / micros`, which does not throw —
+  /// it just makes every baseline look starved and silently relaxes the switch
+  /// ratio everywhere. (This happened; the log printed "baseline only reaches 0%".)
+  ///
+  /// Returns 0 for unknown inputs so the caller can treat 0 as "don't apply".
+  static double requiredMBps(int size, int durationMs) =>
+      (size <= 0 || durationMs <= 0) ? 0 : size / durationMs / 1000;
+
   /// Returns `(bytes downloaded, elapsed microseconds)`, or null when nothing
   /// arrived. Aborting at a cap is a normal result; a genuine network failure
   /// rethrows.

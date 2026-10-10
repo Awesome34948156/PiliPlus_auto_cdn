@@ -138,6 +138,19 @@ mixin CdnSwitchMixin on GetxController {
   /// （playerInit + seek 回原位），画面会闪一下，所以宁可少切。
   static const double _kCdnStarveRatio = 1.5;
 
+  /// 当前镜像**已经喂不动这条流**（实测低于 `对象大小 / 时长`）时放宽到这个
+  /// 倍数。
+  ///
+  /// 1.5 倍的隐含前提是"基线是健康的，只有明显更快才值得为它付一次重载"。
+  /// 基线低于码率时这个前提不成立 —— 它不是"健康但有更好的"，而是**确定要
+  /// 饿死**，这时候 1.2 倍也是实打实的画面。实测一例：对象 239720678B /
+  /// 1075.5s = 0.223MB/s 是硬需求，基线 `akam` 只有 0.171（需求的 77%，注定
+  /// 饿死），候选 `tf_tx` 0.242 刚好够，1.42x 被 1.5 挡下。
+  ///
+  /// 方向很重要：这是在基线**被证明不够用**时放宽，不是给赢家加绝对门槛。
+  /// "讯号普遍很弱、换了也未必够"的场景不受影响。
+  static const double _kCdnStarveRatioLow = 1.2;
+
   /// 测到高于这个速率就认为镜像本身不是瓶颈：1MB/s ≈ 8Mbps，远高于 1080P 码率。
   static const double _kCdnHealthyMBps = 1.0;
 
@@ -146,6 +159,17 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 放弃后冷却多久才允许再次自动切换。
   static const Duration _kCdnGiveUpCooldown = Duration(seconds: 60);
+
+  /// 一轮下来**一个有效样本都没测到**时的冷却，比 [_kCdnGiveUpCooldown] 短。
+  ///
+  /// "测不出来"是不知道，不是"测过了没问题"，不该跟 healthy/noBetter 共用
+  /// 一把锁：实测 @350s 一轮 0 样本锁了 60s，紧接着 @353 缓冲饥饿、@357
+  /// 小卡顿、@362 卡顿、@363、@364 全被丢掉，而那 60 秒墙钟里画面一直是冻的
+  /// （卡顿时墙钟约是视频位置的 7 倍）。
+  ///
+  /// 也不设成 0：卡顿触发会反复来，每次都是一整轮（3 条流 × 2MiB ≈ 6MB），
+  /// 在一条连码率都喂不动的链路上按触发频率打是雪上加霜。
+  static const Duration _kCdnUnmeasuredCooldown = Duration(seconds: 20);
 
   /// 小卡顿探测的节流。它比 [_kCdnProbeInterval] 敏感得多，所以靠这个间隔
   /// 而不是靠判据来限流：两次探测之间至少隔这么久，免得一次持续抖动被拆成
@@ -275,36 +299,55 @@ mixin CdnSwitchMixin on GetxController {
   /// 自然老去），否则只留最大值。只留最大值而没有第一条的话，一个早先的高峰
   /// 会永远占着冠军位子：09:00 测到 5MB/s、之后实测只有 0.3MB/s，仍会被每轮
   /// 送进候选窗口白占一个位子。
-  void _recordCdnSample(CDNService service, CdnSample sample, DateTime now) {
+  void _recordCdnSample(
+    CDNService service,
+    CdnSample sample,
+    DateTime now, {
+    bool asCandidate = false,
+  }) {
     if (sample.micros <= 0) return;
     final speed = sample.bytes * 1000000 ~/ sample.micros;
     // 0 天然就是"没记录过"，所以绝不能把 0 写进去。
     if (speed <= 0) return;
 
     final record = Pref.cdnSpeedRecord;
-    final at = service.index * 2;
+    final at = service.index * 3;
     // 枚举增删过的话旧记录会短一截，补齐而不是越界。
-    if (record.length < CDNService.values.length * 2) {
+    if (record.length < CDNService.values.length * 3) {
       record.addAll(
-        List.filled(CDNService.values.length * 2 - record.length, 0),
+        List.filled(CDNService.values.length * 3 - record.length, 0),
       );
+    }
+    var changed = false;
+    // "当过候选"是镜像的固有属性（host 改写之后服务端认不认），不随时间过期，
+    // 所以只置 1、从不回 0 —— 包括下面 stale 覆盖的时候。
+    if (asCandidate && record[at + 2] != 1) {
+      record[at + 2] = 1;
+      changed = true;
     }
     final stale =
         now.difference(
           DateTime.fromMillisecondsSinceEpoch(record[at + 1] * 1000),
         ) >=
         _kCdnRecordReset;
-    if (!stale && speed <= record[at]) return;
-    record[at] = speed;
-    record[at + 1] = now.millisecondsSinceEpoch ~/ 1000;
-    Pref.cdnSpeedRecord = record;
+    if (stale || speed > record[at]) {
+      record[at] = speed;
+      record[at + 1] = now.millisecondsSinceEpoch ~/ 1000;
+      changed = true;
+    }
+    if (changed) Pref.cdnSpeedRecord = record;
   }
 
-  /// 记录里速度最高的那个镜像，还没有超过 [_kCdnRecordExpiry]。
+  /// 记录里速度最高、且**当过候选**的那个镜像，还没有超过 [_kCdnRecordExpiry]。
   ///
   /// 冠军**不免检**：它照样每轮实测，照样要赢 [_kCdnStarveRatio] 倍才切换。
   /// 记录只决定"优先被想到"，不决定"优先被信任"，所以记录过期或不准也不会
   /// 造成误切，只是白占一个位子。
+  ///
+  /// 要求"当过候选"是因为基线样本和候选样本不是同一个测量：基线用原始签名
+  /// URL，候选用改写 host 之后的 URL。`akamai` 就是反例 —— 当基线能跑到
+  /// 5MB/s，当候选每次都 403。把它送进候选窗口是纯亏：冠军位白占，轮换还少
+  /// 测一个镜像（实测 @578s 那轮就是这样，整轮颗粒无收）。
   ///
   /// 等于当前正在播的 host 时返回 null：它已经坐在基线的位置上了，再占一个
   /// 候选位子等于白白少测一个镜像。
@@ -313,8 +356,9 @@ mixin CdnSwitchMixin on GetxController {
     CDNService? best;
     var bestSpeed = 0;
     for (final service in CdnSpeedTest.mirrors) {
-      final at = service.index * 2;
-      if (at + 1 >= record.length) continue;
+      final at = service.index * 3;
+      if (at + 2 >= record.length) continue;
+      if (record[at + 2] != 1) continue;
       final speed = record[at];
       if (speed <= bestSpeed) continue;
       // 没记录过的格子时间是 0，算出来是 1970 年，自然落在过期之外。
@@ -561,6 +605,8 @@ mixin CdnSwitchMixin on GetxController {
     var bestMicros = 0;
     // 放弃时要说的话。测速给了明确结论就照实说，别让用户以为 CDN 有问题。
     String? giveUp;
+    // 这一轮什么都没测出来时只锁 [_kCdnUnmeasuredCooldown]：详见那个常量的注释。
+    var giveUpCooldown = _kCdnGiveUpCooldown;
     for (var attempt = 0; attempt < _kCdnMaxAttempts; attempt++) {
       if (generation != _cdnGeneration ||
           isClosed ||
@@ -577,6 +623,7 @@ mixin CdnSwitchMixin on GetxController {
       if (round.verdict == _CdnRoundVerdict.unmeasurable) {
         // 这里说「CDN 都正常」是假话：根本没测出可比的数据。
         giveUp = '无法测出更快的 CDN，暂不切换';
+        giveUpCooldown = _kCdnUnmeasuredCooldown;
         break;
       }
       if (round.verdict == _CdnRoundVerdict.healthy) {
@@ -624,9 +671,9 @@ mixin CdnSwitchMixin on GetxController {
       debugPrint('CDN 自动切换: ${chosen.desc} 未恢复，换下一个候选');
     }
 
-    _cdnGiveUpUntil = DateTime.now().add(_kCdnGiveUpCooldown);
+    _cdnGiveUpUntil = DateTime.now().add(giveUpCooldown);
     debugPrint(
-      'CDN 自动切换: 放弃，${_kCdnGiveUpCooldown.inSeconds}s 内不再尝试'
+      'CDN 自动切换: 放弃，${giveUpCooldown.inSeconds}s 内不再尝试'
       '${giveUp == null ? '' : '（$giveUp）'}',
     );
     final reason =
@@ -862,23 +909,40 @@ mixin CdnSwitchMixin on GetxController {
 
     // 记下这一轮的速度当作历史。放在这几道作废判断**之后**：连这一轮自己都判
     // "没法比较"的样本（416、未遵守 Range），也没有资格去当下一轮的冠军。
-    // 门槛跟着 usable 走 —— 快档样本照样记，它是在缓冲挨饿时测的，读数被争抢
-    // 压低，赢不过一条干净记录（只取最大值），真测出高分那也确实是有用信息。
-    final baselineService = CDNService.values.firstWhereOrNull(
-      (e) => e.host == currentHost,
-    );
-    final baseSample = baseline;
-    if (baselineService != null && baseSample != null && usable(baseSample)) {
-      _recordCdnSample(baselineService, baseSample, now);
-    }
-    for (final entry in samples) {
-      if (usable(entry.$2)) _recordCdnSample(entry.$1, entry.$2, now);
+    //
+    // **快档（小卡顿）样本一律不记。** 原先的设想是"快档读数被争抢压低，赢不过
+    // 一条干净记录"，实测证伪了：争抢只把读数**压低**，突发却把读数**抬高**，而
+    // 记录取的是最大值 —— 专挑高的那个。@409s 一轮快档把 akam 记成 5.02MB/s
+    // （519kB/0.11s，撞的是**字节上限**，只证明头 512KiB 快；同一链路同一深度
+    // 6 秒窗口下只有 0.171MB/s），下一轮就把一个当候选时永远 403 的镜像送进了
+    // 候选窗口。快档仍然可以**读**冠军，只是不能**写**记录。
+    if (!quick) {
+      final baselineService = CDNService.values.firstWhereOrNull(
+        (e) => e.host == currentHost,
+      );
+      final baseSample = baseline;
+      if (baselineService != null && baseSample != null && usable(baseSample)) {
+        _recordCdnSample(baselineService, baseSample, now);
+      }
+      for (final entry in samples) {
+        if (usable(entry.$2)) {
+          _recordCdnSample(entry.$1, entry.$2, now, asCandidate: true);
+        }
+      }
     }
 
     final best = samples
         .where((e) => usable(e.$2))
         .sortedBy((e) => -(e.$2.bytes / e.$2.micros))
         .firstOrNull;
+    // 这条流自己需要多快。这是播放的硬需求，不是 [_kCdnHealthyMBps] 那种经验值
+    // —— 低于它，缓冲一定入不敷出。单位换算和那个 1e6 的坑都写在
+    // [CdnSpeedTest.requiredMBps] 里，并在单测里钉住了。
+    final needBps = CdnSpeedTest.requiredMBps(
+      size ?? 0,
+      plPlayerController.durationInMilliseconds,
+    );
+
     if (best == null) {
       // 候选全废，但基线本身测出来了 —— 那说明当前镜像没问题，是别处卡
       // （实测里就有一次：基线 akam 3.92MB/s，两个候选一个超时一个握手失败）。
@@ -887,7 +951,9 @@ mixin CdnSwitchMixin on GetxController {
       final base = baseline;
       if (base != null && usable(base)) {
         final baseBps = base.bytes / base.micros;
-        final healthy = baseBps >= _kCdnHealthyMBps;
+        // 喂不动这条流时它就不是"健康"。
+        final starved = needBps > 0 && baseBps < needBps;
+        final healthy = baseBps >= _kCdnHealthyMBps && !starved;
         // 这一句必须跟 verdict 一致：曾经无论基线多慢都印"正常"，于是同一轮里
         // 日志说"基线 0.304MB/s 正常 —— 卡顿多半不在 CDN"，紧跟着的 toast 却说
         // "当前 CDN 只有 0.304MB/s"。只有真的高于健康线才配说"正常"。
@@ -896,8 +962,9 @@ mixin CdnSwitchMixin on GetxController {
               ? 'CDN 自动切换: 候选全无有效样本，但基线 [${currentHost ?? '当前'}] '
                     '${_fmtSpeed(base.bytes, base.micros)} 健康 —— 卡顿多半不在 CDN'
               : 'CDN 自动切换: 候选一个都没测到，基线 [${currentHost ?? '当前'}] '
-                    '自己也只有 ${_fmtSpeed(base.bytes, base.micros)}（低于 '
-                    '${_kCdnHealthyMBps}MB/s 健康线）—— 没得换，不是没毛病',
+                    '自己也只有 ${_fmtSpeed(base.bytes, base.micros)}'
+                    '（${starved ? '这条流需要 ${needBps.toStringAsPrecision(3)}MB/s，喂不动' : '低于 ${_kCdnHealthyMBps}MB/s 健康线'}）'
+                    '—— 没得换，不是没毛病',
         );
         return (
           verdict: healthy
@@ -930,20 +997,29 @@ mixin CdnSwitchMixin on GetxController {
     }
 
     final baseBps = base.bytes / base.micros;
+    // 基线**喂不动**这条流：它不是"健康但有更好的"，而是确定要饿死。这时候
+    // 1.5 倍的隐含前提（基线健康，只有明显更快才值得付一次重载）不成立。
+    final starved = needBps > 0 && baseBps < needBps;
+    final bar = starved ? _kCdnStarveRatioLow : _kCdnStarveRatio;
     final ratio = bestBps / baseBps;
-    final faster = ratio >= _kCdnStarveRatio;
+    final faster = ratio >= bar;
     debugPrint(
       'CDN 自动切换: 判定 最快候选 ${best.$1.desc} '
       '${_fmtSpeed(best.$2.bytes, best.$2.micros)} / 基线 '
       '${_fmtSpeed(base.bytes, base.micros)} = '
-      '${ratio.toStringAsPrecision(3)}x (阈值 $_kCdnStarveRatio) -> '
+      '${ratio.toStringAsPrecision(3)}x (阈值 $bar'
+      '${starved ? '，需要 ${needBps.toStringAsPrecision(3)}MB/s，'
+            '基线只到 ${(baseBps / needBps * 100).toStringAsFixed(0)}% 故放宽' : ''}'
+      ') -> '
       '${faster ? '切换' : '不切换'} '
       '(有效候选样本 ${samples.where((e) => usable(e.$2)).length}/${candidates.length})',
     );
     if (!faster) {
       // 基线自己都低于健康线时不能说"CDN 都正常" —— 那是没得换，不是没毛病。
+      // 喂不动这条流时同理：健康线是固定的 1MB/s，码率更高的流可以在"高于健康
+      // 线"的同时依然喂不动，那也不是"没问题"。
       return (
-        verdict: baseBps >= _kCdnHealthyMBps
+        verdict: baseBps >= _kCdnHealthyMBps && !starved
             ? _CdnRoundVerdict.healthy
             : _CdnRoundVerdict.noBetter,
         service: null,

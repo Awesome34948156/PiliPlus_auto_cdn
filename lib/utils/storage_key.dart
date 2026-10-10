@@ -251,7 +251,7 @@ abstract final class LocalCacheKey {
       mixinKey = 'mixinKey',
       timeStamp = 'timeStamp',
       cdnMirrorRotation = 'cdnMirrorRotation',
-      cdnSpeedRecord = 'cdnSpeedRecord',
+      cdnSpeedRecord = 'cdnSpeedRecordV2',
       buvid = 'buvid';
 }
 
