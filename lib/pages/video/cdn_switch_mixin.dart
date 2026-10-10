@@ -203,6 +203,17 @@ mixin CdnSwitchMixin on GetxController {
   /// 预检最晚什么时候做。缓冲一直补不满（镜像本就是坏的）也要测。
   static const Duration _kCdnPreflightDeadline = Duration(seconds: 10);
 
+  /// 历史速度记录多久没被刷新就重新开一个窗口。
+  ///
+  /// 只保留"最大值"会让一个早先的高峰永远占着冠军位子：09:00 测到 5MB/s、
+  /// 之后实测只有 0.3MB/s，仍会被每轮送进候选窗口白占一个位子。所以超过这个
+  /// 时间没刷新过就直接覆盖，而不是取最大值 —— 峰值会自然老去。
+  static const Duration _kCdnRecordReset = Duration(minutes: 30);
+
+  /// 历史速度记录超过这么久就作废，不再参与冠军评选。网络状况是随时间变的，
+  /// 昨天的冠军今天未必还是。
+  static const Duration _kCdnRecordExpiry = Duration(hours: 6);
+
   // ---------------------------------------------------------------------------
   // 一集之内的状态：换集、换 P、换画质都走 resetCdnAutoSwitch() 清掉。
   // ---------------------------------------------------------------------------
@@ -258,6 +269,65 @@ mixin CdnSwitchMixin on GetxController {
     return now.difference(at) < window;
   }
 
+  /// 记下一个镜像这一轮实测到的速度，供 [_cdnChampion] 每轮把冠军送进候选窗口。
+  ///
+  /// 两条规则：超过 [_kCdnRecordReset] 没刷新过就**整个覆盖**（旧窗口作废，峰值
+  /// 自然老去），否则只留最大值。只留最大值而没有第一条的话，一个早先的高峰
+  /// 会永远占着冠军位子：09:00 测到 5MB/s、之后实测只有 0.3MB/s，仍会被每轮
+  /// 送进候选窗口白占一个位子。
+  void _recordCdnSample(CDNService service, CdnSample sample, DateTime now) {
+    if (sample.micros <= 0) return;
+    final speed = sample.bytes * 1000000 ~/ sample.micros;
+    // 0 天然就是"没记录过"，所以绝不能把 0 写进去。
+    if (speed <= 0) return;
+
+    final record = Pref.cdnSpeedRecord;
+    final at = service.index * 2;
+    // 枚举增删过的话旧记录会短一截，补齐而不是越界。
+    if (record.length < CDNService.values.length * 2) {
+      record.addAll(
+        List.filled(CDNService.values.length * 2 - record.length, 0),
+      );
+    }
+    final stale =
+        now.difference(
+          DateTime.fromMillisecondsSinceEpoch(record[at + 1] * 1000),
+        ) >=
+        _kCdnRecordReset;
+    if (!stale && speed <= record[at]) return;
+    record[at] = speed;
+    record[at + 1] = now.millisecondsSinceEpoch ~/ 1000;
+    Pref.cdnSpeedRecord = record;
+  }
+
+  /// 记录里速度最高的那个镜像，还没有超过 [_kCdnRecordExpiry]。
+  ///
+  /// 冠军**不免检**：它照样每轮实测，照样要赢 [_kCdnStarveRatio] 倍才切换。
+  /// 记录只决定"优先被想到"，不决定"优先被信任"，所以记录过期或不准也不会
+  /// 造成误切，只是白占一个位子。
+  ///
+  /// 等于当前正在播的 host 时返回 null：它已经坐在基线的位置上了，再占一个
+  /// 候选位子等于白白少测一个镜像。
+  CDNService? _cdnChampion(DateTime now, String? currentHost) {
+    final record = Pref.cdnSpeedRecord;
+    CDNService? best;
+    var bestSpeed = 0;
+    for (final service in CdnSpeedTest.mirrors) {
+      final at = service.index * 2;
+      if (at + 1 >= record.length) continue;
+      final speed = record[at];
+      if (speed <= bestSpeed) continue;
+      // 没记录过的格子时间是 0，算出来是 1970 年，自然落在过期之外。
+      final age = now.difference(
+        DateTime.fromMillisecondsSinceEpoch(record[at + 1] * 1000),
+      );
+      if (age > _kCdnRecordExpiry) continue;
+      best = service;
+      bestSpeed = speed;
+    }
+    if (best == null || best.host == currentHost) return null;
+    return best;
+  }
 
   bool get _cdnAutoEligible {
     // 直播、本地文件、durl(edl://) 都不在范围内。
@@ -596,6 +666,18 @@ mixin CdnSwitchMixin on GetxController {
     // 已经又耗掉一截，结论就过时了 —— 饥饿时省下的每一秒都是画面。
     const limit = CdnSpeedTest.autoCandidatesMax;
 
+    final now = DateTime.now();
+    final candidates = <CDNService>[];
+
+    // 记得最快的那个镜像固定占一个位子。轮换只保证"迟早轮到"，不保证"及时"：
+    // 快的镜像正好排在下一格时，这一轮就会得出"没找到更快的镜像"。实测有一轮
+    // 只轮到 hwov/ali，而 hw 就在下一格。
+    //
+    // 它**不是免检**：照样每轮实测，照样要赢 [_kCdnStarveRatio] 才切换。记录
+    // 只决定"优先被想到"，不决定"优先被信任"，所以记录过期也不会造成误切。
+    final champion = _cdnChampion(now, currentHost);
+    if (champion != null) candidates.add(champion);
+
     // 轮换相位在**完整镜像表**上推进，而不是在当前可用候选上。后者会随
     // `_cdnTriedAt` 收缩，两个模数（表长和候选数）对不上，窗口就会跳着走、
     // 整轮整轮地漏掉镜像 —— 实测 hw 和 cos 就是这样被跳过的。在完整表上按
@@ -603,13 +685,12 @@ mixin CdnSwitchMixin on GetxController {
     // 相位持久化：控制器随页面销毁，onReset(换P) 也会清状态，轮换要跨这些事件累积。
     final all = CdnSpeedTest.mirrors;
     final phase = Pref.cdnMirrorRotation % all.length;
-    Pref.cdnMirrorRotation = (phase + limit) % all.length;
+    final rotationSlots = limit - candidates.length;
 
-    final now = DateTime.now();
-    final candidates = <CDNService>[];
+    var fromRotation = 0;
     // 第二遍忽略冷却：宁可重测刚测过的，也不要出现"一轮没有候选"。
     for (final ignoreCooldown in const [false, true]) {
-      for (var i = 0; i < all.length && candidates.length < limit; i++) {
+      for (var i = 0; i < all.length && fromRotation < rotationSlots; i++) {
         final service = all[(phase + i) % all.length];
         if (candidates.contains(service)) continue;
         final host = service.host;
@@ -619,8 +700,14 @@ mixin CdnSwitchMixin on GetxController {
         final url = CdnSpeedTest.urlFor(urls, service);
         if (url.isEmpty || url == baseUrl) continue;
         candidates.add(service);
+        fromRotation++;
       }
     }
+    // 推进量必须跟随**实际从轮换取走的个数**，不能写死 `limit`。冠军占了位子
+    // 时每轮只从轮换取 1 个，相位若仍推进 2，下标就永远落在偶数列 —— 奇数位
+    // 的镜像再也不会被轮到，正是上面那段注释警告过的"跳着走"。
+    Pref.cdnMirrorRotation = (phase + fromRotation) % all.length;
+
     if (candidates.isEmpty) {
       debugPrint('CDN 自动切换: 没有可测的候选镜像');
       return null;
@@ -657,8 +744,10 @@ mixin CdnSwitchMixin on GetxController {
       '${plPlayerController.durationInMilliseconds}ms)',
     );
     debugPrint(
-      'CDN 自动切换: 测速 1 基线 + ${candidates.length} 候选 @$readOffset '
-      '(轮换起点 $phase) ${candidates.map((e) => e.desc).join(', ')}',
+      'CDN 自动切换: 测速 1 基线 + ${candidates.length} 候选'
+      '${champion == null ? '' : '（含 1 个历史冠军）'} @$readOffset '
+      '(轮换起点 $phase) '
+      '${candidates.map((e) => e == champion ? '${e.desc}（历史冠军）' : e.desc).join(', ')}',
     );
 
     // 无论测速成功与否，这一轮候选都进入冷却；[_kCdnRetryAfter] 之后可以重测。
@@ -770,6 +859,21 @@ mixin CdnSwitchMixin on GetxController {
         : CdnSpeedTest.autoMinBytes;
     bool usable(CdnSample? s) =>
         s != null && s.bytes >= minBytes && (readOffset == 0 || s.ranged);
+
+    // 记下这一轮的速度当作历史。放在这几道作废判断**之后**：连这一轮自己都判
+    // "没法比较"的样本（416、未遵守 Range），也没有资格去当下一轮的冠军。
+    // 门槛跟着 usable 走 —— 快档样本照样记，它是在缓冲挨饿时测的，读数被争抢
+    // 压低，赢不过一条干净记录（只取最大值），真测出高分那也确实是有用信息。
+    final baselineService = CDNService.values.firstWhereOrNull(
+      (e) => e.host == currentHost,
+    );
+    final baseSample = baseline;
+    if (baselineService != null && baseSample != null && usable(baseSample)) {
+      _recordCdnSample(baselineService, baseSample, now);
+    }
+    for (final entry in samples) {
+      if (usable(entry.$2)) _recordCdnSample(entry.$1, entry.$2, now);
+    }
 
     final best = samples
         .where((e) => usable(e.$2))

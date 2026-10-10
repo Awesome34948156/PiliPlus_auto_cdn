@@ -77,6 +77,26 @@ abstract final class Pref {
   static set cdnMirrorRotation(int value) =>
       _localCache.put(LocalCacheKey.cdnMirrorRotation, value);
 
+  /// 各镜像历史测到的最高速度，用来把"记得最快的那个"每轮固定送进候选窗口。
+  /// 同样存 localCache：内部状态，不是用户设置。
+  ///
+  /// 扁平 `List<int>`，长度 `CDNService.values.length * 2`，按 `service.index` 寻址：
+  ///
+  ///     [index * 2]      速度，单位 B/s，0 表示没测过
+  ///     [index * 2 + 1]  记录时刻，epoch 秒
+  ///
+  /// 速度为 0 天然可以当"未记录"：真实样本的 bytes 一定大于 0。整个记录在
+  /// 换集/换画质时**不清空** —— 镜像快慢是网络属性，跟放的是哪个视频无关。
+  static List<int> get cdnSpeedRecord => List<int>.from(
+    _localCache.get(
+      LocalCacheKey.cdnSpeedRecord,
+      defaultValue: const <int>[],
+    ),
+  );
+
+  static set cdnSpeedRecord(List<int> value) =>
+      _localCache.put(LocalCacheKey.cdnSpeedRecord, value);
+
   static RuleFilter get danmakuFilterRule => _localCache.get(
     LocalCacheKey.danmakuFilterRules,
     defaultValue: RuleFilter.empty(),
