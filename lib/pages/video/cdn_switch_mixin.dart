@@ -349,13 +349,22 @@ mixin CdnSwitchMixin on GetxController {
   /// 5MB/s，当候选每次都 403。把它送进候选窗口是纯亏：冠军位白占，轮换还少
   /// 测一个镜像（实测 @578s 那轮就是这样，整轮颗粒无收）。
   ///
-  /// 等于当前正在播的 host 时返回 null：它已经坐在基线的位置上了，再占一个
-  /// 候选位子等于白白少测一个镜像。
+  /// 等于当前正在播的 host 时**跳过它、继续往下找**，而不是整轮作废。原先是在
+  /// 结尾写 `if (best.host == currentHost) return null;`，那等于把"当前镜像恰好是
+  /// 最快的那个"翻译成"没有冠军"，而这两种情况该得到的答案是相反的。
+  ///
+  /// 实测就死在这上面：`cosov`（当前 host）当过一次候选、拿到 `cand=1` 之后又
+  /// 每轮作基线写读数，最后记到 19.2MB/s（2MiB/0.12s 的热缓存突发），于是它永远
+  /// 是记录里最快的那个、又永远被结尾那句丢掉。十轮日志里「历史冠军」出现 0 次、
+  /// 轮换每轮固定 +2（`cdnMirrorRotation` 停在 4）就是它的指纹。改成跳过之后，
+  /// 冠军退化成"第二快的合格候选"（记录里是 `hw` 3.27MB/s），而不是"没有冠军"。
   CDNService? _cdnChampion(DateTime now, String? currentHost) {
     final record = Pref.cdnSpeedRecord;
     CDNService? best;
     var bestSpeed = 0;
     for (final service in CdnSpeedTest.mirrors) {
+      // 当前在播的已经坐在基线位置上了，再占一个候选位子等于白少测一个镜像。
+      if (service.host == currentHost) continue;
       final at = service.index * 3;
       if (at + 2 >= record.length) continue;
       if (record[at + 2] != 1) continue;
@@ -369,7 +378,6 @@ mixin CdnSwitchMixin on GetxController {
       best = service;
       bestSpeed = speed;
     }
-    if (best == null || best.host == currentHost) return null;
     return best;
   }
 
@@ -588,8 +596,9 @@ mixin CdnSwitchMixin on GetxController {
     );
   }
 
-  /// 判据 3 的回调：画面还在走、前向缓冲却在变少。换源型故障只在这里露头，
-  /// 播放器只负责上报，怎么处理由本页决定（和 [onStall] 同一个决策链）。
+  /// 判据 3 的回调，两头都走这里：前向缓冲在变少（供不上），或者余量涨到失真
+  /// （音频在走、画面冻着 —— 播放器里的 `telemetryDiverged`）。换源型故障只在这
+  /// 里露头，播放器只负责上报，怎么处理由本页决定（和 [onStall] 同一个决策链）。
   void _onPlayerBufferStarve(Duration position) =>
       _onPlayerStall(position, trigger: _CdnTrigger.starve);
 
@@ -669,6 +678,19 @@ mixin CdnSwitchMixin on GetxController {
         return;
       }
       debugPrint('CDN 自动切换: ${chosen.desc} 未恢复，换下一个候选');
+    }
+
+    // 画面冻着、音频还在走的时候，上面那些"没找到更快的镜像"其实答非所问：
+    // 用户已经看不到画面了，换不换 CDN 是次要的。测速没能给出更好的源，那就把
+    // 当前源重载一遍 —— 重开连接会让音视频两条独立流重新对齐时钟，这是这个故障
+    // 唯一不换源的解法（EDL 里视频和音频是两条流、两条连接，见播放器的 EDL 注释）。
+    //
+    // 用 [PLPlayerController.telemetryDiverged] **现场取值**而不是记下触发那一刻：
+    // 一轮测速要跑好几秒，期间可能自己缓过来了，缓过来就不该动播放器。
+    if (!switched && plPlayerController.telemetryDiverged) {
+      debugPrint('CDN 自动切换: 画面已冻（余量失真），重载当前源');
+      plPlayerController.refreshPlayer();
+      giveUp = '画面已冻，没有更快的镜像，已重载当前源';
     }
 
     _cdnGiveUpUntil = DateTime.now().add(giveUpCooldown);
@@ -916,14 +938,18 @@ mixin CdnSwitchMixin on GetxController {
     // （519kB/0.11s，撞的是**字节上限**，只证明头 512KiB 快；同一链路同一深度
     // 6 秒窗口下只有 0.171MB/s），下一轮就把一个当候选时永远 403 的镜像送进了
     // 候选窗口。快档仍然可以**读**冠军，只是不能**写**记录。
+    //
+    // **基线样本也不记，只记候选。** 这也是实测推翻的：基线 URL 就是正在播的那
+    // 条，播放器刚拉过的那个区段在边缘节点上是热的，于是基线读数是双模态的 ——
+    // 热的时候 2MiB/0.12s（19.2MB/s），冷的时候才是真值（0.683MB/s）；候选测的
+    // 是冷字节，从来没有这种突发。两者不是同一个测量，混进同一个格子取最大值，
+    // 结果就是**当前镜像自我加冕**：记录里最快的那条永远是它自己。
+    //
+    // 不记也不损失什么：当前 host 本来就坐在基线位置上，[_cdnChampion] 也会跳过
+    // 它，所以它不需要一条记录；等它哪天不再是当前 host，那条记录也只会是一份
+    // 来自热缓存的虚高读数（`cosov` 留下的 19.2MB/s 正是如此，切走之后反而会
+    // 把刚抛弃的镜像重新顶上冠军位）。
     if (!quick) {
-      final baselineService = CDNService.values.firstWhereOrNull(
-        (e) => e.host == currentHost,
-      );
-      final baseSample = baseline;
-      if (baselineService != null && baseSample != null && usable(baseSample)) {
-        _recordCdnSample(baselineService, baseSample, now);
-      }
       for (final entry in samples) {
         if (usable(entry.$2)) {
           _recordCdnSample(entry.$1, entry.$2, now, asCandidate: true);

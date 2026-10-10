@@ -109,6 +109,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return ahead > 0 ? ahead : 0;
   }
 
+  /// 遥测是否已经失真：前方余量离谱地大于 mpv 的缓存上限。
+  ///
+  /// 判据见 [_kDivergedFactor]。这是"只有声音、画面冻住"唯一可靠的信号 ——
+  /// 那时位置由音频时钟推着走、[buffered] 被音频轨抬到上千秒、[isBuffering]
+  /// 是假，判据 1、2 都看不见，判据 3 的"趴在低位"也只防了反的一侧。
+  bool get telemetryDiverged {
+    final limit = _divergedAheadSec;
+    return limit > 0 && bufferedAhead > limit;
+  }
+
   final RxInt duration = RxInt(0);
 
   int durationInMilliseconds = 0;
@@ -209,6 +219,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 故障不会让 buffered 归零（mpv 有 cache-secs 打底），位置又一直在推进，
   /// 两种卡顿判据都看不到，只有缓冲余量在悄悄变少。
   /// 与 [onStall] 一样，播放器只上报事实，如何恢复由页面决定。
+  ///
+  /// 同一条判据还负责另一半：余量**离谱地大**（见 [_kDivergedFactor]）同样是
+  /// 这个故障的指纹——那时不是"余量变少"而是音视频两轨的时间轴已经分家。只防
+  /// 低的一侧会让画面冻着而三个判据同时失明，实测就是这样。
   ValueChanged<Duration>? onBufferStarve;
 
   /// 最敏感的一条：前向余量**一归零**就上报一次（每次归零只报一次，补回来
@@ -251,6 +265,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
   static const double _kStarveMinSeconds = 4.0;
+
+  /// 余量超过 mpv 缓存上限 `cache-secs` 的这么多倍，就认为遥测已经失真。
+  ///
+  /// 健康播放的锯齿在 `[demuxer-hysteresis-secs, cache-secs]` 之间摆动，永远
+  /// 到不了 2 倍。而"只有声音、画面冻住"时音频轨的读指针还在推进，
+  /// `demuxer-cache-time` 被音频一路抬到上千秒，于是余量涨成上限的几十倍 ——
+  /// **离谱地大**本身就是故障指纹，跟判据 3 的"趴在低位"是同一个故障的两副
+  /// 面孔，所以共用一条回调。
+  static const double _kDivergedFactor = 3.0;
 
   Timer? _stallTicker;
   int _stallLastSecond = 0;
@@ -1212,7 +1235,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                 // `buffered == 0` 只有还没起播时才成立（见 [buffered] 的注释），
                 // 所以这条"打开失败就重试"的恢复路径原本一次都没跑过，跟看门狗
                 // 犯的是同一个错。要判断的是前方余量，而且别在 seek 中途重载。
-                if (bufferedAhead <= 0 && !isSeeking.value) {
+                if ((bufferedAhead <= 0 || telemetryDiverged) &&
+                    !isSeeking.value) {
                   SmartDialog.showToast(
                     '视频链接打开失败，重试中',
                     displayTime: const Duration(milliseconds: 500),
@@ -1349,9 +1373,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return threshold < _kStarveMinSeconds ? 0 : threshold;
   }
 
-  /// 判据 3：前向缓冲长期趴在低位。只看 [bufferedAhead]，不看位置也不要求
-  /// [isBuffering]——换源型卡顿时位置一直在推进，core-idle / paused-for-cache
-  /// 也未必为真。
+  /// 失真阈值：mpv 缓存上限 `cache-secs` 的 [_kDivergedFactor] 倍。读不到就
+  /// 不启用（返回 0）—— 直播走的是 [liveBuffer]，压根没有这个键，本地点播
+  /// 文件更是 `cache: no`，两者的 `demuxer-cache-time` 语义本来也不同，不该
+  /// 套这条判据。跟 [_starveThresholdSec] 用"返回 0 表示不启用"是同一套约定。
+  double get _divergedAheadSec {
+    final cache = double.tryParse(buffer['cache-secs'] ?? '') ?? 0;
+    return cache > 0 ? cache * _kDivergedFactor : 0;
+  }
+
+  /// 判据 3：只盯 [bufferedAhead]，不看位置也不要求 [isBuffering]——换源型卡顿
+  /// 时位置一直在推进，core-idle / paused-for-cache 也未必为真。两头都要防：
+  /// 余量长期趴在低位是"供不上"，余量涨到 [telemetryDiverged] 是"遥测被音频
+  /// 拖走了"，后者正是"只有声音、画面冻住"。
   ///
   /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束。
   void _sampleStarve(DateTime now) {
@@ -1371,6 +1405,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return;
     }
     _starveSeconds = 0;
+    // 余量涨到失真：音频在走、画面冻着。`demuxer-cache-time` 被音频轨抬离了
+    // 播放位置，余量因此超过缓存上限好几倍 —— 位置还在推进、[isBuffering]
+    // 也是假，判据 1、2 都看不见，只有这里能拦住。同样每段只报一次。
+    if (telemetryDiverged) {
+      if (_starveFired) return;
+      _starveFired = true;
+      debugPrint(
+        'CDN 遥测失真: 余量 ${bufferedAhead}s 超过缓存上限 '
+        '${_divergedAheadSec.toStringAsFixed(1)}s 的 ${_kDivergedFactor}x '
+        '(音频在走，画面已冻) @${position.value}s',
+      );
+      onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
+      return;
+    }
     // 只有补回 mpv 自己的水位才算这段饥饿真的结束了。
     if (bufferedAhead >= threshold / _kStarveFloorFraction) {
       if (_starveFired) {
