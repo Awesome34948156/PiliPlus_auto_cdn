@@ -92,7 +92,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   int get positionInMilliseconds =>
       videoPlayerController?.state.position.inMilliseconds ?? 0;
 
+  /// mpv 的 `demuxer-cache-time` 原样搬过来 —— 那是**文件时间轴上的绝对时刻**
+  /// （缓存末端的时间戳），不是"缓冲了多少秒"。缓存非空时它一路跟着读指针走，
+  /// 空了就停在最后一次的值上，所以它看起来几乎等于 [position]（实测位置
+  /// 917s 时它是 921s）。把它当"前方余量"用会得出荒谬的结论：一个 37 分钟的
+  /// 视频不可能缓冲了 1240 秒。
   final RxInt buffered = RxInt(0);
+
+  /// 真正的前方缓冲余量：缓存末端减去播放位置，负数归零。
+  ///
+  /// 实测健康时 20~32s（mpv 配的是 `cache-secs: 32`，补满就停读、掉到
+  /// `demuxer-hysteresis-secs` 才续读，于是锯齿在两者之间摆动）；CDN 供不上时
+  /// 会趴在 0~4s 并且再也不涨 —— 那正是"画面在走但一直在小卡"的真身。
+  int get bufferedAhead {
+    final ahead = buffered.value - position.value;
+    return ahead > 0 ? ahead : 0;
+  }
 
   final RxInt duration = RxInt(0);
 
@@ -189,6 +204,24 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 这一事实，如何恢复由页面决定。每段冻结只触发一次。
   ValueChanged<Duration>? onStall;
 
+  /// 缓冲饥饿回调：播放中前向缓冲 [buffered] 连续 [_kStarveSeconds] 秒低于
+  /// 饥饿阈值时上报一次。与 [onStall] 互补——"画面冻住但音频在走"这种换源型
+  /// 故障不会让 buffered 归零（mpv 有 cache-secs 打底），位置又一直在推进，
+  /// 两种卡顿判据都看不到，只有缓冲余量在悄悄变少。
+  /// 与 [onStall] 一样，播放器只上报事实，如何恢复由页面决定。
+  ValueChanged<Duration>? onBufferStarve;
+
+  /// 最敏感的一条：前向余量**一归零**就上报一次（每次归零只报一次，补回来
+  /// 才重新武装）。前三条判据都要等 —— [onStall] 等 8 秒冻结、[_sampleRebuffer]
+  /// 攒够 [_kRebufferTrigger] 次、[onBufferStarve] 连续 [_kStarveSeconds] 秒低于
+  /// 阈值 —— 而"卡一下又接着播"这种小卡顿一条都凑不满，等凑满时用户已经看了
+  /// 半分钟转圈。这里只报事实，节流与"要不要真去测速"由页面决定（测速会跟
+  /// 播放器抢带宽，不能由播放器自己决定）。
+  ///
+  /// 刻意不要求 [isBuffering]：换源型卡顿时 core-idle / paused-for-cache 未必
+  /// 为真，`stream.buffer` 才是唯一一定会动的信号。
+  ValueChanged<Duration>? onRebuffer;
+
   /// 位置连续冻结多少秒才算卡顿。普通重新缓冲一般 1~3 秒。
   static const int _kStallSeconds = 8;
 
@@ -202,12 +235,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 不静默的话每次开播都会白记一次。
   static const Duration _kRebufferSuppress = Duration(seconds: 8);
 
+  /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
+  /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
+  /// 后停读，等掉回水位才续读，所以健康播放的锯齿在
+  /// `[cache-secs, demuxer-hysteresis-secs]` 之间摆动、从来不会接近 0。
+  /// 取 0.6 即 `cache-secs * 0.4`，比锯齿下沿还低 40%，健康播放碰不到。
+  static const double _kStarveFloorFraction = 0.6;
+
+  /// 连续多少个 1s 采样低于阈值才算饥饿。健康锯齿只在谷底停留一两拍。
+  static const int _kStarveSeconds = 4;
+
+  /// 看门狗心跳间隔。三条判据都只在出事时才出声，没有心跳就无法区分
+  /// "一切正常"和"看门狗根本没跑"——两者留下的日志一模一样。
+  static const int _kHeartbeatSeconds = 10;
+
+  /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
+  static const double _kStarveMinSeconds = 4.0;
+
   Timer? _stallTicker;
   int _stallLastSecond = 0;
   int _stallFrozen = 0;
   final List<DateTime> _rebufferEvents = [];
   DateTime _rebufferSuppressUntil = DateTime.fromMillisecondsSinceEpoch(0);
   bool _wasStalled = false;
+  /// 余量是否已经归零过（[onRebuffer] 的上升沿去重）。
+  bool _wasEmpty = false;
+  int _starveSeconds = 0;
+  bool _starveFired = false;
+  DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 全屏方向
   // ignore: unnecessary_getters_setters
@@ -733,6 +788,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }) async {
     try {
       _processing = true;
+      // 装载会让 buffered 归零，显式重置看门狗：切换可能在 1 s 内结束，
+      // ticker 来不及采样到 _processing。
+      _resetStallWatchdog();
       this.isLive = isLive;
       _videoType = videoType ?? VideoType.ugc;
       this.width = width;
@@ -964,6 +1022,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (dataSource is FileSource) {
       return null;
     }
+    // 重新打开同一个 Media，缓冲从头再来，看门狗同步重置。
+    _resetStallWatchdog();
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       var media = ctr.current.last;
       if (!isLive) media = media.copyWith(start: ctr.state.position);
@@ -1149,7 +1209,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                 // if (kDebugMode) {
                 //   debugPrint("_buffered.value: ${_buffered.value}");
                 // }
-                if (isBuffering.value && buffered.value == 0) {
+                // `buffered == 0` 只有还没起播时才成立（见 [buffered] 的注释），
+                // 所以这条"打开失败就重试"的恢复路径原本一次都没跑过，跟看门狗
+                // 犯的是同一个错。要判断的是前方余量，而且别在 seek 中途重载。
+                if (bufferedAhead <= 0 && !isSeeking.value) {
                   SmartDialog.showToast(
                     '视频链接打开失败，重试中',
                     displayTime: const Duration(milliseconds: 500),
@@ -1178,23 +1241,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _startStallTicker();
   }
 
-  /// 卡顿看门狗，两种判据共用一个 [onStall] 回调。
+  /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。
   ///
   /// 1. 位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
   ///    不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
   /// 2. [_sampleRebuffer]：窗口内缓冲归零的上升沿达到 [_kRebufferTrigger] 次。
   ///    判据 1 看不到反复小卡顿（位置一恢复就清零），由判据 2 补上。
+  /// 3. [_sampleStarve]：前向缓冲长期趴在低位。判据 1、2 都要求 buffered 归零，
+  ///    而 mpv 有 cache-secs 打底、换源型卡顿时位置又由音频时钟推着走，
+  ///    两者都见不到"余量在变少"——这条只看 [buffered]，是唯一的早期信号。
   ///
   /// 也不能用 `progress`：seek 期间它返回 seekPosition，必须用原始的 [position]。
   void _startStallTicker() {
     _stallTicker?.cancel();
-    _stallLastSecond = position.value;
-    _stallFrozen = 0;
-    // 每次（重新）装载都清空计数并进入静默期：开播和换源后 buffered 本来就是 0。
-    _rebufferEvents.clear();
-    _wasStalled = false;
-    _rebufferSuppressUntil = DateTime.now().add(_kRebufferSuppress);
+    _resetStallWatchdog();
     _stallTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      // 心跳放在闸门之前：闸门本身也可能是"什么都不发生"的原因之一，
+      // 必须先看到它当时的取值。
+      final now = DateTime.now();
+      if (now.difference(_lastHeartbeat).inSeconds >= _kHeartbeatSeconds) {
+        _lastHeartbeat = now;
+        debugPrint(
+          'CDN 看门狗: 余量 ${bufferedAhead}s 阈值 '
+          '${_starveThresholdSec.toStringAsFixed(1)}s 位置 ${position.value}s '
+          '(cache-time ${buffered.value}s) 播放中 ${playerStatus.isPlaying} '
+          '重新缓冲 ${isBuffering.value} seek中 ${isSeeking.value} '
+          '换源中 $_processing',
+        );
+      }
       if (isLive ||
           dataSource is FileSource ||
           !playerStatus.isPlaying ||
@@ -1202,14 +1276,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _processing) {
         // seek 和换源本身就会让缓冲归零，静默一段，别把自己的动作记成卡顿。
         if (isSeeking.value || _processing) {
-          _rebufferSuppressUntil = DateTime.now().add(_kRebufferSuppress);
+          _armRebufferSuppress();
         }
         _stallLastSecond = position.value;
         _stallFrozen = 0;
+        // 这里刻意不整套换成 [_disarmTriggers]：它连 [_wasEmpty] 一起清，
+        // 而暂停正好停在一次卡顿中间时，恢复后的第一次归零不该被当成新的一次。
+        // [_wasEmpty] 只在真正的装载边界和静默期起点重置。
         _wasStalled = false;
+        _starveSeconds = 0;
+        // 换源后是全新一轮，允许再报一次。
+        _starveFired = false;
         return;
       }
-      _sampleRebuffer();
+      _sampleRebuffer(now);
+      _sampleStarve(now);
       if (position.value != _stallLastSecond) {
         _stallLastSecond = position.value;
         _stallFrozen = 0;
@@ -1217,24 +1298,108 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
       if (++_stallFrozen >= _kStallSeconds &&
           isBuffering.value &&
-          buffered.value == 0) {
+          bufferedAhead == 0) {
         _stallFrozen = 0;
         onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
       }
     });
   }
 
+  /// 清空三条判据的状态并进入静默期。任何一次装载（开播、换源、换 P、切换
+  /// CDN）都会让 buffered 归零，必须显式调用——只靠 ticker 里看到
+  /// `_processing` 是不可靠的：一次切换可能不到 1 秒就结束，ticker 根本没机会
+  /// 采样，静默期没被续上，紧接着的饥饿就会被误判成新的。
+  void _resetStallWatchdog() {
+    _stallLastSecond = position.value;
+    _stallFrozen = 0;
+    _rebufferEvents.clear();
+    _armRebufferSuppress();
+  }
+
+  /// 重新武装三条判据的去重状态，效果等同于刚装载。
+  ///
+  /// 静默期的含义是"这段时间里的归零一律不算数"：只要进入静默时不把"已归零/
+  /// 已上报"的记录一并清掉，静默结束后的第一次归零就会被读成"还没报过"。
+  /// 两个采样函数因此只在静默期内返回，武装统一收敛到这里。
+  void _disarmTriggers() {
+    _wasStalled = false;
+    _wasEmpty = false;
+    _starveSeconds = 0;
+    _starveFired = false;
+  }
+
+  /// 进入/推进静默期。任何一次装载（开播、换源、换 P、切换 CDN）以及 seek
+  /// 都会让缓冲归零，必须先把这段时间静音掉，否则等长冻结判据会把自己的动作
+  /// 读成卡顿。
+  void _armRebufferSuppress() {
+    _rebufferSuppressUntil = DateTime.now().add(_kRebufferSuppress);
+    _disarmTriggers();
+  }
+
+  /// 饥饿阈值：mpv 回填水位（`demuxer-hysteresis-secs`）的
+  /// [_kStarveFloorFraction]。低于 [_kStarveMinSeconds] 视为没有观测余量，
+  /// 返回 0 表示不启用。
+  ///
+  /// 取值要从 mpv 真正拿到的 [buffer] 里读，而不是用当前倍速重算：`buffer` 是
+  /// 首次装载时定下的 late final，[setPlaybackSpeed] 不会重建它，两者会不一致
+  /// （例如按 1x 装载后改成 2x，水位仍是按 1x 算的，而缓冲消耗速度已翻倍）。
+  double get _starveThresholdSec {
+    final floor = double.tryParse(buffer['demuxer-hysteresis-secs'] ?? '') ?? 0;
+    final threshold = floor * _kStarveFloorFraction;
+    return threshold < _kStarveMinSeconds ? 0 : threshold;
+  }
+
+  /// 判据 3：前向缓冲长期趴在低位。只看 [bufferedAhead]，不看位置也不要求
+  /// [isBuffering]——换源型卡顿时位置一直在推进，core-idle / paused-for-cache
+  /// 也未必为真。
+  ///
+  /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束。
+  void _sampleStarve(DateTime now) {
+    final threshold = _starveThresholdSec;
+    // 静默期内不采样：加载/换源/seek 之后 buffered 本来就是 0。去重状态在
+    // 进入静默的那一处就重新武装好了（见 [_armRebufferSuppress]）。
+    if (threshold <= 0 || now.isBefore(_rebufferSuppressUntil)) return;
+    if (bufferedAhead < threshold) {
+      if (++_starveSeconds < _kStarveSeconds || _starveFired) return;
+      _starveFired = true;
+      debugPrint(
+        'CDN 缓冲饥饿: 前方余量 ${bufferedAhead}s < '
+        '${threshold.toStringAsFixed(1)}s (连续 $_kStarveSeconds s) '
+        '@${position.value}s',
+      );
+      onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
+      return;
+    }
+    _starveSeconds = 0;
+    // 只有补回 mpv 自己的水位才算这段饥饿真的结束了。
+    if (bufferedAhead >= threshold / _kStarveFloorFraction) {
+      if (_starveFired) {
+        debugPrint('CDN 缓冲饥饿: 已恢复 (${bufferedAhead}s)');
+      }
+      _starveFired = false;
+    }
+  }
+
   /// 统计"缓冲归零"的上升沿 —— 即加载中转圈出现的次数。
   ///
   /// 必须数上升沿而不是数采样：`buffered` 每次 stream.buffer 推送都会重写，
   /// 一秒内可能变几十次，数零值会把一次卡顿记成几十次。
-  void _sampleRebuffer() {
-    final now = DateTime.now();
-    if (now.isBefore(_rebufferSuppressUntil)) {
-      _wasStalled = false;
-      return;
+  void _sampleRebuffer(DateTime now) {
+    if (now.isBefore(_rebufferSuppressUntil)) return;
+
+    // 最敏感的一条：余量归零的上升沿立刻上报，不等 isBuffering、不等攒够次数。
+    // 每一次归零只报一次，补回来才重新武装。
+    if (bufferedAhead == 0) {
+      if (!_wasEmpty) {
+        _wasEmpty = true;
+        debugPrint('CDN 余量归零 @${position.value}s，上报小卡顿');
+        onRebuffer?.call(videoPlayerController?.state.position ?? Duration.zero);
+      }
+    } else {
+      _wasEmpty = false;
     }
-    final stalled = isBuffering.value && buffered.value == 0;
+
+    final stalled = isBuffering.value && bufferedAhead == 0;
     if (stalled && !_wasStalled) {
       _rebufferEvents.add(now);
       _rebufferEvents.removeWhere((t) => now.difference(t) > _kRebufferWindow);
@@ -1244,7 +1409,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       );
       if (_rebufferEvents.length >= _kRebufferTrigger) {
         _rebufferEvents.clear();
-        _stallFrozen = 0;
         onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
       }
     }
