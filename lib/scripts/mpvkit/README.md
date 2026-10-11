@@ -118,6 +118,30 @@ HEVC must still read `videotoolbox*` after the swap.
 `relink.sh` self-checks each dylib it produces: exported symbol count and the
 presence of the four `*_videotoolbox` hwaccel names.
 
+`verify-render.sh` is the real check, and the one to reach for whenever the render
+path itself is in question:
+
+```sh
+bash verify-render.sh /tmp/bbb_av1_1080.mp4   # dylib defaults to $WORK/out/Mpv.macos
+```
+
+It compiles `mpvgl.c` against the MPVKit headers — the same build as the dylib, so
+the API cannot drift — and runs it. mpvgl.c stands up a CGL 3.2 core context and
+calls `mpv_render_context_create(MPV_RENDER_API_TYPE_OPENGL)` with no
+`MPV_RENDER_PARAM_HW_FRAMES`, which is what media_kit's `TextureHW` does, then
+renders into an FBO and reads the centre pixel back. Pass = **non-black readback,
+0 render errors, `hwdec-current: videotoolbox`**, and the exit code is the verdict:
+
+```
+frames rendered through vo=libmpv + GL render API: 30 (errors: 0)
+centre pixel readback: R=86 G=82 B=26 A=255  (non-black -> real frame)
+hwdec-current: videotoolbox
+```
+
+`mpvtest.c` is the cheap first check (`--vo=null`): good for "does it even load and
+find the hwaccel", but it reports `videotoolbox-copy` — a copy-back, not the
+zero-copy path the real VO takes — so it cannot tell you the render path works.
+
 ## macOS status
 
 Verified 2026-10-11 through a full `flutter build macos --release` (179 MB app,
