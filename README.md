@@ -27,6 +27,49 @@
 
 <br/>
 
+## 这个 fork 做了什么
+
+本仓库是 [bggRGjQaUbCoE/PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) 的 fork，改动集中在播放链路上。安装包看本仓库的 [Releases](../../releases)。
+
+### 播放卡顿自动切换 CDN
+
+同一个视频 B 站会发多个 CDN 镜像（`upos-sz-mirrorcos`、`akamai` 等），不同网络下手感差很多，之前只能在设置里手动测速切换。现在卡顿时会自动测速换源：
+
+- 看门狗（`lib/plugin/pl_player/controller.dart`）只上报事实：播放位置冻结，或前向缓冲吃不饱；片尾必然的余量下滑不算卡顿。
+- 编排在 `lib/pages/video/cdn_switch_mixin.dart`：拿当前源做基线，与一小批轮换的候选镜像一起测速；候选明显更快时**只替换镜像 host**（不重新请求 playurl、不改编码），seek 回原位置，再用「位置是否真的往前走了」验证恢复，最多重试 3 次。
+- 测速逻辑抽到 `lib/utils/cdn_speed_test.dart`，手动测速对话框和自动切换共用同一套两阶段流程（先探针、后计量）。
+- 候选里留一个「冠军位」给历史上最快的镜像，但连续两轮没被选中就让位给轮换，避免它长期占坑。
+- `CDNService.knownDead` 剔除了 DNS 上已不存在的镜像 —— 它们以前会白占候选名额，导致测速永远选不出更好的源。
+- 整个切换是会话级的，**不会写回你手动设置的默认 CDN**。
+
+设置里有两个开关：`autoSwitchCdnOnStall`（总开关）和 `showCdnSwitchToast`（切换提示）。
+
+### AV1 硬件解码
+
+`media_kit` 自带的 ffmpeg 6.0 编入了 h264/hevc/vp9 的 VideoToolbox，**唯独没有 `av1_videotoolbox`** —— 所以哪怕在 A17/A18/M 系列芯片上，AV1 也一直走 libdav1d 软解：不一定卡，但费电、发热。换 libs 版本也修不好，那些构建里同样没有这个 hwaccel。
+
+`lib/scripts/mpvkit/` 是修复：把 MPVKit（mpv 0.41 / ffmpeg n9.0.2，含 `videotoolbox_av1.c`）的 30 个静态库重新链接成一个动态 `Mpv.framework`（只对 Libmpv 用 `-force_load`，其余库列两遍，导出表裁剪到 `_mpv_*`），构建时覆盖进 media_kit 的 pub-cache。
+
+iOS / macOS 的 workflow 会从**当前仓库自己的 release**（tag `libmpv-0.41-n9.0.2`）取这份 libmpv —— 所以从这个 fork 再 fork 出去，想构建得先自己发一份同名 release。
+
+已在 iPhone 16 Plus 上验证：AV1 流 52 个采样全是 `videotoolbox`，0 个软解。
+
+### 「只有声音没画面」自愈
+
+iOS 上偶发打开视频只有声音、画面不出来：media_kit 的 iOS VideoOutput 在 `video-out-params` 变成非零之前不会开始渲染，和 mpv 的 VO 互相等。现在检测到视频输出没建出来会「钉住尺寸」自愈，检测窗口 8 秒。
+
+### 诊断日志
+
+release 包的 `debugPrint` 原本没有任何落地，iOS 上尤其什么都看不到。现在 `lib/services/console_log.dart` 是常驻 sink，日志写到应用文档目录，iOS 用「文件」App 就能取回（`UIFileSharingEnabled`）。mpv 自身的详细日志在设置里单独有个开关，并会记录实际选中的流编码 —— 判断「到底走了硬解还是软解」就靠它。
+
+### 构建产物
+
+- Android 出**通用包**：一个 APK 含 arm64-v8a / armeabi-v7a / x86_64，不用再挑 ABI。
+- iOS 的 IPA 是 `--no-codesign` 的未签名包，需要自行签名或用 sideload 工具安装。
+- 本仓库没有配签名密钥，APK 是 **debug 签名**：能装，但覆盖安装已装的 release 签名版本会失败，需要先卸载旧的。
+
+<br/>
+
 ## 适配平台
 
 - [x] Android
