@@ -264,9 +264,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// "一切正常"和"看门狗根本没跑"——两者留下的日志一模一样。
   static const int _kHeartbeatSeconds = 10;
 
-  /// 无视频轨自愈每一级之间等多久。够 mpv 走一次 render 往返，又不至于让
-  /// 用户对着黑屏干等 —— 三级合计 3.6s，比一次心跳（10s）还快。
+  /// 「无视频轨」自己的采样节奏。心跳是 10s，等它两拍要 20s —— 而黑屏是死锁，
+  /// 每多等一秒用户就多对着黑屏一秒。改成 2s 一探，[_kNoVideoProbes] 拍就动手。
+  static const Duration _kNoVideoProbe = Duration(seconds: 2);
+
+  /// 连续几探"音频在推进、画面仍是空"才认定是死锁。
+  ///
+  /// 取 4 探（~8s）是放过起播慢的大文件：视频参数本来就比音频晚到，只是不会
+  /// 晚到 8 秒。2026-10-11 那次 iOS 黑屏从起播到被探到也远不到 8s。
+  static const int _kNoVideoProbes = 4;
+
+  /// 钉住尺寸后等 mpv 走一次 render 往返再看结果。
   static const Duration _kHealWait = Duration(milliseconds: 1200);
+
+  /// 自愈最多钉几次尺寸。第一次 render 可能正好落在 mpv 拆完旧输出、新输出
+  /// 还没建好的缝里，再推一次几乎不要钱（不 seek、不重载、不动位置）。
+  static const int _kHealAttempts = 2;
 
   /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
   static const double _kStarveMinSeconds = 4.0;
@@ -995,7 +1008,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _heartDuration = 0;
     danmakuController?.clear();
     // 换了媒体，「音频在、画面不在」的计数与自愈额度都重新来过。
-    _noVideoBeats = 0;
+    _noVideoProbes = 0;
     _noVideoHealed = false;
 
     var player = _videoPlayerController;
@@ -1282,14 +1295,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _startStallTicker();
   }
 
-  /// 连续多少个心跳"音频在、画面不在"。见 [_checkNoVideoTrack]。
-  int _noVideoBeats = 0;
+  /// 连续多少探"音频在、画面不在"。见 [_checkNoVideoTrack]。
+  int _noVideoProbes = 0;
+
+  /// 上一次采样时刻。自带 [_kNoVideoProbe] 的节奏，不等 10s 心跳。
+  DateTime _lastNoVideoProbe = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 本次媒体是否已经跑过一轮自愈。每换一次媒体在 [_createVideoController]
   /// 里重置 —— 一轮就够，别跟用户的手动操作抢。
   bool _noVideoHealed = false;
 
-  /// 自愈是否正在跑（阶梯里 await 了，心跳回调可能重入）。
+  /// 自愈是否正在跑（里面有 await，采样回调可能重入）。
   bool _healingNoVideo = false;
 
   /// 读一个 mpv 属性，读不到就当空串。
@@ -1310,22 +1326,30 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// （当时拍到的「播放信息」里 Resolution 0x0、VideoParams 全空），而 CDN 与
   /// 编码可用性都已排除。build 5483 的 mpv 日志把病因定到了**视频输出**一侧：
   /// 解码、滤镜、音轨全部正常，唯独那一次没有建出视频输出 —— 日志里没有
-  /// `VO: [libmpv]` / `vo/libmpv: reconfig` / `libmpv_render:` 这三行，只有
-  /// mpv 自己的警告 `mpv_render_context_render() not being called or stuck.`。
+  /// `VO: [libmpv]` / `vo/libmpv: reconfig` / `libmpv_render: Window size` 这三行。
+  /// （别拿 `mpv_render_context_render() not being called or stuck.` 当判据：
+  /// 正常播放的每一段里都有它，只是排队晚了一点点。）
   /// 以前这个状态一行日志都不留，只能靠用户手动抄「播放信息」；现在它自己会
-  /// 连着两拍报到日志里，并触发一次 [_healNoVideoTrack]。
+  /// 连着 [_kNoVideoProbes] 探报到日志里，并触发一次 [_healNoVideoTrack]。
   ///
-  /// 连空两拍才算：视频参数本来就比音频晚到，起播那一拍看到空属于正常。
+  /// 连空几探才算：视频参数本来就比音频晚到，起播那一两探看到空属于正常。
+  /// 采样从 10s 心跳提到 2s 之后，seek / 换源 / 重新缓冲这三个"参数本来就该
+  /// 是空的"窗口必须显式放过，否则会把自己的动作当成死锁。
   void _checkNoVideoTrack() {
-    if (onlyPlayAudio.value || isLive || position.value <= 0) {
-      _noVideoBeats = 0;
+    if (onlyPlayAudio.value ||
+        isLive ||
+        position.value <= 0 ||
+        isSeeking.value ||
+        _processing ||
+        isBuffering.value) {
+      _noVideoProbes = 0;
       return;
     }
     if (_hasVideoTrack) {
-      _noVideoBeats = 0;
+      _noVideoProbes = 0;
       return;
     }
-    if (++_noVideoBeats < 2) return;
+    if (++_noVideoProbes < _kNoVideoProbes) return;
     debugPrint(
       '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
       'video ${_safeProp('video-codec')} hwdec ${_safeProp('hwdec-current')} '
@@ -1343,7 +1367,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return (state?.width ?? 0) > 0 || (state?.videoParams.w ?? 0) > 0;
   }
 
-  /// 「只有声音没画面」的自愈阶梯。
+  /// 「只有声音没画面」的自愈。
   ///
   /// 病根在 media_kit 的 iOS 视频输出一侧，不在流、不在解码器：
   /// `VideoOutput._updateCallback` 只在 mpv 的 `video-out-params` 报出非零 dw/dh
@@ -1352,79 +1376,58 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 是空"的状态上，两边就互等成死锁：mpv 一直抱怨没人调 render，画面永远不出
   /// 来；而音频走的是独立的 AO，所以听得到声音、看不到画面。
   ///
-  /// 三级都只碰输出侧，不重开媒体、不换数据源、不丢播放位置：
-  /// 1. 重挂视频轨：让 mpv 重新走一遍视频链初始化，视频输出随之重建；
-  /// 2. `video-reload`：mpv 自带的"重载当前视频轨"；
-  /// 3. 钉住输出尺寸：直接绕过上面那个判断，一次 render 就能让 mpv 把输出配上，
-  ///    随后立刻把尺寸交还 mpv 自己算（见 [_nudgeSize]）。
+  /// 只有一个动作：**钉住输出尺寸**。这直接绕过上面那个判断 —— 尺寸由我们从
+  /// demuxer 那边取来（见 [_nudgeSize]），mpv 报不报都不影响 —— 一次 render
+  /// 就能让 mpv 把视频输出配上，随后立刻把尺寸交还 mpv 自己算。
   ///
-  /// 三级全败也不算白跑：日志会记下放弃，用户手动退出视频页再进来仍然能恢复
-  /// —— 那会新建渲染上下文，是这个死锁的另一条出路。
+  /// 5484 那次线上验证把另外两级砍掉了，它们不修病、只伤身（详情见下面）。
+  /// 全败也不算白跑：日志会记下放弃，用户手动退出视频页再进来仍然能恢复 ——
+  /// 那会新建渲染上下文，是这个死锁的另一条出路。
   Future<void> _healNoVideoTrack() async {
-    final player = _videoPlayerController;
-    if (player == null || _healingNoVideo) {
+    if (_videoPlayerController == null || _healingNoVideo) {
       return;
     }
     _healingNoVideo = true;
-    var nudged = false;
+    final (w, h) = _nudgeSize;
+
+    /// 把尺寸交还 mpv：钉住只是为了松开死锁，一直挂着会让竖屏这类非 16:9
+    /// 的视频按错的尺寸渲染。
+    Future<void> unpin() async {
+      try {
+        await videoController?.setSize(width: null, height: null);
+      } catch (e) {
+        debugPrint('无视频轨自愈收尾抛错: $e');
+      }
+    }
+
     try {
-      for (var level = 1; level <= 3; level++) {
+      for (var attempt = 1; attempt <= _kHealAttempts; attempt++) {
         debugPrint(
-          '无视频轨自愈 $level/3: ${_healName(level)} '
+          '无视频轨自愈 $attempt/$_kHealAttempts: 钉住输出尺寸 ${w}x$h '
           '(位置 ${position.value}s)',
         );
         try {
-          nudged = await _healStep(level, player) || nudged;
+          await videoController?.setSize(width: w, height: h);
         } catch (e) {
-          debugPrint('无视频轨自愈 $level/3 抛错: $e');
-          continue;
+          debugPrint('无视频轨自愈 $attempt/$_kHealAttempts 抛错: $e');
         }
         await Future.delayed(_kHealWait);
         if (_hasVideoTrack) {
-          debugPrint('无视频轨自愈成功: ${_healName(level)}');
+          debugPrint('无视频轨自愈成功: 钉住输出尺寸（第 $attempt 次）');
           return;
         }
+        // 先交还再重来：第一次 render 可能正好落在 mpv 拆完旧输出、新输出
+        // 还没建好的缝里。重来一次不 seek、不重载、不动位置，几乎不要钱。
+        await unpin();
       }
-      debugPrint('无视频轨自愈失败: 三级都没能让视频输出起来，退出视频页再进来可恢复');
+      debugPrint('无视频轨自愈失败: 钉住尺寸没能让视频输出起来，退出视频页再进来可恢复');
     } finally {
+      await unpin();
       _healingNoVideo = false;
-      if (nudged) {
-        // 把尺寸交还 mpv：钉住只是为了松开死锁，一直挂着会让竖屏这类
-        // 非 16:9 的视频按错的尺寸渲染。
-        await videoController?.setSize(width: null, height: null);
-      }
     }
   }
 
-  String _healName(int level) => switch (level) {
-    1 => '重挂视频轨 vid=no→auto',
-    2 => 'video-reload',
-    _ => '钉住输出尺寸 setSize',
-  };
-
-  /// 跑一级自愈。返回是否钉住了输出尺寸（收尾时要交还 mpv）。
-  Future<bool> _healStep(int level, Player player) async {
-    switch (level) {
-      case 1:
-        // setProperty 是同步下发的（不是 Future），中间留一拍让 mpv 先把
-        // 视频链拆掉，再挂回去才算一次完整的重建。
-        player.setProperty('vid', 'no');
-        await Future.delayed(const Duration(milliseconds: 400));
-        player.setProperty('vid', 'auto');
-        return false;
-      case 2:
-        await player.command(['video-reload']);
-        return false;
-      default:
-        final vc = videoController;
-        if (vc == null) return false;
-        final (w, h) = _nudgeSize;
-        await vc.setSize(width: w, height: h);
-        return true;
-    }
-  }
-
-  /// 第 3 级钉尺寸用的尺寸。
+  /// 钉尺寸用的尺寸。
   ///
   /// 优先取 demuxer 报的轨道尺寸：`track-list/<n>/demux-w` 不依赖视频输出就有效
   /// （竖屏视频也报得对），而 `video-params` 此刻正是空的 —— 那正是病根。
@@ -1437,6 +1440,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     return (1920, 1080);
   }
+
+  // 5484 上线前这里还有两级，线上日志把它们的账算清楚了，别再捡回来：
+  //
+  //   1. `vid=no` → `auto`（重挂视频轨）：**不修病，还有声音代价**。它强制
+  //      视频轨重挂 → `timeline: refresh seek` → 缓冲从 100% 掉到 0% →
+  //      `Audio device underrun detected`（耳朵能听到的一声爆音），而且会把
+  //      位置往回拖到上一个关键帧（实测 14.1s → 10.0s）。画面照样是黑的。
+  //   2. `video-reload`：**直接报错，还把解码器搞坏**。命令本身返回
+  //      `mpv error: error running command`；之后是 92 条
+  //      `hevc: Could not find ref with POC …` + `Failed to decode frame
+  //      (invalid session, -12903)`，硬解从 videotoolbox 掉到
+  //      videotoolbox-copy。这个 EDL 流 mpv 自己都说了 `Stream is not
+  //      seekable`，中途重载视频流就是会丢参考帧。
+  //
+  // 而第 3 级（钉尺寸）在那一刻干净地修好了：`VO: [libmpv]` / `reconfig` /
+  // `libmpv_render: Window size` 三行是在它触发时才第一次出现的。
 
   /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。
   ///
@@ -1472,6 +1491,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           '${_videoPlayerController?.state.width}x'
           '${_videoPlayerController?.state.height}',
         );
+      }
+      // 「无视频轨」自己一档 2s 的节奏。挂在 10s 心跳上要等两拍才敢动手，
+      // 而黑屏是死锁 —— 那 20s 纯粹是对着黑屏干等。
+      if (now.difference(_lastNoVideoProbe) >= _kNoVideoProbe) {
+        _lastNoVideoProbe = now;
         _checkNoVideoTrack();
       }
       if (isLive ||
