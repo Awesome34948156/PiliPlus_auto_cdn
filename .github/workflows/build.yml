@@ -110,7 +110,9 @@ jobs:
 
             - name: Flutter Build Release Apk
               if: ${{ github.event_name == 'workflow_dispatch' }}
-              run: flutter build apk --release --split-per-abi --dart-define-from-file=pili_release.json --no-pub
+              # 不带 --split-per-abi：产出一个含全部 ABI 的通用包，
+              # 用户不用再挑 arm64-v8a / armeabi-v7a / x86_64。
+              run: flutter build apk --release --dart-define-from-file=pili_release.json --no-pub
 
             - name: Flutter Build Dev Apk
               if: ${{ github.event_name == 'pull_request' }}
@@ -119,7 +121,14 @@ jobs:
 
             - name: Rename
               run: |
+                  # 通用包：不带 --split-per-abi 的产物，文件名没有 ABI 段
+                  if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+                    mv build/app/outputs/flutter-apk/app-release.apk \
+                       "PiliPlus_android_${{ env.version }}_universal.apk"
+                  fi
+                  # 按 ABI 拆的产物（PR 的 dev 包仍是拆包）
                   for file in build/app/outputs/flutter-apk/app-*-release.apk; do
+                    [ -e "$file" ] || continue
                     abi=$(echo "$file" | sed -E 's|.*app-(.*)-release\.apk|\1|')
                     mv "$file" "PiliPlus_android_${{ env.version }}_${abi}.apk"
                   done
@@ -137,22 +146,8 @@ jobs:
               uses: actions/upload-artifact@v7
               with:
                   archive: false
-                  name: Android_arm64-v8a
-                  path: PiliPlus_android_*_arm64-v8a.apk
-
-            - name: 上传
-              uses: actions/upload-artifact@v7
-              with:
-                  archive: false
-                  name: Android_armeabi-v7a
-                  path: PiliPlus_android_*_armeabi-v7a.apk
-
-            - name: 上传
-              uses: actions/upload-artifact@v7
-              with:
-                  archive: false
-                  name: Android_x86_64
-                  path: PiliPlus_android_*_x86_64.apk
+                  name: Android_apk
+                  path: PiliPlus_android_*.apk
 
     ios:
         if: ${{ (github.event_name == 'pull_request' && github.repository == 'bggRGjQaUbCoE/PiliPlus') || github.event.inputs.build_ios == 'true' }}
