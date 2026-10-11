@@ -1,4 +1,8 @@
-/// mpv / ffmpeg 在说「你给我的这段字节我解不出来」的几种说法。
+/// mpv / ffmpeg 在说「画面出不来了」的**两种**说法：一种怪**字节**，一种怪
+/// **本机解码会话**。两者症状一模一样（声音在走、画面冻着、缓冲余量健康），
+/// 但**该做的事相反** —— 前者换源，后者重建本机解码器。
+///
+/// 下面先讲第一种。
 ///
 /// 这是换源型故障的**另一半**。另外几条 CDN 判据（位置冻结、缓冲饥饿、余量
 /// 失真）看的都是"喂不饱"；而镜像把**坏字节**喂进来时，吞吐、余量、位置、hwdec
@@ -58,6 +62,53 @@ final List<String> _kDecoderCorruptionSignaturesLower = kDecoderCorruptionSignat
 bool isDecoderCorruptionLog(String text) {
   final lower = text.toLowerCase();
   return _kDecoderCorruptionSignaturesLower.any(lower.contains);
+}
+
+/// mpv / ffmpeg 在说「**本机解码会话**已经废了」的几种说法。
+///
+/// 和 [kDecoderCorruptionSignatures] 是**两个不同的病**，虽然症状一模一样
+/// （声音在走、画面冻着、余量健康）：
+///
+/// - 那一族是**镜像喂进来的字节**解不出来 —— 换源能治，`onDecodeError` 走那条路。
+/// - 这一族是**本机的硬解会话**被系统作废了 —— 字节是好的，换源治不了，只能
+///   重建本机解码器。2026-10-11 实测：app 退后台 6 分钟，回前台那一刻 **0.881 秒
+///   内刷了 78 行**这类报错（`av1: Failed to decode frame (invalid session, -12903)`
+///   ×1、`av1: vt decoder cb: output image buffer is null: -12909, reconfig 1` ×25，
+///   其余两条是通用症状），随后**画面再没回来** —— 位置 19s→28s 在推进、余量 28s、
+///   音频 AAC 正常，直到用户点走别的视频把它拆掉。
+///
+/// **刻意只收"会话 / 渲染缓冲"这一层。** 同一场风暴里的
+/// `vd: Error while decoding frame (hardware decoding)!` 与
+/// `av1: HW accel end frame fail.` **不收**：它们是**通用症状** —— 坏字节时也刷，
+/// 而 `PLPlayerController` 里那段 `video-reload` 的事故记录（见 `_healNoVideoTrack`
+/// 上方的注释）正是我们自己的重载弄出来的 92 行同类报错。收进来会在**真正的坏
+/// 字节风暴**里（那一族本该命中 400+ 条并换源）把动作从"换源"改成"重建解码器"，
+/// 等于治错了病。
+const List<String> kDecoderSessionFailureSignatures = [
+  // VideoToolbox 的 DecompressionSession 被系统作废。iOS 在 app 被挂起时会这么干；
+  // 之后每一帧都解不出来，而音频走的是另一条 EDL 源，照常播。
+  'invalid session',
+  // 解码回调拿不到输出缓冲（`vt decoder cb: output image buffer is null: -12909`）。
+  // 后面常跟 `reconfig N` —— mpv 自己试过重配，照样拿不到。
+  'output image buffer is null',
+];
+
+/// 预先转小写的签名表，理由同 [_kDecoderCorruptionSignaturesLower]。
+final List<String> _kDecoderSessionFailureSignaturesLower =
+    kDecoderSessionFailureSignatures
+        .map((s) => s.toLowerCase())
+        .toList(growable: false);
+
+/// 这一行 mpv 日志是不是在说「**本机硬解会话废了**」—— 注意不是"字节坏了"。
+///
+/// 调用方拿它做的动作与 [isDecoderCorruptionLog] **相反**：不是换源，而是重建
+/// 本机解码器（`PLPlayerController.refreshPlayer`）。所以两者必须互斥地使用：
+/// 有坏字节证据时让位给换源那条路（见 `_sampleDecoderSessionFailure` 里的让位判据）。
+///
+/// 匹配同样大小写无关、同样只做子串匹配，理由同 [isDecoderCorruptionLog]。
+bool isDecoderSessionFailureLog(String text) {
+  final lower = text.toLowerCase();
+  return _kDecoderSessionFailureSignaturesLower.any(lower.contains);
 }
 
 /// 记一条**已判定为坏字节**的报错（[isDecoderCorruptionLog] 过了才调），

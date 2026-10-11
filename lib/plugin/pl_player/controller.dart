@@ -291,6 +291,32 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 取 5ms：三层会跨毫秒边界，同毫秒太紧。
   static const Duration _kDecodeLineDedupe = Duration(milliseconds: 5);
 
+  /// 硬解会话失效：这么短的时间内攒够这么多条「本机解码会话废了」的报错，就重建
+  /// 解码器。判据见 [isDecoderSessionFailureLog]。
+  ///
+  /// 6 条 / 3 秒是照着实测那一场卡的：0.881 秒里 26 条（会话层那两条，
+  /// `invalid session` ×1 + `output image buffer is null` ×25）—— 4 倍余量。
+  /// 不能只认单条：单条 `invalid session` 在 seek / 拆链的缝隙里也可能冒出来，
+  /// 那时候重建是白扔一整个缓冲。
+  static const int _kSessionFailBurst = 6;
+
+  /// 上面那 6 条的统计窗口。同 [_kDecodeErrorWindow]：要的是"短时间内密集"，
+  /// 不是"累计"。
+  static const Duration _kSessionFailWindow = Duration(seconds: 3);
+
+  /// 重建过一次之后隔多久才允许再重建。一轮重建要重开播放器、缓冲从头攒
+  /// （1~3 秒卡顿），不压住的话一次会话失效会连着重建好几轮。取 30s，与
+  /// [_kDecodeErrorCooldown] 同量级。
+  static const Duration _kSessionFailCooldown = Duration(seconds: 30);
+
+  /// 让位窗：距最近一条**坏字节**报错（[lastDecoderCorruptionAt]）不到这么久，
+  /// 就不把会话失效当回事 —— 那说明真正发生的是"镜像喂了坏字节"，该走换源。
+  ///
+  /// 两族在同一场故障里可能交错出现（坏字节同样会让硬解拿不到输出缓冲），少了
+  /// 这一条就会一边换源一边重建解码器，两个动作互相拆台。取 2s：坏字节是**成百条
+  /// 不停地刷**的（实测 400+ 条、横跨 100 多秒），2 秒内必有新的一条续上。
+  static const Duration _kSessionFailDeferBadBytes = Duration(seconds: 2);
+
   /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
   /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
   /// 后停读，等掉回水位才续读，所以健康播放的锯齿在
@@ -363,6 +389,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// "不再吐坏字节"才是真话。
   DateTime? lastDecoderCorruptionAt;
 
+  /// 落在 [_kSessionFailWindow] 里的「本机解码会话废了」的报错时刻，窗口自己滑动
+  /// 淘汰。与 [_decodeErrors] 分开记账：两族的窗口、门槛、以及**该做的事**都不同。
+  final List<DateTime> _sessionFailures = [];
+
+  /// 重建解码器的冷却截止时刻。见 [_kSessionFailCooldown]。
+  DateTime _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
   /// 换集 / 换画质：换成了**另一个对象**，旧的解码账作废重计。
   ///
   /// 刻意不在 `setDataSource` / `player.open` 里调 —— 换源重载时旧流的报错要
@@ -371,6 +404,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _decodeErrors.clear();
     _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
     lastDecoderCorruptionAt = null;
+    _sessionFailures.clear();
+    _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
   }
 
   /// 全屏方向
@@ -1216,6 +1251,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _decodeErrors.clear();
     _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
     lastDecoderCorruptionAt = null;
+    _sessionFailures.clear();
+    _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
     final stream = player.stream;
     _subscriptions = [
       /// playing
@@ -1308,6 +1345,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 采样搭在这里而不是 `stream.error` 上：同一个事件在两条通道上都会到，
         // 两边都采等于阈值被砍半。
         _sampleDecodeError(log.text);
+        _sampleDecoderSessionFailure(log.text);
         if (kDebugMode || consoleLogActive) {
           if (log.level == 'error' || log.level == 'fatal') {
             Utils.reportError(
@@ -1579,6 +1617,65 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       '$_kDecodeErrorBurst 条），当前镜像给的字节解不出画面 —— 上报换源',
     );
     onDecodeError?.call(videoPlayerController?.state.position ?? Duration.zero);
+  }
+
+  /// 硬解会话失效的采样：攒够 [_kSessionFailBurst] 条就**重建本机解码器**。
+  ///
+  /// 与 [_sampleDecodeError] 是两个相反的结论，见 [isDecoderSessionFailureLog]：
+  /// 那条路是"镜像给的字节解不出来" → 换源；这条路是"本机硬解会话被系统作废了"
+  /// → 重开同一个 Media。2026-10-11 实测那一局（退后台 6 分钟再回前台，0.881 秒
+  /// 78 行、随后画面再没回来）正是后者：换源毫无用处 —— 字节是好的，位置和缓冲
+  /// 余量全程健康。所以这里**不**上报 [onDecodeError]。
+  ///
+  /// 同样搭在 `stream.log` 上、同样因为"报错是事件不是采样量"，理由见
+  /// [_sampleDecodeError] 的注释。
+  void _sampleDecoderSessionFailure(String text) {
+    if (!isDecoderSessionFailureLog(text)) return;
+    final now = DateTime.now();
+    // 让位于坏字节：两族的动作相反，同时开火会互相拆台（见那个常量的注释）。
+    final lastBadBytes = lastDecoderCorruptionAt;
+    if (lastBadBytes != null &&
+        now.difference(lastBadBytes) < _kSessionFailDeferBadBytes) {
+      return;
+    }
+    // 闸门：拆链 / 重载的缝隙里，会话报错是**正常**产物，不该拿去重建。本故障
+    // 那一刻这几样全是健康的（实测：余量 28s、重新缓冲 false、输出参数
+    // 1920x1080），所以它照样进得来。
+    //
+    // 换源在途由 [_processing] 挡（页面 `playerInit` 会置它）；[refreshPlayer]
+    // 不走那条路、自己不会置 [_processing]，所以另用 [isBuffering] 与余量把
+    // "任何一次重载的拆装抖动"一起挡在外面。
+    if (isSeeking.value ||
+        _processing ||
+        onlyPlayAudio.value ||
+        isBuffering.value ||
+        bufferedAhead <= 0 ||
+        // 输出参数是好的 ⇒ 坏在解码链上，不是 [_checkNoVideoTrack] 那条死锁 ——
+        // 那条自己有自愈，两边不能同时动手。
+        !_hasVideoTrack) {
+      return;
+    }
+    if (!recordDecodeErrorHit(
+      _sessionFailures,
+      now,
+      window: _kSessionFailWindow,
+      burst: _kSessionFailBurst,
+      lineDedupe: _kDecodeLineDedupe,
+    )) {
+      return;
+    }
+    // 先记账、再判冷却：同 [_sampleDecodeError]，冷却压的是"动手"不是计数。
+    // 这里不用清 [_sessionFailures] —— 冷却（30s）比窗口（3s）长得多，到那时
+    // 旧记录早就自己出窗了，清是句死代码。
+    if (now.isBefore(_sessionHealUntil)) return;
+    _sessionHealUntil = now.add(_kSessionFailCooldown);
+    debugPrint(
+      'CDN 看门狗: 硬解会话失效（${_kSessionFailWindow.inSeconds}s 内 '
+      '$_kSessionFailBurst 条），本机解码器被系统作废 —— 重建解码器',
+    );
+    // 重开同一个 Media：位置保留（见 [refreshPlayer] 里的 `start: state.position`），
+    // 解码器和视频输出都是全新的。代价是缓冲从头攒、1~3 秒卡顿 —— 比永久黑屏值。
+    refreshPlayer();
   }
 
   /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。

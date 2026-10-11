@@ -98,6 +98,91 @@ void main() {
     );
   });
 
+  group('isDecoderSessionFailureLog 认得本机硬解会话废了', () {
+    test('2026-10-11 那一局：退后台 6 分钟，回前台 0.881 秒刷了 78 行', () {
+      // 逐字抄自 iPhone 上取回的 pili-console.log（行 599–676）。这一族和坏字节
+      // 那族**症状完全相同、该做的事相反**：字节是好的，换源治不了，只能重建
+      // 本机解码器。所以它必须是**独立**的判据，不能并进上面那张签名表。
+      const lines = [
+        'av1: Failed to decode frame (invalid session, -12903)',
+        'av1: vt decoder cb: output image buffer is null: -12909, reconfig 1',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionFailureLog(line), isTrue, reason: line);
+      }
+    });
+
+    test('大小写无关：mpv/ffmpeg 的输出大小写并不稳定', () {
+      const lines = [
+        'av1: FAILED TO DECODE FRAME (INVALID SESSION, -12903)',
+        'AV1: VT DECODER CB: OUTPUT IMAGE BUFFER IS NULL: -12909, RECONFIG 1',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionFailureLog(line), isTrue, reason: line);
+      }
+    });
+  });
+
+  group('会话失效不该认的', () {
+    test('坏字节那一族的行，一条都不算会话失效', () {
+      // 收进来就会在**真正的坏字节风暴**里（那一族本该命中 400+ 条并换源）把动作
+      // 从"换源"改成"重建解码器" —— 治错了病。
+      const lines = [
+        'av1: obu_forbidden_bit out of range: 1, but must be in [0,0].',
+        'libdav1d: Error parsing OBU data',
+        'Invalid NAL unit size (34817 > 5117).',
+        'missing picture in access unit with size 5121',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionFailureLog(line), isFalse, reason: line);
+      }
+    });
+
+    test('通用症状不收 —— 坏字节时也刷，5484 那次我们自己重载弄出的 92 条正是它们', () {
+      // 这两条和上面那两条在**同一场**风暴里成对出现（实测各 ×26）。只认会话层
+      // 那两条，是为了保证"坏字节 → 换源"这条路不被抢走动作。
+      const lines = [
+        'vd: Error while decoding frame (hardware decoding)!',
+        'av1: HW accel end frame fail.',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionFailureLog(line), isFalse, reason: line);
+      }
+    });
+
+    test('网络族的行也不算', () {
+      const lines = [
+        'tls: IO error: Socket is not connected',
+        'ffmpeg: https: Will reconnect at 366404 in 0 second(s), '
+            'error=Socket is not connected.',
+        'Stream ends prematurely at 0, should be 543447102',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionFailureLog(line), isFalse, reason: line);
+      }
+    });
+
+    test('两族的判据互不重叠（同一条日志不可能两边都算）', () {
+      // 这两族被两个采样器分别喂进去，动作相反（换源 vs 重建本机解码器）。
+      // 有交叠就会出现"一边换源一边重建"，两个动作互相拆台。
+      const lines = [
+        'av1: Failed to decode frame (invalid session, -12903)',
+        'av1: vt decoder cb: output image buffer is null: -12909, reconfig 1',
+        'av1: obu_forbidden_bit out of range: 1, but must be in [0,0].',
+        'libdav1d: Error parsing OBU data',
+        'Invalid NAL unit size (34817 > 5117).',
+        'missing picture in access unit with size 5121',
+      ];
+      for (final line in lines) {
+        expect(
+          isDecoderSessionFailureLog(line) && isDecoderCorruptionLog(line),
+          isFalse,
+          reason: line,
+        );
+      }
+    });
+  });
+
   group('recordDecodeErrorHit 攒风暴', () {
     // 播放器那边用的就是这三个数（PlPlayerController）。
     const window = Duration(seconds: 6);
@@ -171,6 +256,26 @@ void main() {
         hit(hits, t0.add(Duration(milliseconds: 100 * i)));
       }
       expect(hits.length, 12);
+    });
+
+    test('会话失效那一档用的是 6 条 / 3 秒，不是 12 条 / 6 秒', () {
+      // 两个采样器共用这个纯函数，只是传进来的窗口和门槛不同（会话失效那一档见
+      // PlPlayerController._kSessionFailBurst / _kSessionFailWindow）。实测那一场
+      // 是 0.881 秒 26 条，6 条 / 3 秒有 4 倍余量 —— 而单条 `invalid session`
+      // 在 seek / 拆链的缝隙里也会冒出来，所以门槛不能低到一条就动手。
+      final hits = <DateTime>[];
+      bool hit(DateTime now) => recordDecodeErrorHit(
+        hits,
+        now,
+        window: const Duration(seconds: 3),
+        burst: 6,
+        lineDedupe: dedupe,
+      );
+      for (var i = 0; i < 5; i++) {
+        expect(hit(t0.add(Duration(milliseconds: 30 * i))), isFalse,
+            reason: '第 ${i + 1} 条不该触发');
+      }
+      expect(hit(t0.add(const Duration(milliseconds: 150))), isTrue);
     });
 
     test('a backwards clock step does not silence the criterion', () {
