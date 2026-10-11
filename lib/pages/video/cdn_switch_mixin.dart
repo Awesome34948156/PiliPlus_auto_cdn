@@ -31,11 +31,16 @@ enum _CdnRoundVerdict {
 
 /// [CdnSwitchMixin._pickFastestCdn] 的一轮结果。[service] 只在
 /// [verdict] 为 [_CdnRoundVerdict.better] 时非空。
+///
+/// [champion] 是这一轮**白占了一个候选位**的那个镜像（没有就是 null）。它不参与
+/// 判定，只是带回来给 [_noteChampionOutcome] 记账 —— 保留票该不该继续发，只能
+/// 在结果出来之后才知道。
 typedef _CdnRound = ({
   _CdnRoundVerdict verdict,
   CDNService? service,
   int bytes,
   int micros,
+  CDNService? champion,
 });
 
 /// 触发一轮测速的原因。只影响日志和 toast 里的说法，以及用哪一档预算 ——
@@ -238,6 +243,14 @@ mixin CdnSwitchMixin on GetxController {
   /// 昨天的冠军今天未必还是。
   static const Duration _kCdnRecordExpiry = Duration(hours: 6);
 
+  /// 历史冠军连着这么多轮**没能成为切换目标**，就把它从冠军位请出去，把那个
+  /// 候选位让给轮换。判定与理由见 [_cdnChampionMisses] 和 [_noteChampionOutcome]。
+  ///
+  /// 取 2 而不是更大：误降级的代价只是"这一集少一张保留票"，而它照样能被轮换
+  /// 窗口取到、照样能靠被选中重新挣回来；而漏降级的代价是每轮白少测一个镜像，
+  /// 实测能连任 25 轮。宁可早点让位。
+  static const int _kCdnChampionMisses = 2;
+
   // ---------------------------------------------------------------------------
   // 一集之内的状态：换集、换 P、换画质都走 resetCdnAutoSwitch() 清掉。
   // ---------------------------------------------------------------------------
@@ -255,6 +268,25 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 上一轮一个字节都没到的候选。见 [_kCdnDeadRetryAfter]。
   final Set<CDNService> _cdnNoSample = {};
+
+  /// 历史冠军的"欠账"：连着多少轮**没能成为切换目标**。达到
+  /// [_kCdnChampionMisses] 就不再给它留候选位。
+  ///
+  /// 冠军位是一张**保留票** —— 让快的镜像不必等轮换排到（见 [_cdnChampion]）。
+  /// 但保留票的前提是"迟早能兑现"。[_recordCdnSample] 只留最大值、且只在**刷新
+  /// 纪录**时才续 30 分钟的时钟，于是当一条记录是靠一次突发立起来的、此后每轮
+  /// 实测都更慢时，它既不更新也不作废（覆盖不了自己，也够不着 6 小时的作废线），
+  /// 冠军位就被永久占住。
+  ///
+  /// 实测 2026-10-11 一局 25 轮：`ali（阿里云）` 连任 25/25 轮冠军，轮轮实测
+  /// 0.475–0.879MB/s，而同一轮的基线有 1.7–6.1MB/s（比值 0.12–0.47，门槛 1.5）
+  /// —— 一个候选位白占到底，轮换一轮只够走一个镜像。
+  ///
+  /// 用**结果**记这个账，而不是拿记录去比当下基线：基线每轮都在变（实测同一条
+  /// 链路隔几分钟能差 4 倍），静态记录比动态读数本来就没有可靠门限；而"这一轮
+  /// 它有没有被选中"是确定的事实。被选中就清零，所以降级可逆 —— 它还能从轮换
+  /// 窗口里被取到，并靠被选中重新挣回冠军位（见 [_noteChampionOutcome]）。
+  final Map<CDNService, int> _cdnChampionMisses = {};
 
   /// 这一集的对象总长。所有镜像服务字节一致的同一个对象，探一次就够；
   /// 缓存它主要是为了小卡顿档 —— 3 秒预算里不该再花几秒去探大小。
@@ -344,6 +376,9 @@ mixin CdnSwitchMixin on GetxController {
   /// 记录只决定"优先被想到"，不决定"优先被信任"，所以记录过期或不准也不会
   /// 造成误切，只是白占一个位子。
   ///
+  /// 但"只是白占一个位子"这件事本身是要还的：连着 [_kCdnChampionMisses] 轮没能
+  /// 成为切换目标就不再发这张保留票，见 [_cdnChampionMisses]。
+  ///
   /// 要求"当过候选"是因为基线样本和候选样本不是同一个测量：基线用原始签名
   /// URL，候选用改写 host 之后的 URL。`akamai` 就是反例 —— 当基线能跑到
   /// 5MB/s，当候选每次都 403。把它送进候选窗口是纯亏：冠军位白占，轮换还少
@@ -365,6 +400,14 @@ mixin CdnSwitchMixin on GetxController {
     for (final service in CdnSpeedTest.mirrors) {
       // 当前在播的已经坐在基线位置上了，再占一个候选位子等于白少测一个镜像。
       if (service.host == currentHost) continue;
+      // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 [_cdnChampionMisses]。
+      if ((_cdnChampionMisses[service] ?? 0) >= _kCdnChampionMisses) {
+        debugPrint(
+          'CDN 自动切换: 历史冠军候选 ${service.desc} 已降级，本轮不发保留票 '
+          '(欠账 ${_cdnChampionMisses[service]}/$_kCdnChampionMisses)',
+        );
+        continue;
+      }
       final at = service.index * 3;
       if (at + 2 >= record.length) continue;
       if (record[at + 2] != 1) continue;
@@ -379,6 +422,37 @@ mixin CdnSwitchMixin on GetxController {
       bestSpeed = speed;
     }
     return best;
+  }
+
+  /// 一轮测速结束后给冠军位记账：它这一轮被选中了吗？
+  ///
+  /// 规则就一句：**谁被选中谁就挣到了**。所以冠军被选中就保住位子；轮换里冒出来
+  /// 的镜像被选中，就把它自己的欠账清零 —— 一个被降级的冠军照样能从轮换窗口里
+  /// 重新挣回来，降级不是永久的。
+  ///
+  /// 一轮作废（416 / 基线未遵守 Range）时谁也没测出东西，这一轮不算任何人的账。
+  /// 其余情况冠军只要没成为切换目标就记一笔：包括它测得慢、包括别的候选比它更
+  /// 合适、也包括它一个字节都没测到 —— 从"这张保留票该不该继续发"的角度看，
+  /// 这三种都是没兑现。
+  void _noteChampionOutcome(_CdnRound round) {
+    if (round.verdict == _CdnRoundVerdict.better) {
+      _cdnChampionMisses.remove(round.service);
+    }
+    final champion = round.champion;
+    if (champion == null ||
+        round.verdict == _CdnRoundVerdict.unmeasurable ||
+        round.service == champion) {
+      return;
+    }
+    final misses = (_cdnChampionMisses[champion] ?? 0) + 1;
+    _cdnChampionMisses[champion] = misses;
+    debugPrint(
+      misses >= _kCdnChampionMisses
+          ? 'CDN 自动切换: 历史冠军 ${champion.desc} 连续 $misses 轮没能成为切换目标，'
+                '退出冠军位让给轮换'
+          : 'CDN 自动切换: 历史冠军 ${champion.desc} 本轮没能成为切换目标 '
+                '($misses/$_kCdnChampionMisses)',
+    );
   }
 
   bool get _cdnAutoEligible {
@@ -402,6 +476,8 @@ mixin CdnSwitchMixin on GetxController {
     _cdnAutoAttempts = 0;
     _cdnTriedAt.clear();
     _cdnNoSample.clear();
+    // 换集/换画质是新的比较对象，冠军位的欠账重新计。
+    _cdnChampionMisses.clear();
     // 换集/换画质后对象变了，缓存的总长不再适用。
     _cdnObjectSize = null;
     _cdnGiveUpUntil = null;
@@ -639,6 +715,8 @@ mixin CdnSwitchMixin on GetxController {
       final round = await _pickFastestCdn(stalledAt, quick: quick);
       if (generation != _cdnGeneration || isClosed || isQuerying) return;
       if (round == null) break;
+      // 这一轮的结果已经拿到了，先给冠军位记账，再决定要不要切换。
+      _noteChampionOutcome(round);
       if (round.verdict == _CdnRoundVerdict.unmeasurable) {
         // 这里说「CDN 都正常」是假话：根本没测出可比的数据。
         giveUp = '无法测出更快的 CDN，暂不切换';
@@ -919,6 +997,7 @@ mixin CdnSwitchMixin on GetxController {
         service: null,
         bytes: 0,
         micros: 0,
+        champion: champion,
       );
     }
 
@@ -1006,6 +1085,7 @@ mixin CdnSwitchMixin on GetxController {
           service: null,
           bytes: base.bytes,
           micros: base.micros,
+          champion: champion,
         );
       }
       return unmeasurable(
@@ -1026,6 +1106,7 @@ mixin CdnSwitchMixin on GetxController {
         service: best.$1,
         bytes: best.$2.bytes,
         micros: best.$2.micros,
+        champion: champion,
       );
     }
 
@@ -1058,6 +1139,7 @@ mixin CdnSwitchMixin on GetxController {
         service: null,
         bytes: base.bytes,
         micros: base.micros,
+        champion: champion,
       );
     }
     return (
@@ -1065,6 +1147,7 @@ mixin CdnSwitchMixin on GetxController {
       service: best.$1,
       bytes: best.$2.bytes,
       micros: best.$2.micros,
+      champion: champion,
     );
   }
 
