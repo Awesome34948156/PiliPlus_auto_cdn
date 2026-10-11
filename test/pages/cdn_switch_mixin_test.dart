@@ -6,6 +6,7 @@ import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/pages/video/cdn_switch_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
+import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/utils/cdn_speed_test.dart';
 import 'package:PiliPlus/utils/storage.dart';
@@ -278,6 +279,166 @@ void main() {
       reason: '这一轮已经作废了，不该再花流量去测速：${cdn.samples}',
     );
   });
+
+  test('被顶掉的那一页连兜底重载都不该碰', () async {
+    // 尾段那道兜底（`_autoSwitchLoop` 收尾）：一轮没能换出结果、而画面已经冻住
+    // （`telemetryDiverged`）时，重载当前源，让音视频两条流重新对齐时钟。它
+    // **不换源**，所以前几条用例盯的那些切换动作一个都看不见它 —— 得单独把
+    // "画面已冻"这个前提摆出来才测得到。
+    //
+    // 前提摆两样：
+    //   - `cache-secs` 30s（mpv 的缓存上限）× `_kDivergedFactor` 3 倍 = 90s 是
+    //     失真线，余量 200s 压在上面 —— 也就是"音频在走、画面冻着"那份被抬到
+    //     上千秒的余量。判据是**现场取值**的（那段注释：一轮跑好几秒，期间可能
+    //     自己缓过来），所以整轮都得让它成立；
+    //   - 基线挪到 [_steadyBaselineUrl]：假适配器按 host 发字节，基线那一份于是
+    //     不再是"拿不出有效速度"的小样本，这一轮的裁定落成一条**不切换**的结论
+    //     —— 正是兜底要接的那种。留在 [_baselineUrl] 上，结论会是"基线无有效
+    //     速度，直接切换"，这一轮换完就走人，兜底根本轮不到，用例会空转。
+    PlPlayerController.getInstance()
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 200
+      ..position.value = 0;
+    cdn.holdProbe = Completer<void>();
+    hostA
+      ..videoUrl = _steadyBaselineUrl
+      ..attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => cdn.probes.isNotEmpty);
+
+    // 相关视频跳转：新页 attach 抢走共享播放器的回调，旧页不 onClose、不换代。
+    // 顶进来的时刻选在"探对象总长"那一发卡住的时候 —— 那一发后面还有整轮测速，
+    // 每一处 await 之后旧页都还会接着往下走，最后撞在 `_pickFastestCdn` 之后
+    // 那道 `!_cdnIsAttached` 复查上。
+    hostB.attachCdnSwitch();
+    cdn.holdProbe!.complete();
+
+    // 等三发采样都发出去 —— 那是"这一轮真的跑到了测速"的正面证据。少了它，
+    // 下面那两句"没有"就可能是"这一轮压根卡在探测里"的假绿。
+    await _waitFor(() => cdn.samples.length >= 3);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(cdn.samples.length, 3, reason: '这一轮没跑完测速：${cdn.samples}');
+    expect(
+      PlPlayerController.getInstance().telemetryDiverged,
+      isTrue,
+      reason: '兜底的前提不成立，这条用例就空转了 —— 下面两句"没有"什么也证明不了',
+    );
+    expect(
+      log.has('画面已冻（余量失真），重载当前源'),
+      isFalse,
+      reason: '旧页已经不在台上了，不该重载共享播放器：\n${log.text}',
+    );
+    expect(
+      log.has('放弃，'),
+      isFalse,
+      reason: '这一轮该在那道复查上断掉，不该走到收尾、更不该写冷却：\n${log.text}',
+    );
+  });
+
+  test('没被顶掉时兜底重载照旧（上一条的否定不是空的）', () async {
+    // 上一条的对照组，**只差"有没有被顶掉"这一件事**：同样的"画面已冻"前提、
+    // 同一条基线、同一轮测速。这里必须看见那句重载 —— 否则上一条的"没有"就只是
+    // "这句日志在任何情况下都不会出现"，什么也没锁住。
+    //
+    // 关键是让这一轮**不切换**：换了源 `switched` 就是真，兜底那句
+    // `if (!switched && telemetryDiverged)` 直接短路。裁定怎么摆出来：
+    //   - 基线在 [_steadyBaselineUrl] 上 —— host 一离开 [_baselineHost]，假适配器
+    //     就按候选档发字节，基线于是**拿得出**有效速度；
+    //   - 候选拿到的字节数与基线一模一样，比值 ≈ 1.0x，够不着 `_kCdnStarveRatio`
+    //     1.5 → 判成 `healthy`（"CDN 都正常"）→ 不切换。真要两边比出差距得靠
+    //     真实墙钟去堆分块延迟，那既慢又不稳（文件头那句"刻意不用速度比来造
+    //     better"）。实测这条路上比值一直落在 0.99x 附近，阈值在 1.5。
+    //
+    // 播放器单例的 `dataSource` 是 `late`（`controller.dart:180`），兜底那句
+    // `refreshPlayer()` 头一件事就是读它（`:1210`）。不摆好，这条会在打出"画面
+    // 已冻"之后抛 LateInitializationError —— 日志对了、用例照样红。摆成网络源
+    // （非 FileSource）才走得到重载那一句。
+    PlPlayerController.getInstance()
+      ..dataSource = NetworkSource(
+        videoSource: _steadyBaselineUrl,
+        audioSource: null,
+      )
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 200
+      ..position.value = 0;
+    hostA
+      ..videoUrl = _steadyBaselineUrl
+      ..attachCdnSwitch();
+    _stall(hostA);
+
+    await Future<void>.delayed(const Duration(seconds: 3));
+
+    expect(
+      log.has('-> 不切换'),
+      isTrue,
+      reason: '这一轮本该判成不切换（基线健康、候选不快）—— 裁定变了就不是这条用例在测的东西了：'
+          '\n${log.text}',
+    );
+    expect(
+      log.has('画面已冻（余量失真），重载当前源'),
+      isTrue,
+      reason: '没人顶掉、又没能换出更快的镜像，兜底就该重载当前源：\n${log.text}',
+    );
+    expect(
+      log.has('放弃，60s 内不再尝试（画面已冻，没有更快的镜像，已重载当前源）'),
+      isTrue,
+      reason: '重载之后那句收尾没写出来，说明兜底半路断了：\n${log.text}',
+    );
+  });
+
+  test('被顶掉又回来的那一页，旧一轮不许复活（重挂要作废在途轮）', () async {
+    // 与"被顶掉的那一页连兜底重载都不该碰"只差**一步**：那条停在"被顶掉"，
+    // 这条多一个"用户又退回来"。返回时 `view.dart` 的 `didPopNext` 会再调一次
+    // `attachCdnSwitch()`，而此刻 `_cdnIsAttached` 是假（回调被 B 抢走了），幂等
+    // 守卫拦不住 —— 回调重新挂上、`_cdnIsAttached` 又读成真。可 `_cdnGeneration`
+    // 没动，于是那一轮"本页还有效吗"重新读成真：它醒来就接着往下走，拿的还是
+    // **上一个视频**的地址去指挥这台共享播放器。修复就是让"重挂"顺手作废在途轮。
+    //
+    // 卡在"探对象总长"那一发上，好让这一轮停在 `_pickFastestCdn` 中间：那里之后
+    // 只有 `_roundVoided` 一道闸、**没有** `_cdnIsAttached` 复查（`:1142`），
+    // 正是"代际不动就拦不住"的那个缺口。
+    cdn.holdProbe = Completer<void>();
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => cdn.probes.isNotEmpty);
+    expect(
+      log.has('卡顿 @100s，开始找可用镜像'),
+      isTrue,
+      reason: '这一轮压根没起来，下面那句"没有取样"什么也证明不了：\n${log.text}',
+    );
+
+    // 相关视频跳转：新页 attach 抢走回调。旧页不 onClose、不换代。
+    hostB.attachCdnSwitch();
+    // 用户又退了回来：`didPopNext` 再挂一次 —— 就是这一步让旧一轮"复活"。
+    hostA.attachCdnSwitch();
+
+    cdn.holdProbe!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+
+    expect(
+      cdn.samples,
+      isEmpty,
+      reason: '旧页被顶掉过，那一轮已经作废，不该再花流量测速：${cdn.samples}',
+    );
+
+    // 半路那道闸不能只关不重开：代际一推进，那一轮的 whenComplete 就认不出自己了
+    // （`:672` 的 `generation == _cdnGeneration` 为假），busy 得在同一口气里放下
+    // —— 否则 `_cdnAutoBusy` 永远为真，此后每一次触发都只打一行 `busy=true`，
+    // 而 `attachCdnSwitch` 是幂等的，再也不会回来救它。
+    _stall(hostA, const Duration(seconds: 300));
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(
+      log.has('卡顿 @300s，开始找可用镜像'),
+      isTrue,
+      reason: '重挂之后新一轮起不来 —— busy 那道闸没放下：\n${log.text}',
+    );
+    expect(
+      log.has('busy=true'),
+      isFalse,
+      reason: 'busy 没在重挂时清掉，这一页的自动换源被永久关闸了：\n${log.text}',
+    );
+  });
 }
 
 /// 把触发打进播放器上报口 —— 这就是真实的机制（页面不直接调 mixin 的私有方法）。
@@ -309,6 +470,20 @@ Future<void> _waitFor(
 /// 就落到 `last` 分支，所有候选都变成同一个 URL，一轮测速成了自比。
 const _baselineHost = 'upos-sz-mirrorcos.bilivideo.com';
 const _baselineUrl = 'https://$_baselineHost/upgcxcode/1/2/3/4.m4s';
+
+/// 基线换一条镜像之后的版本：host 挪出 [_baselineHost]，[_FakeAdapter] 于是不再
+/// 把基线当"慢 host"，给它的字节跟候选同一档。
+///
+/// 为什么需要它：按 host 发字节这件事把一轮的裁定分成了两条互斥的路 ——
+/// 基线拿不出有效样本时永远是"直接切换"（`:1377`），一条**不切换**的裁定
+/// （`healthy` / `noBetter`）只有基线**拿得出**速度时才出得来，而
+/// `_autoSwitchLoop` 收尾那道兜底重载（`cdn_switch_mixin.dart:988`）恰恰只接
+/// 不切换的裁定。
+///
+/// host 形状还是照旧匹配 `_mirrorRegex`：`getCdnUrl` 只认这个形状，换成别的形状
+/// 候选会全变成同一个 URL，一轮测速就成了自比。这里改的只是"谁坐在基线位置上"。
+const _steadyBaselineUrl =
+    'https://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3/4.m4s';
 
 /// 假播放器宿主：只实现 mixin 的宿主契约（`cdn_switch_mixin.dart:118-155`），
 /// 外加两个测试钩子。

@@ -741,6 +741,15 @@ mixin CdnSwitchMixin on GetxController {
   /// 的解码风暴计数清空、把预检重新点火。
   void attachCdnSwitch() {
     if (_cdnIsAttached) return;
+    // 能走到这里，说明刚才回调不在我手上 —— 典型情形是相关视频跳转时新页抢走了
+    // 共享播放器的回调，我又在用户退回来时重新挂上（`view.dart` 的 `didPopNext`）。
+    // 这一挂就等于宣告"在台上的又是我"：被顶掉期间留下的那一轮已经跑在**别的视频**
+    // 的地址上，必须当场作废，否则它醒来时会发现 `_cdnIsAttached` 又成了真，接着
+    // 往下指挥播放器。推进代际只是让 [_roundVoided] 认得它；`_cdnAutoBusy` 必须
+    // 同一口气清掉 —— 那一轮的 whenComplete（见 [_onPlayerStall]）只在代际没变时
+    // 才放闸，代际一动就再也不放手，留着 busy 为真等于把本页的自动换源永久关掉。
+    _cdnGeneration++;
+    _cdnAutoBusy = false;
     // 一页 = 一个对象。相关视频跳转会再 push 一个 `/videoV` 而**不** onClose
     // 旧的，播放器却是同一个跨页单例，于是旧页留下的解码账会直接算到新视频
     // 头上：[_decodeErrors] 的残余让新视频几条零星报错就凑满风暴门槛（提前
@@ -1538,7 +1547,18 @@ mixin CdnSwitchMixin on GetxController {
         'CDN 自动切换: 落点 ${player.positionInMilliseconds}ms 落后于 '
         '${target.inMilliseconds}ms，补一次 seek',
       );
-      await player.seekTo(target);
+      // 必须 isSeek: false。默认档（[seekTo] 的 `isSeek = true`）在
+      // `lib/plugin/pl_player/controller.dart:2004-2007` 会先
+      // `await _videoPlayerController?.stream.buffer.first` 才把 seek 发出去，
+      // 而换源重载期间那条流要几秒才吐第一个 buffer —— 这一发于是整段悬着
+      // （真机 pili-console-3：22:00:54.646~57.054 连打四发"补一次 seek"，而 mpv
+      // 到 22:00:57.497 才 `queuing seek`）。悬着的这几秒里用户跳去相关视频，
+      // 它醒来时 `_videoPlayerController` 已经是**新页**的视频了，seek 就落到新页
+      // 的片上，还顺手清掉新页的弹幕（`seek()` 里 `danmakuController?.clear()`）。
+      // `_roundLive` 拦不住一发已经发出去的调用 —— 这里把等待去掉，窗口从
+      // "整个重载期"压到"一条 mpv 命令"。**注意这只是收窄，不是根治**：根治要给
+      // [PlPlayerController] 加"发起者身份"，与重载本身拦不住那条同源（见清单第三批）。
+      await player.seekTo(target, isSeek: false);
     }
   }
 
