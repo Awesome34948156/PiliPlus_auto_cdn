@@ -1588,6 +1588,27 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return threshold < _kStarveMinSeconds ? 0 : threshold;
   }
 
+  /// 是否已进入片尾 —— 剩余时长不足 [_starveThresholdSec]。
+  ///
+  /// 判据 2（[bufferedAhead] 归零的上升沿）和判据 3（缓冲饥饿）在片尾都
+  /// **必然**成立，跟网速多快无关：[bufferedAhead] 是
+  /// `demuxer-cache-time - position`，而 cache-time 不可能超过文件总长，所以
+  /// `bufferedAhead <= 剩余时长` 恒成立 —— 播放位置一进最后 `threshold` 秒，
+  /// 余量就必定掉到阈值以下并最终归零。片尾也无源可换（没有剩余数据要下）。
+  ///
+  /// 实测两次误报都严丝合缝卡在这个边界上：145.403s 的视频从 133s 起计数
+  /// （剩余 12.4s）误报 `缓冲饥饿`、@145s 误报 `余量归零`；95.712s 的视频
+  /// 分别在 83s（剩余 12.7s）和 @95s 各一次。
+  ///
+  /// 用 `<` 而不是 `<=`：position / duration 都是整秒，剩余 13s 时余量真的
+  /// 低于阈值仍是有效观测，只放过可证明为假的那一档。duration 为 0（直播 /
+  /// 时长未知）时返回 false —— 那类流没有片尾。
+  bool get _atFileTail {
+    final threshold = _starveThresholdSec;
+    if (threshold <= 0 || duration.value <= 0) return false;
+    return duration.value - position.value < threshold;
+  }
+
   /// 失真阈值：mpv 缓存上限 `cache-secs` 的 [_kDivergedFactor] 倍。读不到就
   /// 不启用（返回 0）—— 直播走的是 [liveBuffer]，压根没有这个键，本地点播
   /// 文件更是 `cache: no`，两者的 `demuxer-cache-time` 语义本来也不同，不该
@@ -1603,11 +1624,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 拖走了"，后者正是"只有声音、画面冻住"。
   ///
   /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束。
+  ///
+  /// **片尾必须放行**：`bufferedAhead` 的上界就是剩余时长，所以视频最后
+  /// `threshold` 秒里这条判据*必然*成立，跟网速多快无关（推导见 [_atFileTail]）。
   void _sampleStarve(DateTime now) {
     final threshold = _starveThresholdSec;
     // 静默期内不采样：加载/换源/seek 之后 buffered 本来就是 0。去重状态在
     // 进入静默的那一处就重新武装好了（见 [_armRebufferSuppress]）。
     if (threshold <= 0 || now.isBefore(_rebufferSuppressUntil)) return;
+    // 片尾放行：推导见 [_atFileTail]。归零是为了不让这点残数被 seek 回中段
+    // 之后接着用。
+    if (_atFileTail) {
+      _starveSeconds = 0;
+      return;
+    }
     if (bufferedAhead < threshold) {
       if (++_starveSeconds < _kStarveSeconds || _starveFired) return;
       _starveFired = true;
@@ -1649,6 +1679,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 一秒内可能变几十次，数零值会把一次卡顿记成几十次。
   void _sampleRebuffer(DateTime now) {
     if (now.isBefore(_rebufferSuppressUntil)) return;
+    // 片尾放行：推导见 [_atFileTail]。这里余量归零是必然而非故障，不放过的话
+    // 每个视频的最后一秒都会误报一次"小卡顿"。_wasEmpty 不动 —— 片尾之外
+    // 余量一涨回就会把它清掉，向后 seek 之后自然重新武装。
+    if (_atFileTail) return;
 
     // 最敏感的一条：余量归零的上升沿立刻上报，不等 isBuffering、不等攒够次数。
     // 每一次归零只报一次，补回来才重新武装。
