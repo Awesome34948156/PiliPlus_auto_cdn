@@ -1,6 +1,6 @@
 # 自动换源：真机手测清单
 
-这份清单对应 17 条判据修复。其中大部分**单测验不了** —— 要真机、真网络才看得出
+这份清单对应 19 条判据修复（条目 19、20 是 2026-10-12 补的）。其中大部分**单测验不了** —— 要真机、真网络才看得出
 来：回拖重开闸、换画质的 416 循环、解码风暴的干净窗口、旧页面探测定时器、
 暂停下换源。每条都写成「前置 → 手机上怎么做 → 哪行日志算通过 → 哪种现象是没修好」。
 
@@ -14,9 +14,16 @@
 >   （回前台硬解会话作废）。两条的日志证据都记在各自条目下面。
 > - **只能单测、已覆盖**：条目 **16**（时钟回拨）—— `cdn_speed_test_test.dart`，
 >   没有改系统时钟就测不了。
-> - **待真机**：1、2、3、4+10、5、6、7、9、11、12、13、14、15、17 —— **共 14 条**。
+> - **单测新增**：**跨页污染**（相关视频跳转把旧页顶掉后，旧页仍往共享播放器上 seek）
+>   —— `test/pages/cdn_switch_mixin_test.dart`，真播放器单例 + 假 Dio 重放"被顶掉那几秒"。
+>   它不是 1~20 里的哪一条，是 2026-10-12 这一轮 review 新找到的（修复见同一次提交）。
+> - **待真机**：1、2、3、4+10、5、6、7、9、11、12、13、14、15、17、19 —— **共 15 条**。
 >   其中 **17** 的判据本身已经改好（密集档，2026-10-11），只差真机上再喂一批坏源复验；
 >   另 **1** 的前置条件这一轮查清并改了（见条目 1）。
+>   **19** 与 16 同理，只是卡在另一头：要真的退后台几分钟让 iOS 作废 VT 会话，
+>   桌面/模拟器上复现不了这一档。
+> - **无需验证（备注）**：条目 **20**（换源轮次里 `now` 的取样时刻偏早几秒）——
+>   对着 3 分钟 / 30 分钟 / 6 小时那三档窗口不产生行为差异，记在条目 20 下面，不用真机。
 >
 > ⚠️ 待真机那批里，**5 / 6 / 7 / 13 / 14 / 17 全都要"坏源"**，而这几条的通过判据
 > 都落在 `解码错误风暴` 那一行上。2026-10-11 的真机日志抓到一条反例：一场
@@ -37,7 +44,7 @@
   **必须开**：关掉时 `_cdnAutoEligible` 为假，每条检查都会卡在资格门上。
 - **「详细播放日志」** → `SettingBoxKey.mpvVerboseLog` → `Pref.mpvVerboseLog`
   （`lib/utils/storage_pref.dart:517`）。它把 mpv 的 `logLevel` 抬到 `.v`，但
-  **只在控制台出口开着时生效**：`lib/plugin/pl_player/controller.dart:1041`
+  **只在控制台出口开着时生效**：`lib/plugin/pl_player/controller.dart:1108`
   `logLevel: consoleLogActive && Pref.mpvVerboseLog ? .v : (kDebugMode ? .warn : .error)`。
 - **「CDN 切换提示」** → `SettingBoxKey.showCdnSwitchToast`（默认开）。可选，
   给同一批事件做旁证。
@@ -225,18 +232,18 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 > **正面那一半才是证据。** 回 A 之后 `22:13:36.188 CDN 自动切换: 预检 @37s` 出现，
 > 后面的 `目标偏移 81517065/543447102 字节 (位置 37000ms/2225075ms)` 用的是 **A 的
 > 对象、A 被盖住时的位置**。而 `attachCdnSwitch` 是幂等的
-> （`if (_cdnIsAttached) return;`，`cdn_switch_mixin.dart:724`），预检能重开
+> （`if (_cdnIsAttached) return;`，`cdn_switch_mixin.dart:743`），预检能重开
 > **只可能**是因为重挂那一刻 `_cdnIsAttached` 为假 —— 也就是说 B 在播的那段时间里，
 > A 确实已经不挂在播放器上了。重挂的因果也是闭合的：`restartCdnProbe()` 只有两个
 > 调用点（`controller.dart:1311` 的 `onReset`，只有换 P/换集走得到；
-> `cdn_switch_mixin.dart:737` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
+> `cdn_switch_mixin.dart:756` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
 > 而它在返回路径上的调用点只有 `view.dart:432`（`didPopNext`）。时间也对：
 > 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `_kCdnPreflightPoll`
 > 的 2 s 加上等缓冲那一拍。
 >
 > ⚠️ **负那一半（"旧页面静默"）不构成证据，别拿它当通过的依据。** 旧页面的周期
 > tick 只有在 `bufferedAhead` 低于回填水位时才打印（`_onCdnProbeTick` 里
-> `if (bufferedAhead >= floor) return;`，`cdn_switch_mixin.dart:822`），而那段
+> `if (bufferedAhead >= floor) return;`，`cdn_switch_mixin.dart:841`），而那段
 > 余量一直 22~31s，很健康 —— 所以"窗口里没有带 A 对象长度的行"这件事，
 > **A 已静默**和**A 仍挂着但没到该响的时候**两种解释都成立。
 > （清单早期版本写过"那 138 秒里一条 `CDN 自动切换:` 都没有"，**是错的**：
@@ -387,6 +394,11 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 前置：任意一集在播（**AV1 硬解**那一档，`hwdec videotoolbox`）。
 病根不是源、不是字节：iOS 在 app 被挂起时会作废本机的 `VTDecompressionSession`。
 
+与**条目 19** 是近邻，别混：本条查的是「**黑着的画面不再自己回来**」—— 那一局是
+**在播状态**退后台，回前台重建解码器、画面回来，所以重建在这里是**正解**；条目 19
+查的是**同一段代码的副作用**：用户**按了暂停**时它照样动手，而
+`refreshPlayer()` 会把播放自己拉起来（见条目 19）。
+
 步骤：`1` 记下当前画面正常；`2` 退到后台 **≥5 分钟**（锁屏或切走都行）；`3` 回到 app。
 
 通过：**≤2 秒**内出现
@@ -441,10 +453,81 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 > （早 0.64 s）。机制见条目 8 的 ⚠️ 之外另有一条：`_kCdnPreflightDeadline`（10s）
 > 到期前你退了后台，iOS 冻住定时器，`_cdnPreflightSince` 就悬着 —— 584 秒后回前台
 > 第一拍 `now - since` 早就过线，于是**补做**了那一次预检。它值钱的前提是"位置还在
-> 起点、换源看不出闪"（`cdn_switch_mixin.dart:786`），在 **353 秒**处开火时这个前提
+> 起点、换源看不出闪"（`cdn_switch_mixin.dart:805`），在 **353 秒**处开火时这个前提
 > 已经没了：这时换源就是一次实打实的重载。这一局没造成伤害（基线 4.42MB/s 赢了，
 > 收在 `放弃`），但那是运气 —— 换与不换取决于那一刻谁快，跟"该不该现在换"无关。
 > 这是旧行为，与本条无关，**待定**。
+
+---
+
+### 19 — 暂停态下回前台：重建解码器不许把播放自己拉起来（MEDIUM，2026-10-12 新增）
+
+前置：与条目 18 同一档 —— 任意一集在播、**AV1 硬解**（心跳行
+`CDN 看门狗: 余量 … hwdec videotoolbox …` 能看到它）。差别只在**播放状态**：
+**手动按暂停**，画面停在最后一帧、控制条是暂停态；确认心跳行里 `播放中 false`
+（那句取自 `controller.dart:1765` 的 `播放中 ${playerStatus.isPlaying}`，
+`_kHeartbeatSeconds = 10`（`controller.dart:355`），所以 10 秒内必有一拍能对上）。
+
+步骤：**保持暂停**退到后台 **≥5 分钟**（锁屏或切走都行），然后回到 app。
+
+病根与 18 是同一件事：iOS 挂起 app 时作废 `VTDecompressionSession`。但 18 那条判据
+修好的动作本身留了个缺口 —— 它重开 Media 时**不带播放意图**：
+
+- `refreshPlayer()`（`controller.dart:1209`）在 `:1218` 是
+  `return ctr.open(media, play: true);` —— `play:` **写死 `true`**，函数签名
+  `Future<void>? refreshPlayer()` 里也没有任何"要不要接着播"的入参。
+  （对照 `:1207` 附近另一条重开路径，用的是 `play: false` —— 差别就在这。）
+- 触发它的 `_sampleDecoderSessionFailure`（`controller.dart:1693`）闸门在
+  `:1709-1718`，只挡 `isSeeking` / `_processing` / `onlyPlayAudio` / `isBuffering` /
+  `bufferedAhead <= 0` / `!_hasVideoTrack` —— **不读 `playerStatus`**，暂停态进得去。
+  命中 6 条 / 3 秒（`_kSessionFailBurst` `:324`、`_kSessionFailWindow` `:328`）后
+  `:1733` 打日志、`:1739` 调 `refreshPlayer()`（返回值忽略）。
+- 重开之后 mpv 一上报 playing，播放器就把 `playerStatus` 置成 `.playing`。用户按的
+  暂停**没有任何地方记着**（全仓没有 `userPause` 之类的标记），意图就此丢掉。
+
+对比 **条目 13**：那条是**换源路**，已经修好了 —— `cdn_switch_mixin.dart:1507`
+`final wasPlaying = plPlayerController.playerStatus.isPlaying;` → `:1512`
+`await playerInit(autoplay: wasPlaying);`。本条是**重建路**，还没按同一口径处理；
+修复方向就是让 `refreshPlayer()` 也读一次 `playerStatus.isPlaying` 再传给 `play:`。
+
+通过：
+1. 那条重建行**照出**（说明暂停态没有被判据挡住，会话作废照样认得）：
+   `CDN 看门狗: 硬解会话失效（3s 内 6 条），本机解码器被系统作废 —— 重建解码器`
+   （逐字，`controller.dart:1733-1736`；判定它的原始 mpv 行是
+   `av1: Failed to decode frame (invalid session, -12903)` 与
+   `av1: vt decoder cb: output image buffer is null: -12909, reconfig 1`，
+   签名表见 `lib/utils/decode_error.dart:87` 的 `kDecoderSessionFailureSignatures`，
+   `:90` `'invalid session'`、`:93` `'output image buffer is null'`）。
+2. 重建之后**播放仍是暂停** —— 心跳行里 `播放中 false` 不变、`位置 Ns` 停在暂停那一刻
+   不往前走；画面回到暂停的那一帧，不自己动。
+
+失败（**这个缺口没堵上时，现状必然是这一边**）：回前台后画面**自己动起来**，心跳行从
+`播放中 false` 翻成 `播放中 true` —— 成因就是上面 `:1218` 那个写死的 `play: true`。
+注意 30s 冷却（`_kSessionFailCooldown`，`controller.dart:333`）只压"动手"的频率，
+不影响这一次的播放意图。
+
+⚠️ 真机上要看清的**第一件事**是"签名到底响没响"：暂停时 mpv 不一定在解码，那两条会话
+行有可能一条都不出。若如此，本条在真机上会表现为"什么都没发生"，缺口只是**潜伏**
+（用户恢复播放时 mpv 重新解码，签名才会响，而那时用户本来就要播）—— 那就不是本条失败，
+而是"要换个前置才复现得出来"。先记下这一次的观察再下结论。
+
+### 20 — 备注：换源轮次里 `now` 的取样时刻偏早几秒（无需真机验证）
+
+一轮换源的 `now` 是在**轮次开头**取的（`lib/pages/video/cdn_switch_mixin.dart:1048`
+`final now = DateTime.now();`），而它要到探完对象大小（`:1128` 的
+`await CdnSpeedTest.probeSize`，预算 `probeMicros`/`probeConnect`/`probeReceive` 各 3s，
+`lib/utils/cdn_speed_test.dart:19-21`）和并发测速（`:1215-1222` 的 await，`autoMicros`
+6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:31`/`:41`）**之后**才被拿去记账 ——
+也就是相对"读数真正落地的时刻"偏早约几秒（最多探大小 3s + 测速 6s）。受影响的是它喂的
+那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1100`，窗口 `_kCdnRetryAfter`
+`:209` / `_kCdnDeadRetryAfter` `:219`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
+（`:1238`）、`_cdnChampion` 的 6 小时过期（`:1057`，窗口 `_kCdnRecordExpiry` `:274`）、
+`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`:1313`，`_kCdnRecordReset` `:270`）。
+**对着这几档窗口，偏早几秒不产生行为差异**（窗口比误差大两三个数量级），所以它是备注、
+不是 bug。**无需真机验证。**
+
+（注意它**不在**解码恢复那条路上：`_awaitRecovery` 的参照点是等它开始时取的 `start`、
+判据用的是 `elapsed`，那里没有"偏早几秒"的取样。）
 
 ---
 
@@ -554,7 +637,9 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 - **`disableAudioCDN` 在换源时被忽略（MEDIUM，**既有**，不是这次改出来的）**：音频那条
   重写没把 `isAudio: true` 传进 `getCdnUrl`，于是"音频不跟随 CDN"这个设置只在起播时
   生效、一换源就失效 —— 正是这个开关要避免的"部分视频无声"。`cdnUrlFor` 现在带
-  `isAudio`。**这条在 HEAD 里就是这样**（`CdnSpeedTest.urlFor` 也没传），顺手修了。
+  `isAudio`。**修复前就是这样**：那时换 URL 的函数叫 `CdnSpeedTest.urlFor`，签名里
+  根本没有 `isAudio` 这个参数（`urlFor(urls, service)`）—— 这一轮才把它挪成
+  `VideoUtils.cdnUrlFor` 并补上 `isAudio`。顺手修了。
   查法：打开该设置，换源后看音频 URL 的 host 有没有跟着变。
 
 ## 备注

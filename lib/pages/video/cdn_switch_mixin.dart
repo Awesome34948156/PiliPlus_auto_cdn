@@ -9,7 +9,7 @@ import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:collection/collection.dart';
 import 'package:dio/dio.dart' show CancelToken, Dio, DioException;
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 
@@ -341,6 +341,15 @@ mixin CdnSwitchMixin on GetxController {
   Duration _cdnLastAttemptPos = Duration.zero;
   CDNService? _cdnAutoServiceSnapshot;
   Dio? _cdnAutoDio;
+
+  /// 单测注入点：填了就用它测速，不填就走真网络（[CdnSpeedTest.createDio]）。
+  ///
+  /// 存在的理由只有一条：一轮测速要跑满 `probeSize` + 若干 `measureAt`，网络
+  /// 是这一整套判据里唯一不可离线复现的东西。给它一个假适配器，整条
+  /// [_onPlayerStall] → [_autoSwitchLoop] → [_switchTo] 的时序就能在
+  /// `flutter test` 里重放（见 `test/pages/cdn_switch_mixin_test.dart`）。
+  @visibleForTesting
+  Dio? cdnAutoDioForTest;
 
   // ---------------------------------------------------------------------------
   // 时钟与闸门。三个时间闸互相独立，谁也别合并谁：
@@ -715,6 +724,16 @@ mixin CdnSwitchMixin on GetxController {
   /// 416 循环 —— 它清掉了缓存，却在几秒后被在途的那一轮又填回去。
   bool _roundVoided(int generation) => generation != _cdnGeneration || isClosed;
 
+  /// [_roundVoided] 之外再补一条：本页**是不是还挂在播放器上**。
+  ///
+  /// 相关视频跳转会 push 一个新页而**不** onClose 旧页、也不换代 —— 于是旧页在
+  /// 每一道"这一轮还有效吗"的闸门上仍然是有效的，可它已经不在台上了，而播放器
+  /// 是跨页共享的那一个。前段的闸门（[_autoSwitchLoop] 的循环口与选完之后的
+  /// 复查）早就用 [_cdnIsAttached] 了，**尾段漏了**：[_switchTo] 重载完之后的
+  /// 位置纠正、[_awaitRecovery] 的恢复判定，都会让被顶掉的旧页拿旧视频的落点
+  /// 去 seek 新视频的播放器。尾段里驱动播放器的调用点里，这三处正是原先漏掉的。
+  bool _roundLive(int generation) => !_roundVoided(generation) && _cdnIsAttached;
+
   /// 把本页挂到播放器的上报口上（见 [detachCdnSwitch]）。
   ///
   /// **幂等**：已经在挂载状态时直接返回。调用方之一是页面重新露面（`didPopNext`，
@@ -950,7 +969,7 @@ mixin CdnSwitchMixin on GetxController {
       // 还可能是这一轮作废了（用户换画质/换集，或本页被顶掉）—— 那时候新镜像
       // 根本没被播出过一秒，拿它头上定罪会凭空封掉一条好镜像 30 分钟。只有这一
       // 轮仍然有效，"换过去以后还在报错"才算证据。
-      if (force && !_roundVoided(generation) && _cdnIsAttached) {
+      if (force && _roundLive(generation)) {
         final bad = chosen.host;
         if (bad != null && _cdnBadHosts.add(bad)) {
           debugPrint('CDN 自动切换: $bad 换过去仍解不出画面，本集不再作为候选');
@@ -1036,7 +1055,17 @@ mixin CdnSwitchMixin on GetxController {
     // 它**不是免检**：照样每轮实测，照样要赢 [_kCdnStarveRatio] 才切换。记录
     // 只决定"优先被想到"，不决定"优先被信任"，所以记录过期也不会造成误切。
     final champion = _cdnChampion(now, currentHost);
-    if (champion != null) candidates.add(champion);
+    if (champion != null) {
+      // 与轮换路径同一条不变量（见下面那个 `url == baseUrl` 的 continue）：
+      // host 替换不起作用时，这个"候选"跟基线是同一个 URL，测了也是自比。
+      // 按代码推这条走不到（[_cdnChampion] 已经跳过 [currentHost]，而 [baseUrl]
+      // 与 [videoUrl] 出自同一个 [VideoUtils.cdnUrlFor]）—— 这是防御，不是修
+      // 一条已证实的故障。
+      final championUrl = VideoUtils.cdnUrlFor(urls, champion);
+      if (championUrl.isNotEmpty && championUrl != baseUrl) {
+        candidates.add(champion);
+      }
+    }
 
     // 轮换相位在**完整镜像表**上推进，而不是在当前可用候选上。后者会随
     // `_cdnTriedAt` 收缩，两个模数（表长和候选数）对不上，窗口就会跳着走、
@@ -1086,7 +1115,8 @@ mixin CdnSwitchMixin on GetxController {
       return null;
     }
 
-    final dio = _cdnAutoDio ??= CdnSpeedTest.createDio();
+    // 括号必须有：`??` 与 `??=` 混在一个表达式里不加括号会解析成非法左值。
+    final dio = cdnAutoDioForTest ?? (_cdnAutoDio ??= CdnSpeedTest.createDio());
 
     // 对象总长探一次就够：所有镜像服务的是字节一致的同一个对象。同一集内缓存
     // 下来 —— 小卡顿档只有 3 秒预算，每次再花几秒去探大小会把预算整个吃掉。
@@ -1480,9 +1510,9 @@ mixin CdnSwitchMixin on GetxController {
     defaultST = null;
 
     await playerInit(autoplay: wasPlaying);
-    if (generation != _cdnGeneration || isClosed) return false;
+    if (!_roundLive(generation)) return false;
     await _restoreResumePosition(pos, generation);
-    return generation == _cdnGeneration && !isClosed;
+    return _roundLive(generation);
   }
 
   /// 换源重载后确认播放位置真的回到了 [target]，落在后面就补一次 seek。
@@ -1499,7 +1529,7 @@ mixin CdnSwitchMixin on GetxController {
     final player = plPlayerController;
     for (var i = 0; i < _kCdnResumeAttempts; i++) {
       await Future<void>.delayed(_kCdnResumePoll);
-      if (generation != _cdnGeneration || isClosed) return;
+      if (!_roundLive(generation)) return;
       if (player.positionInMilliseconds >=
           (target - _kCdnResumeTolerance).inMilliseconds) {
         return;
@@ -1533,7 +1563,7 @@ mixin CdnSwitchMixin on GetxController {
     final start = DateTime.now();
 
     void listener(Duration position) {
-      if (completer.isCompleted || decode) return;
+      if (completer.isCompleted || decode || !_roundLive(generation)) return;
       if (position - from >= _kCdnRecoverProgress) {
         completer.complete(true);
       }
@@ -1544,7 +1574,7 @@ mixin CdnSwitchMixin on GetxController {
     final timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (completer.isCompleted) return;
       final elapsed = DateTime.now().difference(start);
-      if (generation != _cdnGeneration || isClosed || elapsed >= window) {
+      if (!_roundLive(generation) || elapsed >= window) {
         completer.complete(false);
         return;
       }
