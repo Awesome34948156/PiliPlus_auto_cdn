@@ -90,6 +90,27 @@ abstract final class VideoUtils {
               .toString();
   }
 
+  /// The URL [service] would serve for [urls], or `''` when there is nothing to
+  /// serve.
+  ///
+  /// The empty guard is load-bearing, not defensive: for [CDNService.baseUrl]
+  /// [getCdnUrl] returns `urls.first`, which throws on an empty iterable. Callers
+  /// run this on URLs that can legitimately be missing (a video with no separate
+  /// audio track, say), and they treat `''` as "this mirror cannot serve it".
+  ///
+  /// Lives here rather than next to the speed-test math because it is the only
+  /// thing in that file needing [VideoUtils] — and depending on it dragged the
+  /// whole widget tree into the pure-helper tests, which then could not compile
+  /// without the patched Flutter SDK.
+  static String cdnUrlFor(
+    Iterable<String> urls,
+    CDNService service, {
+    bool isAudio = false,
+  }) {
+    if (urls.isEmpty) return '';
+    return getCdnUrl(urls, defaultCDNService: service, isAudio: isAudio);
+  }
+
   static String getLiveCdnUrl(CodecItem e, {int index = 0}) {
     final urlInfo = e.urlInfo.getOrFirst(index);
     return (liveCdnUrl ?? urlInfo.host) + e.baseUrl + urlInfo.extra;

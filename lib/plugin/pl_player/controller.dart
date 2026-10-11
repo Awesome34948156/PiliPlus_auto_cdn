@@ -285,6 +285,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 换到坏镜像上时还能再挣扎一次。
   static const Duration _kDecodeErrorCooldown = Duration(seconds: 30);
 
+  /// 同一个坏包在 ffmpeg 的不同层会各记一行（`av1:` / `libdav1d:` / `NULL:`），
+  /// 三行的时刻几乎相同。不合并的话 [_kDecodeErrorBurst] 的 12 条门槛实际只等于
+  /// 4 个坏包。记下一条之后，这么短时间内再来的都算同一个包，不再计入。
+  /// 取 5ms：三层会跨毫秒边界，同毫秒太紧。
+  static const Duration _kDecodeLineDedupe = Duration(milliseconds: 5);
+
   /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
   /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
   /// 后停读，等掉回水位才续读，所以健康播放的锯齿在
@@ -340,12 +346,32 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   bool _starveFired = false;
   DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// 最近一次装载以来，落在 [_kDecodeErrorWindow] 里的解码报错时刻。
-  /// 每次装载在 [_startListeners] 里清空。
+  /// 落在 [_kDecodeErrorWindow] 里的解码报错时刻，窗口自己滑动淘汰。
+  ///
+  /// 刻意**不随每次装载清零**：换源重载期间旧流还在往外吐报错，那些报错说明的
+  /// 正是刚才那段字节是坏的，必须继续记账（见 [_sampleDecodeError]）。只在
+  /// 播放器创建（[_startListeners]）和换集/换画质（[resetDecodeErrorAccounting]）时清。
   final List<DateTime> _decodeErrors = [];
 
   /// 解码错误风暴的静默期截止时刻。见 [_kDecodeErrorCooldown]。
   DateTime _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 最近一条解码器坏字节报错的时刻，**不受 [_kDecodeErrorCooldown] 限制**。
+  ///
+  /// [CdnSwitchMixin] 换源后用它判断"这条镜像已经干净了"：坏镜像的特征恰恰是
+  /// 缓冲填得满、位置还在被音频时钟推着走，所以位置和余量都判不出恢复，只有
+  /// "不再吐坏字节"才是真话。
+  DateTime? lastDecoderCorruptionAt;
+
+  /// 换集 / 换画质：换成了**另一个对象**，旧的解码账作废重计。
+  ///
+  /// 刻意不在 `setDataSource` / `player.open` 里调 —— 换源重载时旧流的报错要
+  /// 继续算（见 [_decodeErrors] 的注释）。只由页面在换集 / 换画质时调。
+  void resetDecodeErrorAccounting() {
+    _decodeErrors.clear();
+    _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    lastDecoderCorruptionAt = null;
+  }
 
   /// 全屏方向
   // ignore: unnecessary_getters_setters
@@ -1184,10 +1210,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 播放事件监听
   void _startListeners(NativePlayer player) {
     assert(_subscriptions == null);
-    // 新的一次装载，解码错误的账重新计：上一段流的静默期不该挡着新的一段。
-    // 换源到好镜像之后，第一条报错必须能立刻被听见。
+    // 这里是**播放器创建**时的重置，整个会话只跑一次（[player] 非空时
+    // [_createVideoController] 不再走 [_initPlayer]）。所以它管不到换集/换画质 ——
+    // 那些由页面调 [resetDecodeErrorAccounting]。
     _decodeErrors.clear();
     _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    lastDecoderCorruptionAt = null;
     final stream = player.stream;
     _subscriptions = [
       /// playing
@@ -1268,25 +1296,29 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _updatePlaybackState();
         }
       }),
-      // 只要日志能落盘就收 mpv 的日志，release 也不例外 —— 否则事后取回来的
-      // pili-console.log 里会"什么都没有"，那是通道没开，不是没有问题。
-      // 注意这里收到多少由 mpv 自己的档位决定（见上面的 `logLevel`）：默认档下
-      // 只有 error 及以上会到这儿，那正是最该落盘的一批，所以订阅本身不跟着关。
-      if (kDebugMode || consoleLogActive)
-        stream.log.listen(((PlayerLog log) {
+      // 日志订阅**无条件开着**：坏字节的唯一证词就在 mpv 的日志里（见
+      // [onDecodeError]），而四条播放判据一条都看不见它。挂在"日志能落盘"这个
+      // 条件上的话，落盘失败（consoleLogActive=false）时整条判据会静默失明，
+      // release 里没有任何提示。收多少由 mpv 自己的档位决定（见上面的 `logLevel`）：
+      // 默认档只有 error 及以上会到这儿，量很小，订阅本身几乎不要钱。
+      stream.log.listen(((PlayerLog log) {
+        // 采样**对所有档位**都做，不只 error/fatal：mpv 的 `logLevel` 已经限了量，
+        // 而开了 verbose 之后同一段坏字节会同时从 warn/info 冒出来，只认 error
+        // 等于把 open 的那一档又关掉一半。签名是解码器专有的，多收不会误报。
+        // 采样搭在这里而不是 `stream.error` 上：同一个事件在两条通道上都会到，
+        // 两边都采等于阈值被砍半。
+        _sampleDecodeError(log.text);
+        if (kDebugMode || consoleLogActive) {
           if (log.level == 'error' || log.level == 'fatal') {
             Utils.reportError(
               '${log.level}: ${log.prefix}: ${log.text}\n${player.state.playlist}',
               null,
             );
-            // 坏字节的唯一证词就在这批 error 行里，四条播放判据一条都看不见
-            // （见 [onDecodeError]）。采样搭在这里而不是 `stream.error` 上：
-            // 同一个事件在两条通道上都会到，两边都采等于阈值被砍半。
-            _sampleDecodeError(log.text);
           }
           // 错误也落盘：以前 error 只走 reportError，日志文件里反而看不到。
           debugPrint('mpv [${log.level}] ${log.prefix}: ${log.text}');
-        })),
+        }
+      })),
       stream.error.listen((String event) {
         // 这一条在 release 里原本只走 reportError，日志文件里同样看不到 ——
         // 而它正是"流打不开"的直接证词，先落盘，再走原来的恢复逻辑。
@@ -1524,16 +1556,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void _sampleDecodeError(String text) {
     if (!isDecoderCorruptionLog(text)) return;
     final now = DateTime.now();
-    // 先记账、再判静默期：静默期压的是**上报**，不是计数。换源重载期间旧流的
+    // 不受静默期限制的"最后一次坏字节"时刻：给换源后的干净窗口判据用。
+    lastDecoderCorruptionAt = now;
+    // 记账（含窗口淘汰与同包去重）在 [recordDecodeErrorHit] 里，是纯函数。
+    final burstReached = recordDecodeErrorHit(
+      _decodeErrors,
+      now,
+      window: _kDecodeErrorWindow,
+      burst: _kDecodeErrorBurst,
+      lineDedupe: _kDecodeLineDedupe,
+    );
+    if (!burstReached) return;
+    // **先记账、再判静默期**：静默期压的是上报，不是计数。换源重载期间旧流的
     // 报错照记 —— 它们说明的正是刚才那段字节是坏的。这样静默期一过，只要风暴
     // 还在继续，下一条报错就能立刻再上报一次，而不是从头再攒 12 条（换过去的
-    // 镜像一样坏时，那 12 条就是白白多冻几秒）。
-    _decodeErrors.add(now);
-    _decodeErrors.removeWhere(
-      (at) => now.difference(at) > _kDecodeErrorWindow,
-    );
+    // 镜像一样坏时，那 12 条就是白白多冻几秒）。所以静默期内**不清空**窗口。
     if (now.isBefore(_decodeErrorUntil)) return;
-    if (_decodeErrors.length < _kDecodeErrorBurst) return;
     _decodeErrors.clear();
     _decodeErrorUntil = now.add(_kDecodeErrorCooldown);
     debugPrint(

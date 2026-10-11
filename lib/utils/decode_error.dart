@@ -38,10 +38,63 @@ const List<String> kDecoderCorruptionSignatures = [
   'missing picture in access unit',
 ];
 
+/// 预先转成小写的签名表，供 [isDecoderCorruptionLog] 做大小写无关匹配。
+///
+/// mpv/ffmpeg 的输出大小写并不稳定（同一句在不同版本里可能是
+/// `Error parsing OBU data`，也可能是 `error parsing obu data`），而签名是
+/// 从某一次的实测日志里逐字抄下来的。区分大小写的话，对方改一次大小写，
+/// 整个判据就静默失效 —— 这种失配在 release 里没有任何提示。
+final List<String> _kDecoderCorruptionSignaturesLower = kDecoderCorruptionSignatures
+    .map((s) => s.toLowerCase())
+    .toList(growable: false);
+
 /// 这一行 mpv 日志是不是在说「解码器解不出这段字节」。
 ///
 /// 只做子串匹配、不认前缀：同一个故障在 ffmpeg 的不同层上报时前缀各不相同
 /// （`ffmpeg/video: av1:`、`ffmpeg/video: libdav1d:`、光秃秃的 `ffmpeg: NULL:`），
 /// 而前缀本身没有区分度 —— 它们全是 ffmpeg。
-bool isDecoderCorruptionLog(String text) =>
-    kDecoderCorruptionSignatures.any(text.contains);
+///
+/// 匹配大小写无关（见 [_kDecoderCorruptionSignaturesLower]）。
+bool isDecoderCorruptionLog(String text) {
+  final lower = text.toLowerCase();
+  return _kDecoderCorruptionSignaturesLower.any(lower.contains);
+}
+
+/// 记一条**已判定为坏字节**的报错（[isDecoderCorruptionLog] 过了才调），
+/// 返回窗口内的条数是否达到 [burst]。
+///
+/// [hits] 是**可变**的，就地追加并淘汰掉比 [window] 更早的时刻。淘汰用严格
+/// `>`：正好落在窗口边界上的那一条还算数。
+///
+/// 达到 [burst] 时**不清空** [hits] —— 清不清由调用方决定，因为它还欠着一个
+/// 静默期判断：静默期压的是**上报**、不是计数。静默期内攒下的那一批必须在静默期
+/// 一过就兑现，否则一场风暴会被静默期整段吞掉，静默期结束后还要从头再攒一轮。
+///
+/// 和 [hits] 最后一条相隔不到 [lineDedupe] 的，当成同一个坏包的多份副本，不计入：
+/// 同一个坏包在 ffmpeg 的各层（`av1:` / `libdav1d:` / `NULL:`）各记一行，
+/// 不合并的话 [burst] 的实际含义会缩水到三分之一。
+///
+/// 判别用的样本全部来自实测日志，见 [kDecoderCorruptionSignatures]。
+bool recordDecodeErrorHit(
+  List<DateTime> hits,
+  DateTime now, {
+  required Duration window,
+  required int burst,
+  required Duration lineDedupe,
+}) {
+  // 时钟回拨（NTP 校正、用户改表）会让 [hits] 里的时刻落在"未来"：差值成负数，
+  // 去重分支于是把**此后每一条**报错都当成同一个坏包的副本吞掉；而淘汰条件
+  // `now.difference(at) > window` 对未来时刻同样不成立，那条记录永远清不掉 ——
+  // 判据整个 session 静默失效。[CdnSpeedTest.recordTooOld] 就是为同一件事改成
+  // "负差值算过期"的（见条目 16），这里同理：回拨之后一律当成新的一条，并把
+  // 落在未来的旧记录清掉。
+  if (hits.isNotEmpty &&
+      !now.isBefore(hits.last) &&
+      now.difference(hits.last) < lineDedupe) {
+    return false;
+  }
+  hits
+    ..add(now)
+    ..removeWhere((at) => at.isAfter(now) || now.difference(at) > window);
+  return hits.length >= burst;
+}

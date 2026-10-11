@@ -205,15 +205,6 @@ mixin CdnSwitchMixin on GetxController {
   /// 十几轮测速，反而把带宽全抢走。
   static const Duration _kCdnRebufferCooldown = Duration(seconds: 30);
 
-  /// 目标偏移的下界占对象总长的比例。头部是"面子区间"，坏镜像在这里也是满速，
-  /// 必须在它之后取样。
-  static const double _kCdnOffsetFloor = 0.15;
-
-  /// 目标偏移的上界要给尾部留出这么多字节。样本本身最多读
-  /// [CdnSpeedTest.autoBytes]，留 2 倍余量是为了别撞上对象末尾——EOF 会被
-  /// 误读成"这个镜像慢"。
-  static const int _kCdnReadWindowBytes = 4 * 1024 * 1024;
-
   /// 同一个镜像隔多久允许重测。
   static const Duration _kCdnRetryAfter = Duration(minutes: 3);
 
@@ -232,6 +223,21 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 切换后位置推进这么多即认为已恢复。
   static const Duration _kCdnRecoverProgress = Duration(seconds: 2);
+
+  /// 解码错误档换源后，要求"干净"多久才认定恢复。
+  ///
+  /// 这一档不能用位置或余量判恢复：坏镜像的特征恰恰是余量填得满、位置还被
+  /// 音频时钟推着走，两者都"看着正常"。唯一的真话是换了之后**不再吐坏字节**
+  /// （[PlPlayerController.lastDecoderCorruptionAt]）。
+  static const Duration _kCdnDecodeCleanWindow = Duration(seconds: 4);
+
+  /// 上面那个干净窗口的宽限：换源重载期间旧流还在吐报错（解码器在消化旧字节），
+  /// 这段时间的报错不算新镜像的账。
+  static const Duration _kCdnDecodeRecoverGrace = Duration(seconds: 4);
+
+  /// 解码错误档等待恢复的最长时间，比 [_kCdnRecoverWindow] 长：一次重载
+  /// （实测 5~10s）之后还要走完"宽限 + 干净窗口"（≈8s）才敢下结论。
+  static const Duration _kCdnDecodeRecoverWindow = Duration(seconds: 18);
 
   /// 换源重载后，落点离目标多远之内算"还在原处"，不必补 seek。
   static const Duration _kCdnResumeTolerance = Duration(seconds: 5);
@@ -397,11 +403,11 @@ mixin CdnSwitchMixin on GetxController {
       record[at + 2] = 1;
       changed = true;
     }
-    final stale =
-        now.difference(
-          DateTime.fromMillisecondsSinceEpoch(record[at + 1] * 1000),
-        ) >=
-        _kCdnRecordReset;
+    final stale = CdnSpeedTest.recordTooOld(
+      now,
+      DateTime.fromMillisecondsSinceEpoch(record[at + 1] * 1000),
+      _kCdnRecordReset,
+    );
     if (stale || speed > record[at]) {
       record[at] = speed;
       record[at + 1] = now.millisecondsSinceEpoch ~/ 1000;
@@ -457,10 +463,13 @@ mixin CdnSwitchMixin on GetxController {
       final speed = record[at];
       if (speed <= bestSpeed) continue;
       // 没记录过的格子时间是 0，算出来是 1970 年，自然落在过期之外。
-      final age = now.difference(
+      if (CdnSpeedTest.recordTooOld(
+        now,
         DateTime.fromMillisecondsSinceEpoch(record[at + 1] * 1000),
-      );
-      if (age > _kCdnRecordExpiry) continue;
+        _kCdnRecordExpiry,
+      )) {
+        continue;
+      }
       best = service;
       bestSpeed = speed;
     }
@@ -513,7 +522,9 @@ mixin CdnSwitchMixin on GetxController {
   }
 
   /// 换集、换 P、重置等用户动作都要让在途的自动切换失效。
-  void resetCdnAutoSwitch() {
+  /// [resetPlayerAccounting] 为假时不动共享播放器的解码账 —— 见 [detachCdnSwitch]：
+  /// 那份账属于现役页面，一个已经不在台上的旧页退出时没资格清它。
+  void resetCdnAutoSwitch({bool resetPlayerAccounting = true}) {
     _cdnGeneration++;
     _cdnAutoBusy = false;
     _cdnAutoAttempts = 0;
@@ -529,18 +540,41 @@ mixin CdnSwitchMixin on GetxController {
     _cdnGiveUpUntil = null;
     _cdnLastAttemptPos = Duration.zero;
     _cdnAutoServiceSnapshot = null;
+    // 小卡顿的节流也要重来：不带上它，新一集开头 30 秒的 rebuffer 全被上一集的
+    // 时间戳压住。
+    _cdnQuickProbeAt = null;
+    // 解码错误的账在播放器侧，换对象时一并作废（同一条边对另一个视频可能是好的）。
+    if (resetPlayerAccounting) plPlayerController.resetDecodeErrorAccounting();
   }
 
   /// 下面这些诊断刻意不套 kDebugMode：release 包只走手机测试，套了就看不到。
   static String _fmtSpeed(int bytes, int micros) =>
       '${(bytes / micros).toStringAsPrecision(3)}MB/s';
 
-  /// 换画质等于换了 dataSource，在途的测速结果对应的是旧列表，作废。
+  /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
   ///
-  /// 只有真有一轮在跑时才作废：把 reset 无条件地放在换画质的路径上，会顺手
-  /// 清掉放弃冷却和镜像冷却，等于每次调画质都重新开闸。
-  void resetCdnSwitchIfBusy() {
-    if (_cdnAutoBusy) resetCdnAutoSwitch();
+  /// 和 [resetCdnAutoSwitch] 的区别在时间型冷却：这里**保留** [_cdnGiveUpUntil] /
+  /// [_cdnTriedAt] / [_cdnNoSample]。原先把整套 reset 无条件放在换画质路径上，会
+  /// 顺手清掉放弃冷却和镜像冷却，等于每次调画质都重新开闸。
+  ///
+  /// 但对象相关的几样必须清 —— 尤其是 [_cdnObjectSize]：换了画质对象长度就变了，
+  /// 留着旧值会把取样偏移指到新对象之外，服务端回 416，整集每轮都测不出东西。
+  ///
+  /// 清 [_cdnAutoBusy] 必须和 [_autoSwitchLoop] 里的代际守卫配套：在途那一轮被
+  /// generation++ 作废后，它的 whenComplete 不会再清 busy（见那里的注释），所以
+  /// 只能在这里放闸，否则闸门永远关着、此后再也不响应任何触发。
+  void resetCdnForNewObject() {
+    _cdnGeneration++;
+    _cdnObjectSize = null;
+    _cdnBadHosts.clear();
+    _cdnChampionMisses.clear();
+    _cdnLastAttemptPos = Duration.zero;
+    _cdnAutoServiceSnapshot = null;
+    plPlayerController.resetDecodeErrorAccounting();
+    if (_cdnAutoBusy) {
+      _cdnAutoBusy = false;
+      _cdnAutoAttempts = 0;
+    }
   }
 
   /// 小卡顿（余量刚归零）触发的后台探测。
@@ -596,6 +630,12 @@ mixin CdnSwitchMixin on GetxController {
     // 解码错误是例外：它的病在**字节**上，跟位置动不动没关系，而画面冻住时
     // 位置也常常是冻的 —— 拿位置当门槛等于"冻得越死越不许救"。压住它的是
     // 播放器那边的 [_kDecodeErrorCooldown]（一次故障只报一次），这里不必再压。
+    // 位置回退（用户回拖、playRepeat 循环）会让下面的差值恒为负，闸门就永远
+    // 关上了 —— 直到播回上一次尝试的位置为止。回退一律当作新的播放区间，重开闸。
+    // 放在这里（前面几道 return 之后）：被丢弃的触发不该改状态。
+    if (_cdnLastAttemptPos != Duration.zero && position < _cdnLastAttemptPos) {
+      _cdnLastAttemptPos = Duration.zero;
+    }
     if (trigger != _CdnTrigger.decode &&
         _cdnLastAttemptPos != Duration.zero &&
         position - _cdnLastAttemptPos < _kCdnMinReProgress) {
@@ -617,7 +657,10 @@ mixin CdnSwitchMixin on GetxController {
       quick: trigger == _CdnTrigger.rebuffer,
       force: trigger == _CdnTrigger.decode,
     ).whenComplete(() {
-      if (!isClosed) _cdnAutoBusy = false;
+      // 只清**本代**的闸。中途换集/换画质会 generation++，那一轮已经作废，而新的
+      // 一轮（新代）可能已经把 busy 置真 —— 陈旧的这里不能把它清掉，否则会出现
+      // 两条 loop 并发跑。
+      if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;
     });
   }
 
@@ -653,9 +696,40 @@ mixin CdnSwitchMixin on GetxController {
     );
   }
 
-  /// 把本页挂到播放器的三个上报口上（见 [detachCdnSwitch]）。
+  /// 本页是不是当前挂在播放器上的那一页。
+  ///
+  /// [PlPlayerController] 是**跨页单例**，而相关视频跳转会再 push 一个 `/videoV`
+  /// （不 onClose 旧的），于是两个页面各有自己的 [_cdnProbeTimer]。后挂的那一页会
+  /// 覆盖回调，所以"回调是不是我的"就等于"我是不是当前页"。
+  /// [PlPlayerController._isCurrVideoPage] 判不了这件事 —— 新旧两页都是 `/videoV`。
+  bool get _cdnIsAttached => plPlayerController.onStall == _onPlayerStall;
+
+  /// 这一轮测速是不是已经作废：用户换了画质/换 P/换集（[resetCdnForNewObject]
+  /// 推进了 [_cdnGeneration]、清空了 [_cdnObjectSize]），或者本页已经关了。
+  ///
+  /// 一轮要跑好几秒，中间全是 await，作废之后**一个字节的状态都不许提交**。
+  /// 尤其是 [_cdnObjectSize]：它是**一次性**的（只有 `size == null` 才会去探），
+  /// 一旦被旧对象的长度重新填上，这一集就再也不会探第二次；此后每一轮都拿旧
+  /// 长度算 [CdnSpeedTest.targetOffset]，落到短一截的新对象上必得 416 →
+  /// unmeasurable → 自动换源整集失效。这正是 [resetCdnForNewObject] 要防的那个
+  /// 416 循环 —— 它清掉了缓存，却在几秒后被在途的那一轮又填回去。
+  bool _roundVoided(int generation) => generation != _cdnGeneration || isClosed;
+
+  /// 把本页挂到播放器的上报口上（见 [detachCdnSwitch]）。
+  ///
+  /// **幂等**：已经在挂载状态时直接返回。调用方之一是页面重新露面（`didPopNext`，
+  /// 关掉弹层/子页后回来），那里每次都调；不幂等的话，一次普通返回就会把正在攒
+  /// 的解码风暴计数清空、把预检重新点火。
   void attachCdnSwitch() {
+    if (_cdnIsAttached) return;
+    // 一页 = 一个对象。相关视频跳转会再 push 一个 `/videoV` 而**不** onClose
+    // 旧的，播放器却是同一个跨页单例，于是旧页留下的解码账会直接算到新视频
+    // 头上：[_decodeErrors] 的残余让新视频几条零星报错就凑满风暴门槛（提前
+    // 换源），没过期的 [_decodeErrorUntil] 又把新视频真正的风暴按下去（30s 内
+    // 不换源），而一条陈旧的 [lastDecoderCorruptionAt] 会让新镜像的恢复判定
+    // 立刻通过。挂载即换对象，重新记账。
     plPlayerController
+      ..resetDecodeErrorAccounting()
       ..onStall = _onPlayerStall
       ..onBufferStarve = _onPlayerBufferStarve
       ..onRebuffer = _onPlayerRebuffer
@@ -665,6 +739,9 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 页面销毁：只撤掉自己的回调，别把新页面的覆盖掉。
   void detachCdnSwitch() {
+    // 先记下自己是不是现役页：下面把回调置空之后 _cdnIsAttached 就成了假，
+    // 连"我是不是当前那页"都判不出来了。
+    final wasAttached = _cdnIsAttached;
     if (plPlayerController.onStall == _onPlayerStall) {
       plPlayerController.onStall = null;
     }
@@ -679,7 +756,11 @@ mixin CdnSwitchMixin on GetxController {
     }
     _cdnProbeTimer?.cancel();
     _cdnProbeTimer = null;
-    resetCdnAutoSwitch();
+    // 被顶掉的旧页关掉时（相关视频跳转后返回再退出），**共享播放器的**解码账
+    // 是现役那一页的，不能被我这个正在退场的人清掉：清了会让它正攒的风暴从头
+    // 再攒（推迟换源），或者让它在 _awaitRecovery 里因为 lastDecoderCorruptionAt
+    // 被抹掉而提前宣布恢复。本页自己的状态照清。
+    resetCdnAutoSwitch(resetPlayerAccounting: wasAttached);
   }
 
   /// mpv 自己的回填水位；取不到（或过小）返回 null，表示不启用。
@@ -707,6 +788,14 @@ mixin CdnSwitchMixin on GetxController {
   /// 缓冲一补满（正常镜像 3~5s）就测；一直补不满说明镜像本来就是坏的，
   /// [_kCdnPreflightDeadline] 一到也照样测 —— 那正是要抓的情形。
   void _onCdnProbeTick() {
+    // 新页面已经接管共享播放器（相关视频跳转会再 push 一个 /videoV，旧页面并不
+    // onClose）：我这一拍只会用**旧视频的 URL** 去重载播放器。发现被顶掉就停掉
+    // 自己的定时器。
+    if (!_cdnIsAttached) {
+      _cdnProbeTimer?.cancel();
+      _cdnProbeTimer = null;
+      return;
+    }
     if (isClosed || _cdnAutoBusy || !_cdnAutoEligible) return;
     // 还没开播就把预检留着，下一个 tick 再试 —— 页面创建到真正起播之间可能
     // 隔很久（分段加载、用户没点播放），一次错过就永远不做预检了。
@@ -774,6 +863,10 @@ mixin CdnSwitchMixin on GetxController {
       if (generation != _cdnGeneration ||
           isClosed ||
           isQuerying ||
+          // 本页已经被后挂的另一页顶掉了：回调早被覆盖，这一轮测的是**上一个
+          // 视频**的地址，而播放器是同一个单例 —— 再往下走就会拿旧视频的 URL
+          // 去 reload 新视频的播放器。除本节自己，谁都不该指挥这台播放器。
+          !_cdnIsAttached ||
           !_cdnAutoEligible) {
         return;
       }
@@ -782,10 +875,11 @@ mixin CdnSwitchMixin on GetxController {
 
       final round = await _pickFastestCdn(
         stalledAt,
+        generation,
         quick: quick,
         force: force,
       );
-      if (generation != _cdnGeneration || isClosed || isQuerying) return;
+      if (_roundVoided(generation) || isQuerying || !_cdnIsAttached) return;
       if (round == null) break;
       // 这一轮的结果已经拿到了，先给冠军位记账，再决定要不要切换。
       _noteChampionOutcome(round);
@@ -837,7 +931,7 @@ mixin CdnSwitchMixin on GetxController {
 
       switched = true;
       if (!await _switchTo(chosen, generation, resumeAt: stalledAt)) return;
-      if (await _awaitRecovery(generation, stalledAt)) {
+      if (await _awaitRecovery(generation, stalledAt, decode: force)) {
         _cdnAutoAttempts = 0;
         _cdnLastAttemptPos = Duration.zero;
         _cdnTriedAt.clear();
@@ -848,6 +942,19 @@ mixin CdnSwitchMixin on GetxController {
           displayTime: const Duration(seconds: 2),
         );
         return;
+      }
+      // 解码错误档：换过去仍在吐坏字节 ⇒ 这条镜像的字节也解不出画面。不记的话
+      // 下一轮的**测速**又会把它评成最快候选（它真的快）而换回来，来回弹。
+      //
+      // 但"没恢复"不等于"这条镜像坏"：`_awaitRecovery(decode: true)` 返回 false
+      // 还可能是这一轮作废了（用户换画质/换集，或本页被顶掉）—— 那时候新镜像
+      // 根本没被播出过一秒，拿它头上定罪会凭空封掉一条好镜像 30 分钟。只有这一
+      // 轮仍然有效，"换过去以后还在报错"才算证据。
+      if (force && !_roundVoided(generation) && _cdnIsAttached) {
+        final bad = chosen.host;
+        if (bad != null && _cdnBadHosts.add(bad)) {
+          debugPrint('CDN 自动切换: $bad 换过去仍解不出画面，本集不再作为候选');
+        }
       }
       debugPrint('CDN 自动切换: ${chosen.desc} 未恢复，换下一个候选');
     }
@@ -892,8 +999,13 @@ mixin CdnSwitchMixin on GetxController {
   /// 返回 null 表示这一轮无从下手（拿不到地址、没有候选），调用方静默放弃。
   /// [force] 为真时**跳过 [_kCdnStarveRatio] 那一关**（见 [_CdnTrigger.decode]）：
   /// 只要有候选拿得出可用样本，就选最快的那个换过去，不再问它比基线快多少倍。
+  ///
+  /// [generation] 是调用时那一轮的代号。本方法中间有两处长达数秒的 await（探
+  /// 对象大小、并发测速），期间用户完全可能换画质/换集，把这轮测的东西整个换掉。
+  /// 每一处 await 之后都用 [_roundVoided] 复查，作废就返回 null、一个格子都不落。
   Future<_CdnRound?> _pickFastestCdn(
-    Duration position, {
+    Duration position,
+    int generation, {
     bool quick = false,
     bool force = false,
   }) async {
@@ -907,7 +1019,7 @@ mixin CdnSwitchMixin on GetxController {
     // 当前生效的镜像要从 videoUrl 里解析 host —— 默认偏好是 backupUrl，它的
     // URL 里带的是真实 host，只看 Pref 会漏判。
     final currentHost = Uri.tryParse(baselineUrl)?.host;
-    final baseUrl = CdnSpeedTest.urlFor(urls, CDNService.baseUrl);
+    final baseUrl = VideoUtils.cdnUrlFor(urls, CDNService.baseUrl);
 
     // 窗口就取 autoCandidatesMax = autoConcurrency - 1：基线要占掉一个并发位，
     // 剩下的才轮到候选，整轮必须挤进同一批。分两批的话，测基线的那几秒里缓冲
@@ -936,8 +1048,17 @@ mixin CdnSwitchMixin on GetxController {
     final rotationSlots = limit - candidates.length;
 
     var fromRotation = 0;
-    // 第二遍忽略冷却：宁可重测刚测过的，也不要出现"一轮没有候选"。
-    for (final ignoreCooldown in const [false, true]) {
+    // 三遍，一遍比一遍放宽：
+    //   1) 尊重冷却；
+    //   2) 忽略冷却，但仍躲开"上一轮零字节"的镜像 —— 让它们重新占掉唯一的候选位，
+    //      等于每轮白搭两个 3s 超时（正是 [_kCdnDeadRetryAfter] 要避免的）；
+    //   3) 全都不管，只求别出现"一轮没有候选"。
+    // 只有前两遍都填不满窗口，才会走到第 3 遍。
+    for (final pass in const [
+      (ignoreCooldown: false, ignoreNoSample: false),
+      (ignoreCooldown: true, ignoreNoSample: false),
+      (ignoreCooldown: true, ignoreNoSample: true),
+    ]) {
       for (var i = 0; i < all.length && fromRotation < rotationSlots; i++) {
         final service = all[(phase + i) % all.length];
         if (candidates.contains(service)) continue;
@@ -946,9 +1067,10 @@ mixin CdnSwitchMixin on GetxController {
         // 本集里给过坏字节的镜像不再进候选 —— 它的**速度**没问题，测速拦不住它，
         // 只有解码器认得出来（见 [_cdnBadHosts]）。
         if (_cdnBadHosts.contains(host)) continue;
-        if (!ignoreCooldown && _cdnRecentlyTried(service, now)) continue;
+        if (!pass.ignoreNoSample && _cdnNoSample.contains(service)) continue;
+        if (!pass.ignoreCooldown && _cdnRecentlyTried(service, now)) continue;
         // host 替换不起作用（mcdn-only / edl:// 合成项），换过去也是同一个 URL。
-        final url = CdnSpeedTest.urlFor(urls, service);
+        final url = VideoUtils.cdnUrlFor(urls, service);
         if (url.isEmpty || url == baseUrl) continue;
         candidates.add(service);
         fromRotation++;
@@ -985,6 +1107,9 @@ mixin CdnSwitchMixin on GetxController {
       } finally {
         if (!sizeToken.isCancelled) sizeToken.cancel();
       }
+      // 探大小这几秒里用户可能换了画质/换集。作废了就一个格子都别落（见
+      // [_roundVoided]），尤其不能把**旧对象**的长度写回 [_cdnObjectSize]。
+      if (_roundVoided(generation)) return null;
       if (size != null && size > 0) _cdnObjectSize = size;
     }
 
@@ -1001,15 +1126,10 @@ mixin CdnSwitchMixin on GetxController {
       '${candidates.map((e) => e == champion ? '${e.desc}（历史冠军）' : e.desc).join(', ')}',
     );
 
-    // 无论测速成功与否，这一轮候选都进入冷却；[_kCdnRetryAfter] 之后可以重测。
-    for (final service in candidates) {
-      _cdnTriedAt[service] = now;
-    }
-
     var offsetRejected = false;
     final tokens = <CancelToken>[];
 
-    Future<CdnSample?> sample(String url) async {
+    Future<CdnSample?> sample(String url, {required bool isBaseline}) async {
       final token = CancelToken();
       tokens.add(token);
       try {
@@ -1025,16 +1145,22 @@ mixin CdnSwitchMixin on GetxController {
           isCancelled: () => isClosed,
         );
       } on DioException catch (e) {
-        // 服务端明确说这个偏移不存在：整轮作废，不能拿别的镜像去比。
-        if (e.response?.statusCode == 416) offsetRejected = true;
+        // 偏移越界只对**基线**意味着整轮作废 —— 基线那份对象的长度是所有镜像的
+        // 共同定义。候选回 416 只说明它自己那份短/不接受这个 range，丢掉它就行，
+        // 不该连累另外两个已经测出可用样本的候选。
+        if (isBaseline && e.response?.statusCode == 416) offsetRejected = true;
         rethrow;
       }
     }
 
     /// 兜住任何一路的失败，别让它变成未捕获的异步异常。
-    Future<CdnSample?> guarded(String url, String label) async {
+    Future<CdnSample?> guarded(
+      String url,
+      String label, {
+      required bool isBaseline,
+    }) async {
       try {
-        return await sample(url);
+        return await sample(url, isBaseline: isBaseline);
       } catch (e) {
         debugPrint('CDN 测速失败 $label: $e');
         return null;
@@ -1043,12 +1169,16 @@ mixin CdnSwitchMixin on GetxController {
 
     // 先把请求全部发出去，再逐个 await，中间不插入任何等待。
     final label = currentHost ?? '当前';
-    final baselineFuture = guarded(baselineUrl, '[基线 $label]');
+    final baselineFuture = guarded(baselineUrl, '[基线 $label]', isBaseline: true);
     final candidateFutures = [
       for (final service in candidates)
         (
           service: service,
-          future: guarded(CdnSpeedTest.urlFor(urls, service), service.desc),
+          future: guarded(
+            VideoUtils.cdnUrlFor(urls, service),
+            service.desc,
+            isBaseline: false,
+          ),
         ),
     ];
 
@@ -1066,15 +1196,16 @@ mixin CdnSwitchMixin on GetxController {
       }
     }
 
-    // 一个字节都没到的候选进"死镜像"冷却，下一轮不再占候选位；下次出样本了
-    // 就立刻恢复。不要拿 samples 里的"样本太小"去判死 —— 那是活着只是慢。
-    final gotSample = samples.map((e) => e.$1).toSet();
+    // 测速又花了几秒，再复查一次：这一轮的读数属于**当时那个对象**。作废了就
+    // 连速度记录也不该留下 —— 它会喂给下一轮的冠军位，而冠军位是"优先被信任"
+    // 的候选（见 [_cdnChampion]）。
+    if (_roundVoided(generation)) return null;
+
+    // 无论测速成功与否，这一轮候选都进入冷却；[_kCdnRetryAfter] 之后可以重测。
+    // 压在两道作废判断**之后**：给旧对象记的冷却，到了新对象手里只是凭白少几个
+    // 候选（[_cdnTriedAt] 是刻意为换画质保留下来的）。
     for (final service in candidates) {
-      if (gotSample.contains(service)) {
-        _cdnNoSample.remove(service);
-      } else {
-        _cdnNoSample.add(service);
-      }
+      _cdnTriedAt[service] = now;
     }
 
     String describe(String name, CdnSample? s) => s == null
@@ -1102,6 +1233,20 @@ mixin CdnSwitchMixin on GetxController {
     if (readOffset > 0 && baseline != null && !baseline.ranged) {
       // 回 200 = 从头发的整个对象，那是在"面子区间"取样，没法跟偏移样本比。
       return unmeasurable('基线未遵守 Range(200)，样本作废');
+    }
+
+    // 一个字节都没到的候选进"死镜像"冷却，下一轮不再占候选位；下次出样本了就
+    // 立刻恢复。不要拿 samples 里的"样本太小"去判死 —— 那是活着只是慢。
+    //
+    // 放在两道作废判断**之后**：整轮作废（416 / 基线未遵守 Range）时谁也没真测
+    // 过东西，把所有人记成"死镜像"会白白锁掉 30 分钟。
+    final gotSample = samples.map((e) => e.$1).toSet();
+    for (final service in candidates) {
+      if (gotSample.contains(service)) {
+        _cdnNoSample.remove(service);
+      } else {
+        _cdnNoSample.add(service);
+      }
     }
 
     /// 样本能不能拿来比较。offset > 0 时服务器必须真的按 Range 回 206。
@@ -1255,6 +1400,14 @@ mixin CdnSwitchMixin on GetxController {
         '${_fmtSpeed(base.bytes, base.micros)} 快是正常的（坏字节也是这么快'
         '送来的），只比谁的字节能解出画面',
       );
+      // 绕过速度门槛，但**不绕过码率硬需求**：切换是为了躲开坏字节，而落到一条
+      // 喂不动这条流的镜像上只是把"冻画面"换成"永远饿着"。needBps 未知
+      // （size/duration 没探到）时退回原来的行为。
+      if (needBps > 0 && bestBps < needBps) {
+        return unmeasurable(
+          '解码错误，但没有候选能满足 ${needBps.toStringAsPrecision(3)}MB/s 的码率',
+        );
+      }
     }
     return (
       verdict: _CdnRoundVerdict.better,
@@ -1265,25 +1418,18 @@ mixin CdnSwitchMixin on GetxController {
     );
   }
 
-  /// 本轮测速的目标字节偏移。
-  ///
-  /// 用 position/duration 的比例把播放头映射到 size 上，并强制落在
-  /// `[size × _kCdnOffsetFloor, size − _kCdnReadWindowBytes]`：头部是每个镜像都
-  /// 快的"面子区间"（坏镜像在那里也是满速），尾部要留够一个读窗口，否则读到一半
-  /// 就撞 EOF，会被误判成"这个镜像慢"。
-  ///
-  /// duration 未知时退回 0：只能测头部，好过不测。听视频模式下 mpv 拿到的是音频
-  /// 地址，拿视频的偏移去读必然 416，也退回 0。
+  /// 本轮测速的目标字节偏移：只负责从播放器取现场，换算交给
+  /// [CdnSpeedTest.targetOffset]（纯函数，能单测）。
   int _starveOffset(Duration position, int? size) {
-    if (size == null || size <= 0) return 0;
-    if (plPlayerController.onlyPlayAudio.value) return 0;
-    final total = plPlayerController.durationInMilliseconds;
-    if (total <= 0) return 0;
-    final upper = size - _kCdnReadWindowBytes;
-    final lower = (size * _kCdnOffsetFloor).round();
-    if (lower >= upper) return 0;
-    final offset = (size * (position.inMilliseconds / total)).round();
-    return offset.clamp(lower, upper);
+    if (size == null) return 0;
+    return CdnSpeedTest.targetOffset(
+      size: size,
+      playheadMs: position.inMilliseconds,
+      // [buffered] 存的是秒，换算成毫秒才是同一个坐标。
+      cacheEndMs: plPlayerController.buffered.value * 1000,
+      durationMs: plPlayerController.durationInMilliseconds,
+      onlyPlayAudio: plPlayerController.onlyPlayAudio.value,
+    );
   }
 
   /// 只换镜像 host：不重新请求 playurl，也不动 codec（updatePlayer 里的
@@ -1295,7 +1441,7 @@ mixin CdnSwitchMixin on GetxController {
   }) async {
     // 测速期间用户可能已经换集/重置，此时这条 URL 属于上一轮的播放列表。
     if (generation != _cdnGeneration) return false;
-    final newVideo = CdnSpeedTest.urlFor(firstVideo.playUrls, service);
+    final newVideo = VideoUtils.cdnUrlFor(firstVideo.playUrls, service);
     // 永远不要用空的 source 调 setDataSource。
     if (newVideo.isEmpty) return false;
 
@@ -1315,17 +1461,25 @@ mixin CdnSwitchMixin on GetxController {
         (i) => i.id == audioQa.code,
         orElse: () => audioList.first,
       );
-      // disableAudioCDN 已在 getCdnUrl 内部处理，这里不用额外分支。
-      final newAudio = CdnSpeedTest.urlFor(firstAudio.playUrls, service);
+      // disableAudioCDN 由 getCdnUrl 内部处理 —— 但**必须把 isAudio 传进去**：
+      // 不传的话那个分支根本不成立，用户勾了「音频不跟随 CDN」，换源照样把音频
+      // 的 host 改掉（正是这个设置存在要避免的"部分视频无声"）。
+      final newAudio = VideoUtils.cdnUrlFor(
+        firstAudio.playUrls,
+        service,
+        isAudio: true,
+      );
       if (newAudio.isNotEmpty) audioUrl = newAudio;
     }
 
-    autoPlay = true;
+    // 保留用户的播放/暂停意图：解码错误档是事件驱动的，用户暂停后缓冲里残留的
+    // 坏字节仍可能凑够一次风暴 —— 那时候不该把播放重新拉起来。
+    final wasPlaying = plPlayerController.playerStatus.isPlaying;
     playedTime = pos;
     // 清掉它，让 playerInit 走 playedTime 分支 seek 回原位置。
     defaultST = null;
 
-    await playerInit(autoplay: true);
+    await playerInit(autoplay: wasPlaying);
     if (generation != _cdnGeneration || isClosed) return false;
     await _restoreResumePosition(pos, generation);
     return generation == _cdnGeneration && !isClosed;
@@ -1365,25 +1519,59 @@ mixin CdnSwitchMixin on GetxController {
   /// 落点不是 [from] 被判成"未恢复"，于是又换下一个候选、再重载一次 —— 每重载
   /// 一次位置就丢一次，这就是"换 CDN 会回到前面"的来源。位置对不对是
   /// [_restoreResumePosition] 的事，不该由这里兼任。
-  Future<bool> _awaitRecovery(int generation, Duration from) {
+  ///
+  /// [decode] 为真时（解码错误档触发的换源）上面两条判据都不可信：坏镜像的余量
+  /// 填得满（它是**快**的），位置又被音频时钟推着走 —— 两条都会把"画面还冻着"
+  /// 判成已恢复。这一档只看"换过去之后还吐不吐坏字节"。
+  Future<bool> _awaitRecovery(
+    int generation,
+    Duration from, {
+    bool decode = false,
+  }) {
     final player = plPlayerController;
     final completer = Completer<bool>();
     final start = DateTime.now();
 
     void listener(Duration position) {
-      if (completer.isCompleted) return;
+      if (completer.isCompleted || decode) return;
       if (position - from >= _kCdnRecoverProgress) {
         completer.complete(true);
       }
     }
 
     player.addPositionListener(listener);
+    final window = decode ? _kCdnDecodeRecoverWindow : _kCdnRecoverWindow;
     final timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (completer.isCompleted) return;
-      if (generation != _cdnGeneration ||
-          isClosed ||
-          DateTime.now().difference(start) >= _kCdnRecoverWindow) {
+      final elapsed = DateTime.now().difference(start);
+      if (generation != _cdnGeneration || isClosed || elapsed >= window) {
         completer.complete(false);
+        return;
+      }
+      if (decode) {
+        // 前 [_kCdnDecodeRecoverGrace] 秒是旧流在排空：那段时间里解码器报的错
+        // 算不到新镜像头上，要**按时刻**滤掉。只用一个 `since` 是不够的 ——
+        // grace 和 cleanWindow 等长时，"离最近一次报错满 4 秒"会被一条来自旧流
+        // 的报错重置，判据实际退化成"离**那次旧报错**满 4 秒"，grace 想区分的
+        // 那件事被它自己抹平了。
+        final drain = start.add(_kCdnDecodeRecoverGrace);
+        final last = player.lastDecoderCorruptionAt;
+        final lastReal = last != null && last.isAfter(drain) ? last : null;
+        // 滤掉旧流的报错之后，安静时长必须从**宽限期结束**算起，不能从 [start]
+        // 算起。从 start 算的话 `elapsed >= grace && since >= cleanWindow` 会在
+        // elapsed 刚够 grace 那一刻同时成立（since == elapsed == 4s）—— 也就是
+        // **一秒安静都没观察到**就宣布恢复，grace 又从另一头变成了空转，而且跟
+        // [_kCdnDecodeRecoverWindow] 注释里写的"宽限 + 干净窗口（≈8s）"对不上。
+        final since = lastReal == null
+            ? elapsed - _kCdnDecodeRecoverGrace
+            : DateTime.now().difference(lastReal);
+        if (elapsed >= _kCdnDecodeRecoverGrace &&
+            since >= _kCdnDecodeCleanWindow) {
+          debugPrint(
+            'CDN 自动切换: 解码错误档换源后 ${since.inSeconds}s 无新报错，判定已恢复',
+          );
+          completer.complete(true);
+        }
         return;
       }
       final floor = _cdnBufferFloor;

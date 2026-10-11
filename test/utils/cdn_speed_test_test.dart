@@ -108,4 +108,163 @@ void main() {
       expect(need, lessThan(1.0));
     });
   });
+
+  group('recordTooOld', () {
+    final now = DateTime(2026, 10, 11, 12);
+    const window = Duration(minutes: 3);
+
+    test('a fresh record is usable', () {
+      expect(
+        CdnSpeedTest.recordTooOld(now, now.subtract(const Duration(seconds: 1)), window),
+        isFalse,
+      );
+      expect(
+        CdnSpeedTest.recordTooOld(now, now, window),
+        isFalse,
+      );
+    });
+
+    test('the window boundary counts as expired', () {
+      // `>=`, not `>`: the two call sites pass a window that means "this record
+      // is no longer describing the object", so the boundary must retire it.
+      expect(
+        CdnSpeedTest.recordTooOld(now, now.subtract(window), window),
+        isTrue,
+      );
+      expect(
+        CdnSpeedTest.recordTooOld(
+          now,
+          now.subtract(window - const Duration(milliseconds: 1)),
+          window,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a backwards clock step expires the record instead of preserving it', () {
+      // The one-sided `>= window` never fires on a negative delta, so a peak
+      // record would outlive its expiry forever — and the "start a fresh window"
+      // guard in _recordCdnSample would never fire either. Both exist to retire
+      // a record, so a backwards step must expire it immediately.
+      expect(
+        CdnSpeedTest.recordTooOld(now, now.add(const Duration(hours: 1)), window),
+        isTrue,
+      );
+      expect(
+        CdnSpeedTest.recordTooOld(
+          now,
+          now.add(const Duration(days: 365)),
+          const Duration(hours: 6),
+        ),
+        isTrue,
+      );
+    });
+
+    test('a never-written slot (timestamp 0, i.e. 1970) is expired', () {
+      expect(
+        CdnSpeedTest.recordTooOld(
+          now,
+          DateTime.fromMillisecondsSinceEpoch(0),
+          const Duration(hours: 6),
+        ),
+        isTrue,
+      );
+    });
+  });
+
+  group('targetOffset', () {
+    // The same real 1080p60 stream: 399,635,318 B over 2,241,600 ms.
+    const size = 399635318;
+    const durationMs = 2241600;
+    const mid = durationMs ~/ 2;
+    const noAudio = false;
+
+    int offsetAt({
+      required int playheadMs,
+      required int cacheEndMs,
+      int duration = durationMs,
+      bool onlyPlayAudio = noAudio,
+      int total = size,
+    }) => CdnSpeedTest.targetOffset(
+      size: total,
+      playheadMs: playheadMs,
+      cacheEndMs: cacheEndMs,
+      durationMs: duration,
+      onlyPlayAudio: onlyPlayAudio,
+    );
+
+    test('maps the playhead through the object, plus the lead', () {
+      final at = offsetAt(playheadMs: mid, cacheEndMs: 0);
+      // Halfway through, plus [CdnSpeedTest.sampleLeadMs] — so just past half.
+      expect(at, greaterThan(size ~/ 2));
+      expect(at, lessThan((size * 0.51).round()));
+      expect(at, lessThanOrEqualTo(size - CdnSpeedTest.readWindowBytes));
+    });
+
+    test('the buffered end wins over the playhead', () {
+      expect(
+        offsetAt(playheadMs: mid, cacheEndMs: mid + 100000),
+        greaterThan(offsetAt(playheadMs: mid, cacheEndMs: 0)),
+      );
+      // A buffer that has not run ahead is not a second signal.
+      expect(
+        offsetAt(playheadMs: mid, cacheEndMs: mid),
+        offsetAt(playheadMs: mid, cacheEndMs: 0),
+      );
+    });
+
+    test('samples strictly past the buffered end, never inside it', () {
+      // The point of the lead: the bytes the player already pulled are hot in the
+      // edge node, and the baseline is the URL being played, so a sample inside
+      // the buffer inflates the denominator the candidates are judged against.
+      const cacheEnd = mid + 60 * 1000;
+      final at = offsetAt(playheadMs: mid, cacheEndMs: cacheEnd);
+      final bufferedBytes = (size * cacheEnd / durationMs).round();
+      expect(at, greaterThan(bufferedBytes));
+    });
+
+    test('pushes past the head, where every mirror is fast', () {
+      // 5 s in is 0.22% of the object — under the floor. A mirror that dies deeper
+      // in still streams the head at full speed, so a sample there ties everyone.
+      expect(
+        offsetAt(playheadMs: 5000, cacheEndMs: 0),
+        (size * CdnSpeedTest.offsetFloor).round(),
+      );
+    });
+
+    test('stops short of the end so a read cannot run into EOF', () {
+      // Read into the object's end and EOF is misread as "this mirror is slow".
+      expect(
+        offsetAt(playheadMs: durationMs, cacheEndMs: 0),
+        size - CdnSpeedTest.readWindowBytes,
+      );
+    });
+
+    test('an unknown duration falls back to the floor, not the head', () {
+      // No ratio is available, but returning 0 samples the head — where all
+      // mirrors tie, and a round that always ties never switches.
+      final at = offsetAt(playheadMs: mid, cacheEndMs: mid, duration: 0);
+      expect(at, (size * CdnSpeedTest.offsetFloor).round());
+      expect(at, greaterThan(0));
+    });
+
+    test('unknown size, and audio-only mode, stay at 0', () {
+      // Audio-only: mpv was handed an audio URL, so a video offset is a
+      // guaranteed 416 (which voids the whole round).
+      expect(
+        offsetAt(playheadMs: mid, cacheEndMs: mid, onlyPlayAudio: true),
+        0,
+      );
+      expect(offsetAt(playheadMs: mid, cacheEndMs: mid, total: 0), 0);
+      expect(offsetAt(playheadMs: mid, cacheEndMs: mid, total: -1), 0);
+    });
+
+    test('an object too small to hold both bounds stays at 0', () {
+      // The floor and the read window overlap once size <= readWindowBytes/0.85.
+      expect(
+        offsetAt(playheadMs: mid, cacheEndMs: mid, total: 4 * 1024 * 1024),
+        0,
+      );
+    });
+  });
 }

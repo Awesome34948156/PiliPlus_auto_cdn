@@ -37,6 +37,21 @@ void main() {
         isTrue,
       );
     });
+
+    test('大小写无关：mpv/ffmpeg 的输出大小写并不稳定', () {
+      // 签名是从某一次实测日志逐字抄下来的，对方改一次大小写，区分大小写的
+      // 匹配就静默失效 —— 在 release 里没有任何提示。
+      const lines = [
+        'av1: OBU_Forbidden_Bit Out Of Range: 1, but must be in [0,0].',
+        'libdav1d: error PARSING obu DATA',
+        'NULL: fAILED to READ Packet.',
+        'INVALID NAL UNIT SIZE (34817 > 5117).',
+        'MISSING PICTURE IN ACCESS UNIT with size 5121',
+      ];
+      for (final line in lines) {
+        expect(isDecoderCorruptionLog(line), isTrue, reason: line);
+      }
+    });
   });
 
   group('不该认的', () {
@@ -81,5 +96,100 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  group('recordDecodeErrorHit 攒风暴', () {
+    // 播放器那边用的就是这三个数（PlPlayerController）。
+    const window = Duration(seconds: 6);
+    const burst = 12;
+    const dedupe = Duration(milliseconds: 5);
+    final t0 = DateTime(2026, 10, 11, 12);
+
+    bool hit(List<DateTime> hits, DateTime now) => recordDecodeErrorHit(
+      hits,
+      now,
+      window: window,
+      burst: burst,
+      lineDedupe: dedupe,
+    );
+
+    test('the 12th line inside the window is the one that fires', () {
+      // 门槛卡在"一两条就停的偶发报错"和"400+ 条的刷屏"之间。
+      final hits = <DateTime>[];
+      for (var i = 0; i < 11; i++) {
+        expect(
+          hit(hits, t0.add(Duration(milliseconds: 100 * i))),
+          isFalse,
+          reason: '第 ${i + 1} 条不该触发',
+        );
+      }
+      expect(hit(hits, t0.add(const Duration(milliseconds: 1100))), isTrue);
+    });
+
+    test('one bad packet reported by three ffmpeg layers counts once', () {
+      // 实测：同一个坏包在 `av1:` / `libdav1d:` / `NULL:` 上各记一行，相隔不到
+      // 5ms。不合并的话 12 条的门槛只等于 4 个坏包。
+      final hits = <DateTime>[];
+      hit(hits, t0);
+      hit(hits, t0.add(const Duration(milliseconds: 1)));
+      hit(hits, t0.add(const Duration(milliseconds: 3)));
+      expect(hits.length, 1);
+
+      // 过了去重窗就是**另一个**包。
+      hit(hits, t0.add(const Duration(milliseconds: 6)));
+      expect(hits.length, 2);
+    });
+
+    test('hits older than the window are evicted, so a slow trickle never fires', () {
+      // 判据是"6 秒内 12 条"，不是"累计 12 条"：一次长时间播放里的零星报错
+      // 不该攒成一场风暴。
+      final hits = <DateTime>[];
+      // 11 条挤在 1.1 秒里 —— 窗口是 6 秒，所以它们都还在窗内。
+      for (var i = 0; i < 11; i++) {
+        hit(hits, t0.add(Duration(milliseconds: 100 * i)));
+      }
+      expect(hits.length, 11);
+
+      // 隔了将近 17 秒 —— 前 11 条全部出窗，只剩这一条，离门槛还远。
+      expect(hit(hits, t0.add(const Duration(seconds: 18))), isFalse);
+      expect(hits.length, 1);
+    });
+
+    test('a hit exactly at the window edge still counts', () {
+      // 淘汰用严格 `>`：正好 6 秒前的那条还算数，边界上不抖。
+      final hits = <DateTime>[];
+      hit(hits, t0);
+      hit(hits, t0.add(window));
+      expect(hits.length, 2);
+    });
+
+    test('reaching the burst does not clear the window', () {
+      // 清空是调用方的事（真的上报之后才清）：静默期内攒下的这批必须留着，
+      // 静默期一过立刻兑现，而不是从头再攒。
+      final hits = <DateTime>[];
+      for (var i = 0; i < 12; i++) {
+        hit(hits, t0.add(Duration(milliseconds: 100 * i)));
+      }
+      expect(hits.length, 12);
+    });
+
+    test('a backwards clock step does not silence the criterion', () {
+      // NTP 校正把时钟往回拨之后，hits.last 落在"未来"：差值成负数、去重分支会
+      // 把此后**每一条**都当成同一个坏包的副本吞掉，而淘汰条件对未来时刻也不
+      // 成立 —— 那条记录永远清不掉，判据整个 session 静默失效。这里要求回拨后
+      // 的那条算**新的一条**，并且落在未来的旧记录被清掉。
+      final hits = <DateTime>[];
+      hit(hits, t0.add(const Duration(seconds: 10)));
+      // 回拨 10 秒：现在比记录还早。
+      final back = t0;
+      expect(hit(hits, back), isFalse);
+      expect(hits, [back]);
+
+      // 之后照常攒，照样能触发 —— 判据没有被那一下静默掉。
+      for (var i = 1; i < 12; i++) {
+        hit(hits, back.add(Duration(milliseconds: 100 * i)));
+      }
+      expect(hit(hits, back.add(const Duration(milliseconds: 1200))), isTrue);
+    });
   });
 }

@@ -703,8 +703,8 @@ class VideoDetailController extends GetxController
   void updatePlayer() {
     final currentVideoQa = this.currentVideoQa.value;
     if (currentVideoQa == null) return;
-    // 换画质等于换了 dataSource，在途的测速结果对应的是旧列表，作废。
-    resetCdnSwitchIfBusy();
+    // 换画质 = 换对象：字节总长、坏 host、在途的测速都要作废（时间型冷却保留）。
+    resetCdnForNewObject();
     _autoPlay.value = true;
     playedTime = plPlayerController.videoPlayerController?.state.position;
     plPlayerController

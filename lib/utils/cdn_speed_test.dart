@@ -1,7 +1,6 @@
 import 'package:PiliPlus/http/browser_ua.dart';
 import 'package:PiliPlus/http/constants.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
-import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:dio/dio.dart';
 
 /// One transfer sample: bytes received, wall-clock microseconds, the object's
@@ -85,13 +84,6 @@ abstract final class CdnSpeedTest {
       .where((e) => e.host != null && !CDNService.knownDead.contains(e))
       .toList(growable: false);
 
-  /// The URL [service] would serve for [urls], or `''` when there is nothing to
-  /// serve.
-  static String urlFor(Iterable<String> urls, CDNService service) {
-    if (urls.isEmpty) return '';
-    return VideoUtils.getCdnUrl(urls, defaultCDNService: service);
-  }
-
   /// What it takes to play [size] bytes spread over [durationMs], expressed in
   /// **MB/s** — the same unit a measured sample reads as, since every caller
   /// computes a rate as `bytes / micros` and 1 byte/µs is exactly 1 MB/s.
@@ -108,6 +100,74 @@ abstract final class CdnSpeedTest {
   /// Returns 0 for unknown inputs so the caller can treat 0 as "don't apply".
   static double requiredMBps(int size, int durationMs) =>
       (size <= 0 || durationMs <= 0) ? 0 : size / durationMs / 1000;
+
+  /// Is a timestamped speed record too old to be used?
+  ///
+  /// **Negative** age counts as too old. A backwards clock step (NTP correction,
+  /// the user changing it) makes `now - recorded` negative, and a one-sided
+  /// `>= window` then never fires — so a peak record outlives its expiry
+  /// forever, and the "start a fresh window" guard never fires either. Both of
+  /// those exist precisely to retire a record, so a backwards step is treated as
+  /// immediate expiry.
+  ///
+  /// A never-written slot has timestamp 0 (1970), which clears any window on its
+  /// own — no special case needed.
+  static bool recordTooOld(DateTime now, DateTime recorded, Duration window) {
+    final delta = now.difference(recorded);
+    return delta.isNegative || delta >= window;
+  }
+
+  /// Lower bound of the sample offset, as a fraction of the object. The head is
+  /// the "face-saving zone" — a mirror that is dead deeper in still streams the
+  /// head at full speed — so sampling must land past it.
+  static const double offsetFloor = 0.15;
+
+  /// How many bytes to keep clear of the object's end. A sample reads at most
+  /// [autoBytes]; the 2x margin is there so a read never runs into EOF, which
+  /// would be misread as "this mirror is slow".
+  static const int readWindowBytes = 4 * 1024 * 1024;
+
+  /// How far past the buffer's end to sample, on top of the playhead.
+  ///
+  /// What the player has already pulled is hot in the edge node, and the
+  /// baseline *is* the URL being played, so reading hot bytes inflates it
+  /// (measured: 19.2MB/s hot vs 0.683MB/s cold at the same offset) and divides
+  /// the candidate bar down to a phantom. The buffered end is what the playhead
+  /// is about to read next: cold, yet still "the bytes about to be needed".
+  /// When the buffer is starved `cacheEnd == playhead`, so this lead is the only
+  /// margin left — it cannot be 0.
+  static const int sampleLeadMs = 5000;
+
+  /// Where to sample the object for a speed test, in bytes.
+  ///
+  /// The sample must land inside `[size × offsetFloor, size − readWindowBytes]`:
+  /// past the fast head, and short of the end. The point is the **buffered end +
+  /// [sampleLeadMs]**, not the playhead byte, so baseline and candidates both
+  /// read cold bytes (see [sampleLeadMs]).
+  ///
+  /// Unknown duration (the player has not reported one yet) has no usable ratio,
+  /// but it must not fall back to the head either: every mirror is fast at the
+  /// head, so a round there ties them all and never switches. It returns the
+  /// interior floor instead. `onlyPlayAudio` returns 0 — mpv was handed an audio
+  /// URL, so any video offset is a guaranteed 416 — as does an unknown size.
+  static int targetOffset({
+    required int size,
+    required int playheadMs,
+    required int cacheEndMs,
+    required int durationMs,
+    required bool onlyPlayAudio,
+  }) {
+    if (size <= 0) return 0;
+    if (onlyPlayAudio) return 0;
+    final upper = size - readWindowBytes;
+    final lower = (size * offsetFloor).round();
+    if (lower >= upper) return 0;
+    if (durationMs <= 0) return lower;
+    final targetMs =
+        (cacheEndMs > playheadMs ? cacheEndMs : playheadMs) + sampleLeadMs;
+    final offset = (size * (targetMs / durationMs)).round();
+    return offset.clamp(lower, upper);
+  }
 
   /// Returns `(bytes downloaded, elapsed microseconds)`, or null when nothing
   /// arrived. Aborting at a cap is a normal result; a genuine network failure

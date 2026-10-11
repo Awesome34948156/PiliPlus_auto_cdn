@@ -424,6 +424,13 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
 
     _setPlayCallBack();
 
+    // 相关视频跳转时，旧页发现被顶掉就把自己的探测定时器停了
+    // （见 CdnSwitchMixin._onCdnProbeTick），而返回时没有任何东西重新挂载它：
+    // 它是幂等的，只有"我现在又不是现役页了"时才真的动手，所以每次露面都调
+    // 一次是安全的。少了这一句，从相关视频返回后本页的自动换源永久静默 ——
+    // 连换集都不恢复（restartCdnProbe 只重启定时器，不重挂回调）。
+    videoDetailController.attachCdnSwitch();
+
     introController.startTimer();
 
     if (mounted &&
