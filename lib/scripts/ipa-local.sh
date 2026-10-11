@@ -16,7 +16,14 @@
 # Never run `flutter pub get` -- this fork depends on pub-cache patches that are
 # applied out of band, and a re-fetch silently drops them.
 set -euo pipefail
-export LC_ALL=C
+# 不要用 LC_ALL=C：`flutter build ios` 会拉起 pod install，而 CocoaPods 1.17 在
+# Ruby 4.0 上会拿 `Dir.pwd`（ASCII-8BIT）去调 String#unicode_normalize，直接抛
+#   Unicode Normalization not appropriate for ASCII-8BIT (Encoding::CompatibilityError)
+# 位置是 cocoapods/config.rb:167 Pod::Config#installation_root。C 语言环境把 Ruby
+# 的默认外部编码压成二进制，UTF-8 环境才是它要的。（2026-10-11 实测：同一句
+# pod install，LC_ALL=C 失败、LC_ALL=en_US.UTF-8 成功。）
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
 export COPYFILE_DISABLE=1
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
