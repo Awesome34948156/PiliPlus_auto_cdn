@@ -264,6 +264,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// "一切正常"和"看门狗根本没跑"——两者留下的日志一模一样。
   static const int _kHeartbeatSeconds = 10;
 
+  /// 无视频轨自愈每一级之间等多久。够 mpv 走一次 render 往返，又不至于让
+  /// 用户对着黑屏干等 —— 三级合计 3.6s，比一次心跳（10s）还快。
+  static const Duration _kHealWait = Duration(milliseconds: 1200);
+
   /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
   static const double _kStarveMinSeconds = 4.0;
 
@@ -990,6 +994,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
+    // 换了媒体，「音频在、画面不在」的计数与自愈额度都重新来过。
+    _noVideoBeats = 0;
+    _noVideoHealed = false;
 
     var player = _videoPlayerController;
 
@@ -1278,6 +1285,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 连续多少个心跳"音频在、画面不在"。见 [_checkNoVideoTrack]。
   int _noVideoBeats = 0;
 
+  /// 本次媒体是否已经跑过一轮自愈。每换一次媒体在 [_createVideoController]
+  /// 里重置 —— 一轮就够，别跟用户的手动操作抢。
+  bool _noVideoHealed = false;
+
+  /// 自愈是否正在跑（阶梯里 await 了，心跳回调可能重入）。
+  bool _healingNoVideo = false;
+
   /// 读一个 mpv 属性，读不到就当空串。
   ///
   /// [NativePlayer.getProperty] 在 player 已 dispose 时会抛，而这里是定时器
@@ -1292,10 +1306,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 「只有声音没画面」的现场判据。
   ///
-  /// 音频参数正常、视频轨却始终为空 —— 这正是 2026-10-11 那次 iOS 黑屏的形态：
-  /// mpv 根本没建出视频轨（当时拍到的「播放信息」里 Resolution 0x0、VideoParams
-  /// 全空），而 CDN 与编码可用性都已排除。以前这个状态一行日志都不留，只能靠
-  /// 用户手动抄「播放信息」；现在它自己会连着两拍报到日志里。
+  /// 音频参数正常、视频轨却始终为空 —— 这正是 2026-10-11 那次 iOS 黑屏的形态
+  /// （当时拍到的「播放信息」里 Resolution 0x0、VideoParams 全空），而 CDN 与
+  /// 编码可用性都已排除。build 5483 的 mpv 日志把病因定到了**视频输出**一侧：
+  /// 解码、滤镜、音轨全部正常，唯独那一次没有建出视频输出 —— 日志里没有
+  /// `VO: [libmpv]` / `vo/libmpv: reconfig` / `libmpv_render:` 这三行，只有
+  /// mpv 自己的警告 `mpv_render_context_render() not being called or stuck.`。
+  /// 以前这个状态一行日志都不留，只能靠用户手动抄「播放信息」；现在它自己会
+  /// 连着两拍报到日志里，并触发一次 [_healNoVideoTrack]。
   ///
   /// 连空两拍才算：视频参数本来就比音频晚到，起播那一拍看到空属于正常。
   void _checkNoVideoTrack() {
@@ -1303,9 +1321,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _noVideoBeats = 0;
       return;
     }
-    final state = _videoPlayerController?.state;
-    final hasVideo = (state?.width ?? 0) > 0 || (state?.videoParams.w ?? 0) > 0;
-    if (hasVideo) {
+    if (_hasVideoTrack) {
       _noVideoBeats = 0;
       return;
     }
@@ -1313,8 +1329,113 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     debugPrint(
       '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
       'video ${_safeProp('video-codec')} hwdec ${_safeProp('hwdec-current')} '
-      '位置 ${position.value}s)',
+      '位置 ${position.value}s)${_noVideoHealed ? ' [本次媒体已自愈过]' : ''}',
     );
+    if (!_noVideoHealed) {
+      _noVideoHealed = true;
+      _healNoVideoTrack();
+    }
+  }
+
+  /// 画面是否已经起来。判据与 [_checkNoVideoTrack] 相同：宽或视频参数任一非零。
+  bool get _hasVideoTrack {
+    final state = _videoPlayerController?.state;
+    return (state?.width ?? 0) > 0 || (state?.videoParams.w ?? 0) > 0;
+  }
+
+  /// 「只有声音没画面」的自愈阶梯。
+  ///
+  /// 病根在 media_kit 的 iOS 视频输出一侧，不在流、不在解码器：
+  /// `VideoOutput._updateCallback` 只在 mpv 的 `video-out-params` 报出非零 dw/dh
+  /// 时才去 `texture.render()` —— 也就是只有在视频输出**已经配好之后**它才会去
+  /// 驱动 `mpv_render_context_render`。于是只要某次加载停在"输出还没配、参数还
+  /// 是空"的状态上，两边就互等成死锁：mpv 一直抱怨没人调 render，画面永远不出
+  /// 来；而音频走的是独立的 AO，所以听得到声音、看不到画面。
+  ///
+  /// 三级都只碰输出侧，不重开媒体、不换数据源、不丢播放位置：
+  /// 1. 重挂视频轨：让 mpv 重新走一遍视频链初始化，视频输出随之重建；
+  /// 2. `video-reload`：mpv 自带的"重载当前视频轨"；
+  /// 3. 钉住输出尺寸：直接绕过上面那个判断，一次 render 就能让 mpv 把输出配上，
+  ///    随后立刻把尺寸交还 mpv 自己算（见 [_nudgeSize]）。
+  ///
+  /// 三级全败也不算白跑：日志会记下放弃，用户手动退出视频页再进来仍然能恢复
+  /// —— 那会新建渲染上下文，是这个死锁的另一条出路。
+  Future<void> _healNoVideoTrack() async {
+    final player = _videoPlayerController;
+    if (player == null || _healingNoVideo) {
+      return;
+    }
+    _healingNoVideo = true;
+    var nudged = false;
+    try {
+      for (var level = 1; level <= 3; level++) {
+        debugPrint(
+          '无视频轨自愈 $level/3: ${_healName(level)} '
+          '(位置 ${position.value}s)',
+        );
+        try {
+          nudged = await _healStep(level, player) || nudged;
+        } catch (e) {
+          debugPrint('无视频轨自愈 $level/3 抛错: $e');
+          continue;
+        }
+        await Future.delayed(_kHealWait);
+        if (_hasVideoTrack) {
+          debugPrint('无视频轨自愈成功: ${_healName(level)}');
+          return;
+        }
+      }
+      debugPrint('无视频轨自愈失败: 三级都没能让视频输出起来，退出视频页再进来可恢复');
+    } finally {
+      _healingNoVideo = false;
+      if (nudged) {
+        // 把尺寸交还 mpv：钉住只是为了松开死锁，一直挂着会让竖屏这类
+        // 非 16:9 的视频按错的尺寸渲染。
+        await videoController?.setSize(width: null, height: null);
+      }
+    }
+  }
+
+  String _healName(int level) => switch (level) {
+    1 => '重挂视频轨 vid=no→auto',
+    2 => 'video-reload',
+    _ => '钉住输出尺寸 setSize',
+  };
+
+  /// 跑一级自愈。返回是否钉住了输出尺寸（收尾时要交还 mpv）。
+  Future<bool> _healStep(int level, Player player) async {
+    switch (level) {
+      case 1:
+        // setProperty 是同步下发的（不是 Future），中间留一拍让 mpv 先把
+        // 视频链拆掉，再挂回去才算一次完整的重建。
+        player.setProperty('vid', 'no');
+        await Future.delayed(const Duration(milliseconds: 400));
+        player.setProperty('vid', 'auto');
+        return false;
+      case 2:
+        await player.command(['video-reload']);
+        return false;
+      default:
+        final vc = videoController;
+        if (vc == null) return false;
+        final (w, h) = _nudgeSize;
+        await vc.setSize(width: w, height: h);
+        return true;
+    }
+  }
+
+  /// 第 3 级钉尺寸用的尺寸。
+  ///
+  /// 优先取 demuxer 报的轨道尺寸：`track-list/<n>/demux-w` 不依赖视频输出就有效
+  /// （竖屏视频也报得对），而 `video-params` 此刻正是空的 —— 那正是病根。
+  /// 全都读不到就退回 16:9：这一步只求非零，够把死锁松开就行。
+  (int, int) get _nudgeSize {
+    for (var i = 0; i < 4; i++) {
+      final w = int.tryParse(_safeProp('track-list/$i/demux-w')) ?? 0;
+      final h = int.tryParse(_safeProp('track-list/$i/demux-h')) ?? 0;
+      if (w > 0 && h > 0) return (w, h);
+    }
+    return (1920, 1080);
   }
 
   /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。
