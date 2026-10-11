@@ -71,9 +71,15 @@ abstract final class CdnSpeedTest {
           'referer': HttpString.baseUrl,
         };
 
-  /// Real mirrors only — `baseUrl` and `backupUrl` carry no host.
-  static List<CDNService> get mirrors =>
-      CDNService.values.where((e) => e.host != null).toList(growable: false);
+  /// Real mirrors only — `baseUrl` and `backupUrl` carry no host, and
+  /// [CDNService.knownDead] carries a host no resolver can resolve.
+  ///
+  /// 这是唯一一处"哪些镜像值得探"的源头（轮换表和冠军评选都取自它）。死主机
+  /// 留下的唯一后果是每轮白占一个候选位 + 两次 3 秒超时，见 `knownDead`。
+  /// 设置页列的是 `CDNService.values`，所以那两行仍然看得见、选得动。
+  static List<CDNService> get mirrors => CDNService.values
+      .where((e) => e.host != null && !CDNService.knownDead.contains(e))
+      .toList(growable: false);
 
   /// The URL [service] would serve for [urls], or `''` when there is nothing to
   /// serve.

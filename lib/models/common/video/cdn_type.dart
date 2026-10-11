@@ -22,6 +22,26 @@ enum CDNService {
   final String? host;
 
   const CDNService(this.desc, [this.host]);
+
+  /// DNS 上根本不存在的镜像，永远不该进候选窗口。
+  ///
+  /// 2026-10-11 实测，`akamai_sz` 与 `hwov` 这两个主机名在**四个**解析器下
+  /// （系统、223.5.5.5、119.29.29.29、8.8.8.8）全部返回 **NXDOMAIN**：
+  ///
+  ///   - `upos-sz-mirrorakam.akamaized.net` —— 注意兄弟条目 `akamai` 的
+  ///     `upos-hz-mirrorakam.akamaized.net` 是**正常解析**的（它的问题是换
+  ///     host 之后 403，那另外有 `_kCdnDeadRetryAfter` 管）；
+  ///   - `upos-sz-mirrorhwov.bilivideo.com` —— CNAME 指向
+  ///     `…0979c69f.cdnhwcgqa21.com`，而那个目标没有 A 记录。
+  ///
+  /// `cosov` / `aliov`（另外两个海外条目）都正常解析到 IP，所以这不是
+  /// "海外镜像全挂了"，更不是本地网络或 VPN —— 是表里的死数据，重试无用。
+  /// 候选位只有两个（`CdnSpeedTest.autoCandidatesMax`），让它们每轮占一个
+  /// 位子等于把探测能力砍掉一半，还白赔两次 3 秒超时。
+  ///
+  /// **只从候选筛选里排除，不删枚举项**：`CDNService` 是按名字存进 Hive 的，
+  /// 删项会让旧设置读不出来。
+  static const Set<CDNService> knownDead = {akamai_sz, hwov};
 }
 
 // from https://rec.danmuji.org/dev/cdn-info/
