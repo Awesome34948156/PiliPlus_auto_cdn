@@ -297,4 +297,151 @@ void main() {
       expect(hit(hits, back.add(const Duration(milliseconds: 1200))), isTrue);
     });
   });
+
+  group('密集档：不去重，抓稀疏档数不到的短促爆发', () {
+    // 稀疏档的三个数（PlPlayerController._kDecodeErrorBurst / _kDecodeErrorWindow
+    // / _kDecodeLineDedupe）与密集档的两个数（_kDecodeErrorDenseBurst /
+    // _kDecodeErrorDenseWindow）。两档喂的是同一个纯函数，只是参数不同。
+    const sparseWindow = Duration(seconds: 6);
+    const sparseBurst = 12;
+    const dedupe = Duration(milliseconds: 5);
+    const denseWindow = Duration(milliseconds: 100);
+    const denseBurst = 20;
+
+    // 逐字复刻 2026-10-11 那一场：日志 4 的 `22:53:59.334` → `.378`，
+    // **260 条坏字节挤在 44 毫秒里**（`NULL: Failed to parse temporal unit` 一族）。
+    // 它当时一条 `解码错误风暴` 都没出 —— 这就是要修的盲区。
+    final storm0 = DateTime(2026, 10, 11, 22, 53, 59, 334);
+    const stormSpan = Duration(milliseconds: 44);
+    const stormLines = 260;
+    DateTime stormAt(int i) => storm0.add(stormSpan * (i / (stormLines - 1)));
+
+    bool hitWith(
+      List<DateTime> hits,
+      DateTime now, {
+      required Duration window,
+      required int burst,
+      required Duration lineDedupe,
+    }) => recordDecodeErrorHit(
+      hits,
+      now,
+      window: window,
+      burst: burst,
+      lineDedupe: lineDedupe,
+    );
+
+    bool sparseHit(List<DateTime> hits, DateTime now) => hitWith(
+      hits,
+      now,
+      window: sparseWindow,
+      burst: sparseBurst,
+      lineDedupe: dedupe,
+    );
+
+    bool denseHit(List<DateTime> hits, DateTime now) => hitWith(
+      hits,
+      now,
+      window: denseWindow,
+      burst: denseBurst,
+      lineDedupe: Duration.zero,
+    );
+
+    test('44 毫秒 260 条：稀疏档整场数不满，密集档第 20 行就报', () {
+      // 先钉住病：同包去重把命中率封在 1/5ms，44 毫秒最多落 9 条，够不到 12，
+      // 而 44 毫秒之后风暴就结束了 —— 窗口空着等 6 秒过期，整场无人上报。
+      final sparse = <DateTime>[];
+      var sparseEverReached = false;
+      var firstDenseAt = -1;
+      final dense = <DateTime>[];
+      for (var i = 0; i < stormLines; i++) {
+        final at = stormAt(i);
+        sparseEverReached |= sparseHit(sparse, at);
+        if (firstDenseAt < 0 && denseHit(dense, at)) {
+          firstDenseAt = i;
+        }
+      }
+
+      expect(sparseEverReached, isFalse, reason: '稀疏档本该整场看不见（这就是那条盲区）');
+      expect(sparse.length, 9, reason: '44ms / 5ms ≈ 9 条');
+      expect(
+        firstDenseAt,
+        denseBurst - 1,
+        reason: '第 20 行落地就该报，44 毫秒里 20 行离门槛只有一步',
+      );
+    });
+
+    test('越密越看得见：门槛上下各差一条就翻转', () {
+      bool fire(int n) {
+        final dense = <DateTime>[];
+        var reached = false;
+        for (var i = 0; i < n; i++) {
+          reached |= denseHit(dense, storm0.add(stormSpan * (i / (n - 1))));
+        }
+        return reached;
+      }
+
+      expect(fire(denseBurst), isTrue);
+      expect(fire(denseBurst - 1), isFalse);
+    });
+
+    test('反例：同一个坏包在三层各报一行，三条不算密集', () {
+      // 这正是同包去重存在的原因 —— 密集档不去重，就得靠门槛把这种挡在外面。
+      final dense = <DateTime>[];
+      for (var i = 0; i < 3; i++) {
+        expect(
+          denseHit(dense, storm0.add(Duration(milliseconds: i))),
+          isFalse,
+          reason: '第 ${i + 1} 层不该触发',
+        );
+      }
+    });
+
+    test('反例：换集/seek 边界上零星的一两条（单个损坏的 GOP）', () {
+      final dense = <DateTime>[];
+      expect(denseHit(dense, storm0), isFalse);
+      expect(
+        denseHit(dense, storm0.add(const Duration(milliseconds: 60))),
+        isFalse,
+      );
+    });
+
+    test('反例：正好铺满稀疏档窗口的 12 条（平均 545ms 一条）进不了密集档', () {
+      // 这是稀疏档刻意要放过的形状 —— 12 条均匀铺满 6 秒。密集档窗口只有
+      // 100ms，一条都留不住。
+      final gap = Duration(
+        milliseconds: sparseWindow.inMilliseconds ~/ (sparseBurst - 1),
+      );
+      final dense = <DateTime>[];
+      for (var i = 0; i < sparseBurst; i++) {
+        expect(denseHit(dense, storm0.add(gap * i)), isFalse);
+      }
+      expect(dense.length, 1, reason: '100ms 一过，前面的全出窗');
+    });
+
+    test('正好落在 100ms 边界上的那条还算数（淘汰用严格 >）', () {
+      final dense = <DateTime>[];
+      denseHit(dense, storm0);
+      denseHit(dense, storm0.add(denseWindow));
+      expect(dense.length, 2);
+    });
+
+    test('时钟回拨压不住它：落在未来的旧记录当场被清掉', () {
+      // 100ms 的窗口比任何回拨幅度都短，回拨之后旧记录全在"未来"，
+      // removeWhere 第一件事就是把它们清光 —— 不像稀疏档还得专门兜。
+      final dense = <DateTime>[];
+      for (var i = 0; i < denseBurst - 1; i++) {
+        denseHit(dense, storm0.add(Duration(milliseconds: i)));
+      }
+      final back = storm0.subtract(const Duration(minutes: 5));
+      expect(denseHit(dense, back), isFalse);
+      expect(dense, [back], reason: '19 条旧记录全被当成未来清掉');
+
+      // 之后照常攒，照样能报。
+      var reached = false;
+      for (var i = 1; i < denseBurst; i++) {
+        reached |= denseHit(dense, back.add(Duration(milliseconds: i)));
+      }
+      expect(reached, isTrue);
+    });
+  });
 }

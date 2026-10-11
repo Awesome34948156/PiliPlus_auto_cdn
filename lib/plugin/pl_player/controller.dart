@@ -291,6 +291,29 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 取 5ms：三层会跨毫秒边界，同毫秒太紧。
   static const Duration _kDecodeLineDedupe = Duration(milliseconds: 5);
 
+  /// 密集突发档：这么短的窗口里攒够这么多**原始行**就上报 —— **不做同包去重**，
+  /// 这正是它存在的理由。
+  ///
+  /// 为什么需要第二个档：上面那条去重把命中率封在 1/[`_kDecodeLineDedupe`]，
+  /// 于是 [_kDecodeErrorBurst] 的 12 条需要**至少 55ms 的跨度**。比这更密的爆发
+  /// 反而数不满 —— 2026-10-11 实测那一场（日志 4，`22:53:59.334` → `.378`）
+  /// **260 条坏字节挤在 44 毫秒里**，去重后只攒到 9 条，`解码错误风暴` 一条都
+  /// 没出，而 44ms 之后风暴就结束了、窗口空着等 6 秒过期。**越密越看不见**，
+  /// 是纯结构性盲区（条目 17）。
+  ///
+  /// 20 行 / 100ms 是照着"一个坏包在 ffmpeg 各层报 2~3 行"折算的：约等于
+  /// 7~10 个坏包挤在 100ms 里。那场实测是 260 条，13 倍余量；反例侧同样宽 ——
+  /// 换集 / seek 边界上的单个损坏 GOP 只有 1~2 行，差一个数量级。
+  ///
+  /// **只加给坏字节这一族。** 会话失效那一族不能加：我们自己的 `video-reload`
+  /// 事故（见 [_healNoVideoTrack] 上方）刷的 92 行里就有 `invalid session`，
+  /// 加进来会把"镜像给的字节"和"本机解码器"两个相反的结论搅在一起。
+  static const int _kDecodeErrorDenseBurst = 20;
+
+  /// 上面那 20 行的窗口。要的是"挤在一起"而不是"跨得够久"：比稀疏档数不满的
+  /// 最短跨度（55ms）宽近一倍，又短到不会把"慢慢刷"算进来。
+  static const Duration _kDecodeErrorDenseWindow = Duration(milliseconds: 100);
+
   /// 硬解会话失效：这么短的时间内攒够这么多条「本机解码会话废了」的报错，就重建
   /// 解码器。判据见 [isDecoderSessionFailureLog]。
   ///
@@ -379,6 +402,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 播放器创建（[_startListeners]）和换集/换画质（[resetDecodeErrorAccounting]）时清。
   final List<DateTime> _decodeErrors = [];
 
+  /// 落在 [_kDecodeErrorDenseWindow] 里的坏字节**原始行**时刻（不去重）。
+  ///
+  /// 和 [_decodeErrors] 同一族、同一个病，只是数法不同：那个去重、这个不去重。
+  /// 窗口只有 100ms，所以它常年只装十几条 —— 为它单开一个 list 换来的好处是
+  /// 两个档互不干扰：调稀疏档的窗口/门槛不会动到密集档，反之亦然。
+  /// 清零时机与 [_decodeErrors] 完全相同。
+  final List<DateTime> _decodeErrorDense = [];
+
   /// 解码错误风暴的静默期截止时刻。见 [_kDecodeErrorCooldown]。
   DateTime _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -402,6 +433,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 继续算（见 [_decodeErrors] 的注释）。只由页面在换集 / 换画质时调。
   void resetDecodeErrorAccounting() {
     _decodeErrors.clear();
+    _decodeErrorDense.clear();
     _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
     lastDecoderCorruptionAt = null;
     _sessionFailures.clear();
@@ -1249,6 +1281,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // [_createVideoController] 不再走 [_initPlayer]）。所以它管不到换集/换画质 ——
     // 那些由页面调 [resetDecodeErrorAccounting]。
     _decodeErrors.clear();
+    _decodeErrorDense.clear();
     _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
     lastDecoderCorruptionAt = null;
     _sessionFailures.clear();
@@ -1586,35 +1619,63 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   // 而第 3 级（钉尺寸）在那一刻干净地修好了：`VO: [libmpv]` / `reconfig` /
   // `libmpv_render: Window size` 三行是在它触发时才第一次出现的。
 
-  /// 解码错误的采样：攒够 [_kDecodeErrorBurst] 条就上报一次 [onDecodeError]。
+  /// 解码错误的采样：攒够 [_kDecodeErrorBurst]（**或** [_kDecodeErrorDenseBurst]）
+  /// 条就上报一次 [onDecodeError]。
   ///
   /// 和另外三条采样不同，它不由 [_startStallTicker] 的心跳驱动，而是被
   /// `stream.log` 推进 —— 报错是**事件**不是采样量，ticker 那一秒一拍的
   /// 节奏会把它抹平（实测那一局 6 秒里就有几十条）。
+  ///
+  /// **两个档，任一满足即上报**：量的是同一个病、走的也是同一个动作。
+  ///
+  /// - 稀疏档：[_kDecodeErrorBurst] 条 / [_kDecodeErrorWindow]，含同包去重 ——
+  ///   抓"成百条不停地刷"那种持续风暴。
+  /// - 密集档：[_kDecodeErrorDenseBurst] 行 / [_kDecodeErrorDenseWindow]，
+  ///   **不去重** —— 抓"几十毫秒里挤了几百条"那种短促爆发，也就是去重会把它们
+  ///   整段数没的那一档（来由见 [_kDecodeErrorDenseBurst]）。
   void _sampleDecodeError(String text) {
     if (!isDecoderCorruptionLog(text)) return;
     final now = DateTime.now();
     // 不受静默期限制的"最后一次坏字节"时刻：给换源后的干净窗口判据用。
     lastDecoderCorruptionAt = now;
     // 记账（含窗口淘汰与同包去重）在 [recordDecodeErrorHit] 里，是纯函数。
-    final burstReached = recordDecodeErrorHit(
+    final sparseReached = recordDecodeErrorHit(
       _decodeErrors,
       now,
       window: _kDecodeErrorWindow,
       burst: _kDecodeErrorBurst,
       lineDedupe: _kDecodeLineDedupe,
     );
-    if (!burstReached) return;
+    // 密集档把去重窗设成 0：`now.difference(last) < Duration.zero` 恒为假，
+    // 于是**每一条原始行都算数** —— 正是这一档要的语义，不必另写一个函数。
+    final denseReached = recordDecodeErrorHit(
+      _decodeErrorDense,
+      now,
+      window: _kDecodeErrorDenseWindow,
+      burst: _kDecodeErrorDenseBurst,
+      lineDedupe: Duration.zero,
+    );
+    if (!sparseReached && !denseReached) return;
     // **先记账、再判静默期**：静默期压的是上报，不是计数。换源重载期间旧流的
     // 报错照记 —— 它们说明的正是刚才那段字节是坏的。这样静默期一过，只要风暴
     // 还在继续，下一条报错就能立刻再上报一次，而不是从头再攒 12 条（换过去的
     // 镜像一样坏时，那 12 条就是白白多冻几秒）。所以静默期内**不清空**窗口。
     if (now.isBefore(_decodeErrorUntil)) return;
     _decodeErrors.clear();
+    _decodeErrorDense.clear();
     _decodeErrorUntil = now.add(_kDecodeErrorCooldown);
+    // 报的是哪一档要写清楚：这两档在日志里长得像，而"44 毫秒 260 条"和
+    // "6 秒 12 条"对不上账时，就靠这一行分辨盲区有没有回来。
+    //
+    // 两档都成立时报稀疏档那行 —— 那是原本就在的字符串，这样新字符串**只会**
+    // 出现在旧代码打印不出任何东西的地方，读日志的老习惯（和清单里的速查表）
+    // 一条都不用改。
     debugPrint(
-      'CDN 看门狗: 解码错误风暴（${_kDecodeErrorWindow.inSeconds}s 内 '
-      '$_kDecodeErrorBurst 条），当前镜像给的字节解不出画面 —— 上报换源',
+      'CDN 看门狗: 解码错误风暴（'
+      '${sparseReached ? '${_kDecodeErrorWindow.inSeconds}s 内 '
+              '$_kDecodeErrorBurst 条' : '${_kDecodeErrorDenseWindow.inMilliseconds}ms'
+              ' 内 $_kDecodeErrorDenseBurst 行'}'
+      '），当前镜像给的字节解不出画面 —— 上报换源',
     );
     onDecodeError?.call(videoPlayerController?.state.position ?? Duration.zero);
   }
