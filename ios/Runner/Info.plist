@@ -141,5 +141,11 @@
 		</array>
 		<key>ITSAppUsesNonExemptEncryption</key>
 		<false/>
+		<!-- 让文档目录（含 pili-console.log 诊断日志）在「文件」App
+		     和 Finder / AFC 里可见，便于把 iOS 端的播放日志取出来 -->
+		<key>UIFileSharingEnabled</key>
+		<true/>
+		<key>LSSupportsOpeningDocumentsInPlace</key>
+		<true/>
 	</dict>
 </plist>

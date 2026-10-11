@@ -12,6 +12,7 @@ import 'package:PiliPlus/models/common/theme/theme_color_type.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/router/app_pages.dart';
 import 'package:PiliPlus/services/account_service.dart';
+import 'package:PiliPlus/services/console_log.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
 import 'package:PiliPlus/services/logger.dart';
 import 'package:PiliPlus/services/service_locator.dart';
@@ -93,6 +94,9 @@ Future<void> _initAppPath() async {
 
 void main() async {
   ScaledWidgetsFlutterBinding.ensureInitialized();
+  // 诊断（CDN 看门狗 / 自动切换等）只走 debugPrint，而 iOS 的 release 包
+  // 没有 stdout 可看 —— 这里让它同时落盘，事后把文件取回来（见 console_log.dart）。
+  await installConsoleLogCapture();
   MediaKit.ensureInitialized();
   await _initAppPath();
   try {
