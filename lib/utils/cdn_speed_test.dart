@@ -77,7 +77,11 @@ abstract final class CdnSpeedTest {
   /// 这是唯一一处"哪些镜像值得探"的源头（轮换表和冠军评选都取自它）。死主机
   /// 留下的唯一后果是每轮白占一个候选位 + 两次 3 秒超时，见 `knownDead`。
   /// 设置页列的是 `CDNService.values`，所以那两行仍然看得见、选得动。
-  static List<CDNService> get mirrors => CDNService.values
+  ///
+  /// 用 `static final` 而不是 getter：`CDNService.values` 和
+  /// [CDNService.knownDead] 都是编译期常量，结果恒定不变，而这里每轮都要被
+  /// 冠军评选和候选建置各取一次（cdn_switch_mixin.dart），没有必要反复过滤。
+  static final List<CDNService> mirrors = CDNService.values
       .where((e) => e.host != null && !CDNService.knownDead.contains(e))
       .toList(growable: false);
 

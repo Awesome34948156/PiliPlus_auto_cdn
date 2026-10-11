@@ -91,6 +91,7 @@ abstract final class SettingBoxKey {
       cdnSpeedTest = 'cdnSpeedTest',
       autoSwitchCdnOnStall = 'autoSwitchCdnOnStall',
       showCdnSwitchToast = 'showCdnSwitchToast',
+      mpvVerboseLog = 'mpvVerboseLog',
       horizontalPreview = 'horizontalPreview',
       banWordForReply = 'banWordForReply',
       banWordForZone = 'banWordForZone',

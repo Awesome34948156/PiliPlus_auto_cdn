@@ -89,6 +89,15 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.showCdnSwitchToast,
     defaultVal: true,
   ),
+  const SwitchModel(
+    title: '详细播放日志',
+    leading: Icon(Icons.bug_report_outlined),
+    subtitle: '让播放器写出最详细的日志（解码器、视频输出、硬解等），用于排查'
+        '黑屏/无声一类问题。日志会持续写入应用文档目录的 pili-console.log，'
+        '开着会明显增加耗电与存储占用，只在复现问题时打开',
+    setKey: SettingBoxKey.mpvVerboseLog,
+    defaultVal: false,
+  ),
   SwitchModel(
     title: '音频不跟随 CDN 设置',
     subtitle: '直接采用备用 URL，可解决部分视频无声',

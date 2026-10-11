@@ -508,6 +508,15 @@ abstract final class Pref {
   static bool get showCdnSwitchToast =>
       _setting.get(SettingBoxKey.showCdnSwitchToast, defaultValue: true);
 
+  /// 是否让 mpv 把日志开到 verbose 档。
+  ///
+  /// 默认关：`v` 是 mpv 全局最吵的一档，一次故障能连吐几百行，每行都要落盘。
+  /// 它只在**追查播放器内部故障**时才有价值（轨道表 / 解码器初始化 / 视频
+  /// 输出 / hwdec 都只在这一档里），所以做成随用随开，而不是给所有人开着。
+  /// 落盘本身（[consoleLogActive]）不受它影响，PiliPlus 自己的诊断照常记录。
+  static bool get mpvVerboseLog =>
+      _setting.get(SettingBoxKey.mpvVerboseLog, defaultValue: false);
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 

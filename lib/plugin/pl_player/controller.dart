@@ -962,11 +962,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
     final player = await Player.create(
       configuration: PlayerConfiguration(
-        // 日志能落盘时收 mpv 的 `v` 档（含 fatal/error/warn/info/v）：轨道表、
-        // 解码器初始化、视频输出、hwdec 全在这一档。播放器类的故障——例如
-        // 眼下这个"只有声音没画面"——唯一证词就在 mpv 自己的日志里，光靠
-        // PiliPlus 的 debugPrint 查不出来，而 release 原本只留到 error。
-        logLevel: consoleLogActive ? .v : (kDebugMode ? .warn : .error),
+        // mpv 的 `v` 档（含 fatal/error/warn/info/v）里才有轨道表、解码器初始化、
+        // 视频输出、hwdec —— 播放器类故障（例如"只有声音没画面"）的唯一证词在
+        // 这里，光靠 PiliPlus 的 debugPrint 查不出来。
+        //
+        // 但它是**全局最吵的一档**，且现在每一行都要落盘，所以两个条件都满足才开：
+        // 日志确实在落盘（否则收了也没地方放），且用户显式开了 [Pref.mpvVerboseLog]。
+        // 默认档不放宽：那次黑屏已经修了，不能为了"万一以后再出"让所有人一直付
+        // 电量和存储的账。error 及以上在默认档里照样记。
+        logLevel: consoleLogActive && Pref.mpvVerboseLog
+            ? .v
+            : (kDebugMode ? .warn : .error),
         options: opt,
       ),
     );
@@ -1219,6 +1225,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }),
       // 只要日志能落盘就收 mpv 的日志，release 也不例外 —— 否则事后取回来的
       // pili-console.log 里会"什么都没有"，那是通道没开，不是没有问题。
+      // 注意这里收到多少由 mpv 自己的档位决定（见上面的 `logLevel`）：默认档下
+      // 只有 error 及以上会到这儿，那正是最该落盘的一批，所以订阅本身不跟着关。
       if (kDebugMode || consoleLogActive)
         stream.log.listen(((PlayerLog log) {
           if (log.level == 'error' || log.level == 'fatal') {
@@ -1418,7 +1426,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
         // 先交还再重来：第一次 render 可能正好落在 mpv 拆完旧输出、新输出
         // 还没建好的缝里。重来一次不 seek、不重载、不动位置，几乎不要钱。
-        await unpin();
+        // 只在"还要再来一次"时交还 —— 最后一趟的收尾由下面 finally 负责，
+        // 否则同一个 setSize(null) 会白发两遍，多一次 render 往返。
+        if (attempt < _kHealAttempts) await unpin();
       }
       debugPrint('无视频轨自愈失败: 钉住尺寸没能让视频输出起来，退出视频页再进来可恢复');
     } finally {
