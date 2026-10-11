@@ -42,7 +42,10 @@ jobs:
       - name: Use the AV1-capable libmpv
         run: bash lib/scripts/mpvkit/stage-mpv.sh ios
         env:
-          IOS_TARBALL: https://github.com/Awesome34948156/PiliPlus/releases/download/libmpv-0.41-n9.0.2/libmpv-xcframeworks_v0.39.0_ios-universal-video-default.tar.gz
+          # Taken from whichever repo is building, so a fork that publishes the
+          # same release tag works without editing this file. The release assets
+          # are public, so the anonymous `curl` in stage-mpv.sh can fetch them.
+          IOS_TARBALL: https://github.com/${{ github.repository }}/releases/download/libmpv-0.41-n9.0.2/libmpv-xcframeworks_v0.39.0_ios-universal-video-default.tar.gz
 
       - name: Build iOS
         run: |
