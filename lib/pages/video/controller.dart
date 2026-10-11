@@ -983,6 +983,17 @@ class VideoDetailController extends GetxController
       );
       _setVideoHeight();
 
+      // 记下"实际选中了哪条流"。以前只有用户手动开「播放信息」才看得到，
+      // 而首选解码格式（默认 AVC/AV1）只是个偏好：selectCodec 在两者都没
+      // 提供时会退回 codecs.first，上面这个 firstWhere 又带 orElse —— 于是
+      // HEVC 也会被静默选中。事后要判断"黑屏那条流是什么编码"全指望这一行。
+      debugPrint(
+        '选流: 画质 ${currentVideoQa.value?.code}($targetVideoQa) 偏好 '
+        '${preferCodecs.map((e) => e.name).join("/")} 选中 '
+        '${currentDecodeFormats.name} 流编码 ${firstVideo.codecs} '
+        '${firstVideo.width}x${firstVideo.height} bw=${firstVideo.bandWidth}',
+      );
+
       videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
 
       /// 优先顺序 设置中指定质量 -> 当前可选的最高质量

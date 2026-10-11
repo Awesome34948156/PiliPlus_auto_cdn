@@ -29,6 +29,7 @@ import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/danmaku_options.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
+import 'package:PiliPlus/services/console_log.dart';
 import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/android_helper.dart';
@@ -944,7 +945,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
     final player = await Player.create(
       configuration: PlayerConfiguration(
-        logLevel: kDebugMode ? .warn : .error,
+        // 日志能落盘时收 mpv 的 `v` 档（含 fatal/error/warn/info/v）：轨道表、
+        // 解码器初始化、视频输出、hwdec 全在这一档。播放器类的故障——例如
+        // 眼下这个"只有声音没画面"——唯一证词就在 mpv 自己的日志里，光靠
+        // PiliPlus 的 debugPrint 查不出来，而 release 原本只留到 error。
+        logLevel: consoleLogActive ? .v : (kDebugMode ? .warn : .error),
         options: opt,
       ),
     );
@@ -1192,18 +1197,23 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _updatePlaybackState();
         }
       }),
-      if (kDebugMode)
+      // 只要日志能落盘就收 mpv 的日志，release 也不例外 —— 否则事后取回来的
+      // pili-console.log 里会"什么都没有"，那是通道没开，不是没有问题。
+      if (kDebugMode || consoleLogActive)
         stream.log.listen(((PlayerLog log) {
           if (log.level == 'error' || log.level == 'fatal') {
             Utils.reportError(
               '${log.level}: ${log.prefix}: ${log.text}\n${player.state.playlist}',
               null,
             );
-          } else {
-            debugPrint(log.toString());
           }
+          // 错误也落盘：以前 error 只走 reportError，日志文件里反而看不到。
+          debugPrint('mpv [${log.level}] ${log.prefix}: ${log.text}');
         })),
       stream.error.listen((String event) {
+        // 这一条在 release 里原本只走 reportError，日志文件里同样看不到 ——
+        // 而它正是"流打不开"的直接证词，先落盘，再走原来的恢复逻辑。
+        debugPrint('mpv error: $event');
         if (dataSource is FileSource &&
             event.startsWith("Failed to open file")) {
           return;
@@ -1265,6 +1275,48 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _startStallTicker();
   }
 
+  /// 连续多少个心跳"音频在、画面不在"。见 [_checkNoVideoTrack]。
+  int _noVideoBeats = 0;
+
+  /// 读一个 mpv 属性，读不到就当空串。
+  ///
+  /// [NativePlayer.getProperty] 在 player 已 dispose 时会抛，而这里是定时器
+  /// 回调，抛出去没人接 —— 诊断代码绝不能把播放搞挂。
+  String _safeProp(String name) {
+    try {
+      return _videoPlayerController?.getProperty(name) ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// 「只有声音没画面」的现场判据。
+  ///
+  /// 音频参数正常、视频轨却始终为空 —— 这正是 2026-10-11 那次 iOS 黑屏的形态：
+  /// mpv 根本没建出视频轨（当时拍到的「播放信息」里 Resolution 0x0、VideoParams
+  /// 全空），而 CDN 与编码可用性都已排除。以前这个状态一行日志都不留，只能靠
+  /// 用户手动抄「播放信息」；现在它自己会连着两拍报到日志里。
+  ///
+  /// 连空两拍才算：视频参数本来就比音频晚到，起播那一拍看到空属于正常。
+  void _checkNoVideoTrack() {
+    if (onlyPlayAudio.value || isLive || position.value <= 0) {
+      _noVideoBeats = 0;
+      return;
+    }
+    final state = _videoPlayerController?.state;
+    final hasVideo = (state?.width ?? 0) > 0 || (state?.videoParams.w ?? 0) > 0;
+    if (hasVideo) {
+      _noVideoBeats = 0;
+      return;
+    }
+    if (++_noVideoBeats < 2) return;
+    debugPrint(
+      '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
+      'video ${_safeProp('video-codec')} hwdec ${_safeProp('hwdec-current')} '
+      '位置 ${position.value}s)',
+    );
+  }
+
   /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。
   ///
   /// 1. 位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
@@ -1290,8 +1342,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           '${_starveThresholdSec.toStringAsFixed(1)}s 位置 ${position.value}s '
           '(cache-time ${buffered.value}s) 播放中 ${playerStatus.isPlaying} '
           '重新缓冲 ${isBuffering.value} seek中 ${isSeeking.value} '
-          '换源中 $_processing',
+          '换源中 $_processing '
+          // 播放器侧的现场。以前这一行只有 CDN 的数字，于是"只有声音没画面"
+          // 事后必须靠用户手动开「播放信息」抄 VideoParams 才判断得出来。
+          '| video-codec ${_safeProp('video-codec')} '
+          'audio-codec ${_safeProp('audio-codec')} '
+          'hwdec ${_safeProp('hwdec-current')} '
+          '${_videoPlayerController?.state.width}x'
+          '${_videoPlayerController?.state.height}',
         );
+        _checkNoVideoTrack();
       }
       if (isLive ||
           dataSource is FileSource ||

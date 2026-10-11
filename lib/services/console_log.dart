@@ -27,6 +27,13 @@ const int _kPendingLimit = 2000;
 File? _consoleLogFile;
 final List<String> _pendingLines = [];
 
+/// 日志是否真的在落盘。
+///
+/// 诊断类的「话匣子」开关都以它为准：只有日志确实能写进文件时，才值得让
+/// mpv 把话全说出来（见 pl_player/controller.dart 的 `logLevel` 与
+/// `stream.log`）。文件打不开时退回原来的安静档，别白白刷屏。
+bool get consoleLogActive => _consoleLogFile != null;
+
 /// 安装落盘钩子。必须在 binding 初始化之后、`runApp` 之前调用一次。
 Future<void> installConsoleLogCapture() async {
   final original = debugPrint;
