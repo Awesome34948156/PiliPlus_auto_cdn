@@ -83,6 +83,30 @@ final List<String> _pendingLines = [];
 /// `stream.log`）。文件打不开时退回原来的安静档，别白白刷屏。
 bool get consoleLogActive => _sink != null;
 
+/// 给一行日志盖上 `HH:mm:ss.SSS`。
+///
+/// 这个模块存在的理由是**事后**查故障，而自动换源的一半判据是时间窗判据 ——
+/// 「6 秒内 12 条算风暴」（`_kDecodeErrorBurst` / `_kDecodeErrorWindow`）、
+/// 「5ms 内算同一个坏包」（`_kDecodeLineDedupe`）、「换源后 ≥8s 没新报错才算
+/// 恢复」（`_kCdnDecodeRecoverGrace` + `_kCdnDecodeCleanWindow`）。没有逐行时刻，
+/// 日志只回答得了「发生过没有」，回答不了「够不够密」；而 mpv 落在日志里的原文
+/// **一个时刻都不带**（`mpv [error] ffmpeg/video: av1: obu_forbidden_bit out of
+/// range: 1, ...`），`awk '{print $2}'` 取到的是 `[error]` 而不是秒。2026-10-11
+/// 加：真机上要判「12 条 / 6s 这道门槛到底够不够得着」，只能靠它。
+///
+/// 毫秒必须留着 —— `_kDecodeLineDedupe` 是 5ms。多行消息**逐行**盖戳，保证
+/// 文件里每条物理行都带戳，事后拿 grep/awk 处理时不用先猜哪行有哪行没有。
+String _stamp(String message) {
+  final t = DateTime.now();
+  final stamp = '${t.hour.toString().padLeft(2, '0')}:'
+      '${t.minute.toString().padLeft(2, '0')}:'
+      '${t.second.toString().padLeft(2, '0')}.'
+      '${t.millisecond.toString().padLeft(3, '0')}';
+  return message.contains('\n')
+      ? '$stamp ${message.replaceAll('\n', '\n$stamp ')}'
+      : '$stamp $message';
+}
+
 /// 安装落盘钩子。必须在 binding 初始化之后、`runApp` 之前调用一次。
 ///
 /// [logFile] 只给测试用，正常调用不传（走 [getApplicationDocumentsDirectory]）。
@@ -96,11 +120,14 @@ Future<void> installConsoleLogCapture({@visibleForTesting File? logFile}) async 
   debugPrint = (String? message, {int? wrapWidth}) {
     original(message, wrapWidth: wrapWidth);
     if (message == null) return;
+    // 盖戳在**捕获**这一侧，不在落盘那一侧：开档要 await，那之前攒进
+    // [_pendingLines] 的行若等补写时才盖戳，时刻会整体后移到开档之后。
+    final line = _stamp(message);
     if (_sink == null) {
-      if (_pendingLines.length < _kPendingLimit) _pendingLines.add(message);
+      if (_pendingLines.length < _kPendingLimit) _pendingLines.add(line);
       return;
     }
-    _enqueue('$message\n');
+    _enqueue('$line\n');
   };
 
   // 已经装过就先把上一份收干净。生产只在 main() 里调一次，但真被调第二次
@@ -197,7 +224,7 @@ Future<void> _rotate() async {
     await old?.close();
     if (file == null) return;
     final sink = file.openWrite(mode: FileMode.write) // 截断
-      ..write('=== 日志达到 $_maxBytes 字节上限，此处截断重来 ===\n');
+      ..write('${_stamp('=== 日志达到 $_maxBytes 字节上限，此处截断重来 ===')}\n');
     _sink = sink;
   } catch (_) {
     _sink = null; // 重开失败就彻底放弃落盘，绝不抛给调用方

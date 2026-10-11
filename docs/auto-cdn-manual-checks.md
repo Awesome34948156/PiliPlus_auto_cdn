@@ -31,7 +31,16 @@
 
 日志文件：应用文档目录下的 **`pili-console.log`**（`_kConsoleLogName`，
 `lib/services/console_log.dart:28`）。用 adb / 文件 App / iOS 文件共享取回，或直接
-看控制台。
+看控制台。iOS 上 `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace` 都开着，
+所以「文件」App → 我的 iPhone → PiliPlus 里直接就有这个文件。
+
+**每条物理行都以 `HH:mm:ss.SSS ` 开头**（`_stamp`，2026-10-11 加）。下面表格里那些
+"逐字发出的行"指的是戳**之后**的那一段 —— grep 子串照样命中。加戳的理由：换源的一半
+判据是时间窗判据（6s 内 12 条 / 5ms 内算同一包 / 换源后 ≥8s 干净），而 mpv 的原文
+一个时刻都不带，没有戳的话日志只答得了"发生过没有"，答不了"够不够密"。
+
+⚠️ **每次启动都会把这个文件截断重写**（`writeAsString('')`）。测完**别杀进程、别重启
+app**，直接去文件 App 取，或者当场用共享菜单发出来。
 
 注意：CDN 与看门狗那几行**刻意不套 `kDebugMode`**（`cdn_switch_mixin.dart` 注释：
 「下面这些诊断刻意不套 kDebugMode：release 包只走手机测试，套了就看不到」），
@@ -295,11 +304,15 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
    （而不是全部挤在冻住的那一段），包速率就是 ~1.3/s，而门槛要求 12 个包挤进 6s = **2/s**。
    真这样的话，`decode` 这一档在它自己为之而生的场景里**永远不会触发** —— 修复等于没生效，
    而日志里只有沉默，没有任何一行提示。
-   - **怎么量**（用手上那份 `pili-console.log` 就能定，不用再复现）：
-     `grep -E "obu_forbidden_bit|Error parsing OBU|Unknown OBU type|Invalid NAL unit size|missing picture in access unit" pili-console.log | awk '{print $2}' | cut -d. -f1 | uniq -c`
-     拿到"每秒多少行"，除以约 3（去重比）就是包速率。**≥ 2/s** → 12/6s 成立，不用动；
-     **≈1/s** → 门槛够不到，把窗口放宽到 12s（而不是把门槛降到 6：放宽窗口只是等价于
-     1/s，而降门槛会把"换集边界上一两条"的零星报错也算成风暴）。
+   - **怎么量**（要有**带时间戳**的那版日志，即 2026-10-11 之后的构建；更早那份没有戳，
+     量不了）：
+     `grep -E "obu_forbidden_bit|Error parsing OBU|Unknown OBU type|Invalid NAL unit size|missing picture in access unit" pili-console.log | cut -c1-8 | uniq -c`
+     `cut -c1-8` 取的是 `HH:mm:ss`，所以输出就是"每秒多少行"。除以约 3（去重比）就是
+     包速率。**≥ 2/s** → 12/6s 成立，不用动；**≈1/s** → 门槛够不到，把窗口放宽到 12s
+     （而不是把门槛降到 6：放宽窗口只是等价于 1/s，而降门槛会把"换集边界上一两条"的
+     零星报错也算成风暴）。
+     注意这条要的是**风暴那几秒**的行密度，不是全程平均：把 `uniq -c` 的输出按峰值看，
+     平滑平均会把一段 400 行的爆发摊成"全程很稀"。
    - 另外两处注释（`decode_error.dart` 顶部的「400+ 条」和 `controller.dart` 里
      `_kDecodeErrorBurst` 的那段"卡在两者之间"）互相不自洽：前者是行数、后者是包数，
      中间隔着一个约 3 倍的去重比和一段没说清的时长。量完顺手把这两个数写实。
