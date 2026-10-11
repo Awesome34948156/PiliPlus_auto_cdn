@@ -35,6 +35,7 @@ import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/asset_utils.dart';
+import 'package:PiliPlus/utils/decode_error.dart';
 import 'package:PiliPlus/utils/device_utils.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/extension/box_ext.dart';
@@ -237,6 +238,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 为真，`stream.buffer` 才是唯一一定会动的信号。
   ValueChanged<Duration>? onRebuffer;
 
+  /// 解码错误风暴回调：当前这条源给的是**坏字节**，不是喂不饱。
+  ///
+  /// 前四条判据看的全是"供得上供不上"（位置、缓冲、余量），而镜像把坏字节送
+  /// 进来时这四样**全是健康的** —— 吞吐 3MB/s、余量 27s、位置在推进、hwdec
+  /// 正常，画面却冻在最后一帧。2026-10-11 手机上那一局就是这样，而 mpv 同时
+  /// 刷了 400+ 条解码报错。判据见 [_kDecodeErrorBurst]。
+  ///
+  /// 与其他回调一样只上报事实：怎么恢复（换源、要不要绕过那套"必须明显更快
+  /// 才值得重载"的门槛）由页面决定。
+  ValueChanged<Duration>? onDecodeError;
+
   /// 位置连续冻结多少秒才算卡顿。普通重新缓冲一般 1~3 秒。
   static const int _kStallSeconds = 8;
 
@@ -249,6 +261,29 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 加载/换源后的静默期。刚开始缓冲时 `buffered` 本来就是 0，
   /// 不静默的话每次开播都会白记一次。
   static const Duration _kRebufferSuppress = Duration(seconds: 8);
+
+  /// 解码错误风暴：这么短的时间内攒够这么多条解码报错，就认定这段流已经解不
+  /// 出画面了。
+  ///
+  /// 12 条 / 6 秒是照着实测的两组数字卡在中间的：正常播放里解码器是**哑的**
+  /// （那局日志里 8 个视频、二十多分钟，一条解码报错都没有），换集/seek 边界上
+  /// 会冒 1~2 条（`Invalid NAL unit size` 那种，单个损坏的 GOP，几秒后自己就过
+  /// 去了），而坏镜像的指纹是**成百条不停地刷** —— 实测 400+ 条、横跨 100 多秒。
+  /// 两者差一个数量级，门槛落在中间既不会漏报也不会被边界噪音打穿。
+  static const int _kDecodeErrorBurst = 12;
+
+  /// 上面那 12 条的统计窗口。风暴是"持续"的，用固定窗口而不是累计计数：累计
+  /// 计数会让一次长时间的偶发报错（每个视频一两条）早晚凑够阈值，而窗口只在
+  /// "短时间内密集发生"时才成立。
+  static const Duration _kDecodeErrorWindow = Duration(seconds: 6);
+
+  /// 报过一次之后隔多久才允许**再报**（计数不受它影响，见 [_sampleDecodeError]）。
+  ///
+  /// 一轮换源要重载播放器，重载期间旧流的日志还在往外吐（解码器在把已经读进
+  /// 来的字节消化完），不压住的话一次故障会连触发好几轮换源。取 30s：比
+  /// 一轮换源（实测 5~10s）长得多，又比 CDN 那边放弃后的冷却（60s）短，于是
+  /// 换到坏镜像上时还能再挣扎一次。
+  static const Duration _kDecodeErrorCooldown = Duration(seconds: 30);
 
   /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
   /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
@@ -304,6 +339,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   int _starveSeconds = 0;
   bool _starveFired = false;
   DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 最近一次装载以来，落在 [_kDecodeErrorWindow] 里的解码报错时刻。
+  /// 每次装载在 [_startListeners] 里清空。
+  final List<DateTime> _decodeErrors = [];
+
+  /// 解码错误风暴的静默期截止时刻。见 [_kDecodeErrorCooldown]。
+  DateTime _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 全屏方向
   // ignore: unnecessary_getters_setters
@@ -1142,6 +1184,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 播放事件监听
   void _startListeners(NativePlayer player) {
     assert(_subscriptions == null);
+    // 新的一次装载，解码错误的账重新计：上一段流的静默期不该挡着新的一段。
+    // 换源到好镜像之后，第一条报错必须能立刻被听见。
+    _decodeErrors.clear();
+    _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
     final stream = player.stream;
     _subscriptions = [
       /// playing
@@ -1233,6 +1279,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
               '${log.level}: ${log.prefix}: ${log.text}\n${player.state.playlist}',
               null,
             );
+            // 坏字节的唯一证词就在这批 error 行里，四条播放判据一条都看不见
+            // （见 [onDecodeError]）。采样搭在这里而不是 `stream.error` 上：
+            // 同一个事件在两条通道上都会到，两边都采等于阈值被砍半。
+            _sampleDecodeError(log.text);
           }
           // 错误也落盘：以前 error 只走 reportError，日志文件里反而看不到。
           debugPrint('mpv [${log.level}] ${log.prefix}: ${log.text}');
@@ -1465,6 +1515,33 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   //
   // 而第 3 级（钉尺寸）在那一刻干净地修好了：`VO: [libmpv]` / `reconfig` /
   // `libmpv_render: Window size` 三行是在它触发时才第一次出现的。
+
+  /// 解码错误的采样：攒够 [_kDecodeErrorBurst] 条就上报一次 [onDecodeError]。
+  ///
+  /// 和另外三条采样不同，它不由 [_startStallTicker] 的心跳驱动，而是被
+  /// `stream.log` 推进 —— 报错是**事件**不是采样量，ticker 那一秒一拍的
+  /// 节奏会把它抹平（实测那一局 6 秒里就有几十条）。
+  void _sampleDecodeError(String text) {
+    if (!isDecoderCorruptionLog(text)) return;
+    final now = DateTime.now();
+    // 先记账、再判静默期：静默期压的是**上报**，不是计数。换源重载期间旧流的
+    // 报错照记 —— 它们说明的正是刚才那段字节是坏的。这样静默期一过，只要风暴
+    // 还在继续，下一条报错就能立刻再上报一次，而不是从头再攒 12 条（换过去的
+    // 镜像一样坏时，那 12 条就是白白多冻几秒）。
+    _decodeErrors.add(now);
+    _decodeErrors.removeWhere(
+      (at) => now.difference(at) > _kDecodeErrorWindow,
+    );
+    if (now.isBefore(_decodeErrorUntil)) return;
+    if (_decodeErrors.length < _kDecodeErrorBurst) return;
+    _decodeErrors.clear();
+    _decodeErrorUntil = now.add(_kDecodeErrorCooldown);
+    debugPrint(
+      'CDN 看门狗: 解码错误风暴（${_kDecodeErrorWindow.inSeconds}s 内 '
+      '$_kDecodeErrorBurst 条），当前镜像给的字节解不出画面 —— 上报换源',
+    );
+    onDecodeError?.call(videoPlayerController?.state.position ?? Duration.zero);
+  }
 
   /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。
   ///

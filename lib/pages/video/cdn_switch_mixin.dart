@@ -43,8 +43,12 @@ typedef _CdnRound = ({
   CDNService? champion,
 });
 
-/// 触发一轮测速的原因。只影响日志和 toast 里的说法，以及用哪一档预算 ——
-/// 决策链本身（[_kCdnStarveRatio] 那一关）对所有触发一视同仁。
+/// 触发一轮测速的原因。影响日志和 toast 里的说法、用哪一档预算，以及
+/// **结论够不够格直接换**。
+///
+/// 前五个触发是同一套语义：当前镜像"喂不动"，所以要拿候选跟它比速度，赢过
+/// [_kCdnStarveRatio] 才值得付一次重载。[_CdnTrigger.decode] 是唯一的例外 ——
+/// 它比的根本不是速度，见那个成员的注释。
 enum _CdnTrigger {
   /// 播放器判据 1/2：位置长时间不推进。
   stall,
@@ -59,7 +63,17 @@ enum _CdnTrigger {
   preflight,
 
   /// 余量刚归零的小卡顿，用快速档预算。
-  rebuffer;
+  rebuffer,
+
+  /// 判据 4：解码器在刷"这段字节我解不出来"（见 `PlPlayerController.
+  /// onDecodeError`）。
+  ///
+  /// 这个触发**跳过** [_kCdnStarveRatio] 那一关，直接换。理由是那一关的前提
+  /// 在这里根本不成立：门槛问的是"候选比当前镜像快多少倍"，而坏镜像的速度
+  /// **是快的** —— 实测它把垃圾字节以 2~14MB/s 送过来，比健康镜像还快，所以
+  /// 每轮测速都判"基线健康 —— 卡顿多半不在 CDN"，然后什么都不做。要比的是
+  /// "谁的字节能解出画面"，那是测速测不出来的东西，只有解码器知道。
+  decode;
 
   /// 日志/toast 里的简称。
   String get label => switch (this) {
@@ -68,20 +82,28 @@ enum _CdnTrigger {
     _CdnTrigger.probe => '定期测速',
     _CdnTrigger.preflight => '预检',
     _CdnTrigger.rebuffer => '小卡顿',
+    _CdnTrigger.decode => '解码错误',
   };
 }
 
 // ---------------------------------------------------------------------------
 // 卡顿自动切换 CDN
 //
-// 触发是纯反应式的：只有播放器上报卡顿（位置不推进，或前向缓冲长期趴在低位）
-// 才测速。卡住的播放器已经不再下载，此时测速不会与播放争带宽，结果才可信；
-// 健康播放时测速反而会制造我们要修的卡顿。
+// 触发是纯反应式的：只有播放器上报故障（位置不推进、前向缓冲长期趴在低位、
+// 余量失真、**或解码器在刷"这段字节我解不出来"**）才测速。卡住的播放器已经
+// 不再下载，此时测速不会与播放争带宽，结果才可信；健康播放时测速反而会
+// 制造我们要修的卡顿。
 //
 // 测速一律在"播放头即将需要的那段字节"上做，并且总是先测当前镜像作基线：
 // 坏镜像的头部区间和好镜像一样快（实测 upos-sz-mirrorcosov 前 100MB 跑满
 // 23MB/s，之后掉到 30KB/s），只在头部取样等于永远发现不了故障，只测候选而
 // 不测基线则没有比较对象。
+//
+// **测速测不出全部故障**：它只能回答"这条镜像供得上供不上"。同一台机器上
+// 还有第二种坏法 —— 镜像以正常甚至更高的速度送**垃圾字节**，吞吐、余量、
+// 位置、hwdec 全对，只有画面是冻的。那种故障要解码器来报，而且因为速度健康，
+// 决策必须绕过"候选须比基线快 [CdnSwitchMixin._kCdnStarveRatio] 倍"这一关，
+// 见 [_CdnTrigger.decode]。
 //
 // session-only：绝不写 [VideoUtils.cdnService]，只把目标镜像作为
 // `defaultCDNService` 显式传给 getCdnUrl，否则会静默改掉用户的手动设置。
@@ -141,6 +163,8 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 候选必须比当前镜像快这么多倍才值得切换。切换是一次真实的重新加载
   /// （playerInit + seek 回原位），画面会闪一下，所以宁可少切。
+  ///
+  /// 解码错误那一档不走这条（见 [_CdnTrigger.decode]）：那里的病不在速度上。
   static const double _kCdnStarveRatio = 1.5;
 
   /// 当前镜像**已经喂不动这条流**（实测低于 `对象大小 / 时长`）时放宽到这个
@@ -268,6 +292,22 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 上一轮一个字节都没到的候选。见 [_kCdnDeadRetryAfter]。
   final Set<CDNService> _cdnNoSample = {};
+
+  /// 本集里给过**坏字节**的镜像 host。
+  ///
+  /// 和 [_cdnNoSample] 的区别是正好相反的两种病：那是"一个字节都到不了"，这是
+  /// "字节到得又快又好，只是解不出画面"。所以测速两种都测不出来 —— 坏镜像的
+  /// 吞吐实测 2~14MB/s，比健康镜像还高。这笔账只能由解码器来记（见
+  /// [_CdnTrigger.decode]）。
+  ///
+  /// **不记的话会来回弹**：坏镜像当基线时被强制换走，下一轮**测速**又会把它评成
+  /// 最快候选（它是真的快），于是换回去、画面再冻一次。按 host 记而不是按
+  /// [CDNService]：基线那个 host 是 API 分的，不一定来自枚举表，而候选一律来自
+  /// 枚举表，两边对不上就没法比。
+  ///
+  /// 只在换集/换 P 时清（[resetCdnAutoSwitch]）：换一个视频就是另一个对象，
+  /// 同一条边完全可能是好的。
+  final Set<String> _cdnBadHosts = {};
 
   /// 历史冠军的"欠账"：连着多少轮**没能成为切换目标**。达到
   /// [_kCdnChampionMisses] 就不再给它留候选位。
@@ -400,6 +440,9 @@ mixin CdnSwitchMixin on GetxController {
     for (final service in CdnSpeedTest.mirrors) {
       // 当前在播的已经坐在基线位置上了，再占一个候选位子等于白少测一个镜像。
       if (service.host == currentHost) continue;
+      // 给过坏字节的镜像不是"快不快"的问题，历史记录里它可能正是最快的那个
+      // （见 [_cdnBadHosts]）。留着它等于每一轮都白占一个候选位。
+      if (service.host == null || _cdnBadHosts.contains(service.host)) continue;
       // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 [_cdnChampionMisses]。
       if ((_cdnChampionMisses[service] ?? 0) >= _kCdnChampionMisses) {
         debugPrint(
@@ -476,6 +519,9 @@ mixin CdnSwitchMixin on GetxController {
     _cdnAutoAttempts = 0;
     _cdnTriedAt.clear();
     _cdnNoSample.clear();
+    // 换集/换画质是新的对象，坏字节的账也跟着作废：同一条边对另一个视频
+    // 完全可能是好的。
+    _cdnBadHosts.clear();
     // 换集/换画质是新的比较对象，冠军位的欠账重新计。
     _cdnChampionMisses.clear();
     // 换集/换画质后对象变了，缓存的总长不再适用。
@@ -517,6 +563,14 @@ mixin CdnSwitchMixin on GetxController {
     _onPlayerStall(position, trigger: _CdnTrigger.rebuffer);
   }
 
+  /// 解码错误风暴（见 `PlPlayerController.onDecodeError`）触发的换源。
+  ///
+  /// 只改一件事：**结论直接照用**，不跟基线比速度（理由见 [_CdnTrigger.decode]）。
+  /// 其余闸门（并发、冷却、换源快照）一件不减 —— 它和别的触发抢的是同一个
+  /// 播放器，不能因为"画面冻着更急"就允许并发重载。
+  void _onDecodeError(Duration position) =>
+      _onPlayerStall(position, trigger: _CdnTrigger.decode);
+
   void _onPlayerStall(
     Duration position, {
     _CdnTrigger trigger = _CdnTrigger.stall,
@@ -538,7 +592,12 @@ mixin CdnSwitchMixin on GetxController {
 
     // 距上次尝试没有实质进展 → 这个视频是真的放不动，不要再花钱测速。
     // 缓冲饥饿的位置一直在被音频时钟推着走，通常能正常通过这一关。
-    if (_cdnLastAttemptPos != Duration.zero &&
+    //
+    // 解码错误是例外：它的病在**字节**上，跟位置动不动没关系，而画面冻住时
+    // 位置也常常是冻的 —— 拿位置当门槛等于"冻得越死越不许救"。压住它的是
+    // 播放器那边的 [_kDecodeErrorCooldown]（一次故障只报一次），这里不必再压。
+    if (trigger != _CdnTrigger.decode &&
+        _cdnLastAttemptPos != Duration.zero &&
         position - _cdnLastAttemptPos < _kCdnMinReProgress) {
       debugPrint(
         'CDN 自动切换: 距上次尝试只推进了 '
@@ -556,6 +615,7 @@ mixin CdnSwitchMixin on GetxController {
       position,
       what: what,
       quick: trigger == _CdnTrigger.rebuffer,
+      force: trigger == _CdnTrigger.decode,
     ).whenComplete(() {
       if (!isClosed) _cdnAutoBusy = false;
     });
@@ -576,6 +636,9 @@ mixin CdnSwitchMixin on GetxController {
           '缓冲饥饿 @${position.inSeconds}s，开始找可用镜像 '
               '(bufferSec=${Pref.bufferSec})',
         _CdnTrigger.stall => '卡顿 @${position.inSeconds}s，开始找可用镜像',
+        _CdnTrigger.decode =>
+          '解码错误 @${position.inSeconds}s，当前镜像给的是坏字节'
+              '（画面已解不出来），直接换源、不看速度',
       };
 
   /// 启动后台测速：每 [_kCdnPreflightPoll] 检查一次，做完那一次预检之后就
@@ -595,7 +658,8 @@ mixin CdnSwitchMixin on GetxController {
     plPlayerController
       ..onStall = _onPlayerStall
       ..onBufferStarve = _onPlayerBufferStarve
-      ..onRebuffer = _onPlayerRebuffer;
+      ..onRebuffer = _onPlayerRebuffer
+      ..onDecodeError = _onDecodeError;
     restartCdnProbe();
   }
 
@@ -609,6 +673,9 @@ mixin CdnSwitchMixin on GetxController {
     }
     if (plPlayerController.onRebuffer == _onPlayerRebuffer) {
       plPlayerController.onRebuffer = null;
+    }
+    if (plPlayerController.onDecodeError == _onDecodeError) {
+      plPlayerController.onDecodeError = null;
     }
     _cdnProbeTimer?.cancel();
     _cdnProbeTimer = null;
@@ -693,6 +760,7 @@ mixin CdnSwitchMixin on GetxController {
     Duration stalledAt, {
     required String what,
     bool quick = false,
+    bool force = false,
   }) async {
     var switched = false;
     // 记录本轮测到过的最好候选速率，用来判断"镜像没问题，是别处卡"。
@@ -712,14 +780,22 @@ mixin CdnSwitchMixin on GetxController {
       // 用户中途手动换了 CDN，听他的。
       if (_cdnAutoServiceSnapshot != VideoUtils.cdnService) return;
 
-      final round = await _pickFastestCdn(stalledAt, quick: quick);
+      final round = await _pickFastestCdn(
+        stalledAt,
+        quick: quick,
+        force: force,
+      );
       if (generation != _cdnGeneration || isClosed || isQuerying) return;
       if (round == null) break;
       // 这一轮的结果已经拿到了，先给冠军位记账，再决定要不要切换。
       _noteChampionOutcome(round);
       if (round.verdict == _CdnRoundVerdict.unmeasurable) {
-        // 这里说「CDN 都正常」是假话：根本没测出可比的数据。
-        giveUp = '无法测出更快的 CDN，暂不切换';
+        // 这里说「CDN 都正常」是假话：根本没测出可比的数据。解码错误这一档
+        // 更要说清楚病在哪 —— 字节是坏的这件事已经由解码器证实了，缺的是
+        // "换到哪儿去"。
+        giveUp = force
+            ? '当前镜像的字节解不出画面，但没找到可换的镜像'
+            : '无法测出更快的 CDN，暂不切换';
         giveUpCooldown = _kCdnUnmeasuredCooldown;
         break;
       }
@@ -747,6 +823,17 @@ mixin CdnSwitchMixin on GetxController {
       _cdnLastAttemptPos = stalledAt;
       debugPrint('CDN 自动切换: 第$_cdnAutoAttempts次 -> ${chosen.desc} ($speed)');
       _cdnToast('$what，尝试切换到 ${chosen.desc}\n$speed');
+
+      // 强制换源这一档的账：解码器已经证明**正在播的这个 host** 给了坏字节，
+      // 那这一集就别再回到它身上。只在第一次尝试时记 —— 那是触发这一轮的
+      // 那条源；后面几次是"换过去仍没恢复"，那说明的是别的（落点、缓冲），
+      // 不该拿来给新 host 定罪。
+      if (force && attempt == 0) {
+        final bad = Uri.tryParse(videoUrl ?? '')?.host;
+        if (bad != null && bad.isNotEmpty && _cdnBadHosts.add(bad)) {
+          debugPrint('CDN 自动切换: $bad 给的字节解不出画面，本集不再作为候选');
+        }
+      }
 
       switched = true;
       if (!await _switchTo(chosen, generation, resumeAt: stalledAt)) return;
@@ -786,9 +873,13 @@ mixin CdnSwitchMixin on GetxController {
     final reason =
         giveUp ??
         (switched
-            ? (bestMicros > 0 && bestBytes / bestMicros >= _kCdnHealthyMBps
-                  ? 'CDN 都正常，可能是网络问题'
-                  : '自动切换 CDN 未能改善，已暂停尝试')
+            ? (force
+                  // 解码错误这一档"都正常"是句错话：坏镜像的速度本来就是正常的，
+                  // 它坏在字节上。照实说换了几处都没解出来。
+                  ? '换了几处镜像，画面仍然解不出来，已暂停尝试'
+                  : (bestMicros > 0 && bestBytes / bestMicros >= _kCdnHealthyMBps
+                        ? 'CDN 都正常，可能是网络问题'
+                        : '自动切换 CDN 未能改善，已暂停尝试'))
             : null);
     if (reason != null) {
       _cdnToast(reason);
@@ -799,9 +890,12 @@ mixin CdnSwitchMixin on GetxController {
   /// [CdnSpeedTest.autoCandidatesMax] 个轮换候选，同一批并发测完。
   ///
   /// 返回 null 表示这一轮无从下手（拿不到地址、没有候选），调用方静默放弃。
+  /// [force] 为真时**跳过 [_kCdnStarveRatio] 那一关**（见 [_CdnTrigger.decode]）：
+  /// 只要有候选拿得出可用样本，就选最快的那个换过去，不再问它比基线快多少倍。
   Future<_CdnRound?> _pickFastestCdn(
     Duration position, {
     bool quick = false,
+    bool force = false,
   }) async {
     final urls = firstVideo.playUrls.toList();
     final baselineUrl = videoUrl;
@@ -849,6 +943,9 @@ mixin CdnSwitchMixin on GetxController {
         if (candidates.contains(service)) continue;
         final host = service.host;
         if (host == null || host == currentHost) continue;
+        // 本集里给过坏字节的镜像不再进候选 —— 它的**速度**没问题，测速拦不住它，
+        // 只有解码器认得出来（见 [_cdnBadHosts]）。
+        if (_cdnBadHosts.contains(host)) continue;
         if (!ignoreCooldown && _cdnRecentlyTried(service, now)) continue;
         // host 替换不起作用（mcdn-only / edl:// 合成项），换过去也是同一个 URL。
         final url = CdnSpeedTest.urlFor(urls, service);
@@ -1062,6 +1159,13 @@ mixin CdnSwitchMixin on GetxController {
       // 播放器日志里（Seek failed / partial file / 解码器报错）。
       final base = baseline;
       if (base != null && usable(base)) {
+        // 解码错误这一档到这里就没什么可说的了：字节坏是解码器证实的，而这一
+        // 轮连一个候选都没测到 —— 换无可换。基线健康 ≠ 画面健康，那两个数是
+        // 两回事（坏字节是以健康的速度送过来的），所以不能借用下面那句
+        // "卡顿多半不在 CDN"。
+        if (force) {
+          return unmeasurable('解码错误触发，但候选一个都没测到');
+        }
         final baseBps = base.bytes / base.micros;
         // 喂不动这条流时它就不是"健康"。
         final starved = needBps > 0 && baseBps < needBps;
@@ -1129,17 +1233,27 @@ mixin CdnSwitchMixin on GetxController {
       '(有效候选样本 ${samples.where((e) => usable(e.$2)).length}/${candidates.length})',
     );
     if (!faster) {
-      // 基线自己都低于健康线时不能说"CDN 都正常" —— 那是没得换，不是没毛病。
-      // 喂不动这条流时同理：健康线是固定的 1MB/s，码率更高的流可以在"高于健康
-      // 线"的同时依然喂不动，那也不是"没问题"。
-      return (
-        verdict: baseBps >= _kCdnHealthyMBps && !starved
-            ? _CdnRoundVerdict.healthy
-            : _CdnRoundVerdict.noBetter,
-        service: null,
-        bytes: base.bytes,
-        micros: base.micros,
-        champion: champion,
+      // 解码错误触发的这一档**不看这个门槛**：它比的是"谁的字节能解出画面"，
+      // 而坏镜像的速度是正常的（实测 2~14MB/s，比健康镜像还高），拿速度当门槛
+      // 等于永远换不动 —— 这正是修复前"基线健康 —— 卡顿多半不在 CDN"的来源。
+      if (!force) {
+        // 基线自己都低于健康线时不能说"CDN 都正常" —— 那是没得换，不是没毛病。
+        // 喂不动这条流时同理：健康线是固定的 1MB/s，码率更高的流可以在"高于健康
+        // 线"的同时依然喂不动，那也不是"没问题"。
+        return (
+          verdict: baseBps >= _kCdnHealthyMBps && !starved
+              ? _CdnRoundVerdict.healthy
+              : _CdnRoundVerdict.noBetter,
+          service: null,
+          bytes: base.bytes,
+          micros: base.micros,
+          champion: champion,
+        );
+      }
+      debugPrint(
+        'CDN 自动切换: 解码错误触发，不等 ${bar}x 门槛 —— 基线 '
+        '${_fmtSpeed(base.bytes, base.micros)} 快是正常的（坏字节也是这么快'
+        '送来的），只比谁的字节能解出画面',
       );
     }
     return (
