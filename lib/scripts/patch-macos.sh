@@ -20,20 +20,24 @@
 # `git apply --check` would call every patch on an already-patched SDK a failure,
 # which tells you nothing.
 #
-# KNOWN DIVERGENCE (found 2026-10-11, and the reason --check earns its keep):
-# `scroll_position.patch` reports NEITHER. The SDK file is not stale -- it was
-# hand-edited *after* the patch went on, and the edit is not in the patch:
+# DRIFT CAUGHT AND FIXED 2026-10-11 -- the case that shows why --check earns its keep:
+# `scroll_position.patch` reported NEITHER. Its file was not stale -- it had been
+# hand-edited *after* the patch went on, and the edit never made it into the patch:
 #
-#   SDK now:  if (_userScrollDirection == ScrollDirection.idle ||
-#                (newPixels != setPixels(newPixels) && newPixels >= 0))
-#   patch:    if (newPixels != setPixels(newPixels) ||
-#                _userScrollDirection == ScrollDirection.idle)
+#   SDK:   if (_userScrollDirection == ScrollDirection.idle ||
+#              (newPixels != setPixels(newPixels) && newPixels >= 0))
+#   patch: if (newPixels != setPixels(newPixels) ||
+#              _userScrollDirection == ScrollDirection.idle)
 #
-# So a from-scratch run of this script reproduces the patch's condition, not the
-# SDK's. That is also why moving the SDK tag is done by carrying the working tree
-# forward (see the commit that did 3.47.6 -> 3.47.7): re-applying patches from
-# scratch would silently revert this edit. Decide which side is right before
-# "fixing" anything -- do not reach for `git reset`.
+# A from-scratch run therefore reproduced the *patch's* condition, not the SDK's,
+# so CI (which always applies from scratch) built different scroll behaviour than
+# this machine. Fixed by regenerating the patch from the live SDK diff --
+# `git -C ~/flutter diff -- <file> > lib/scripts/<name>.patch` -- which now applies
+# from scratch to a byte-identical file. Any patch here can drift the same way, so
+# run --check before trusting a from-scratch apply, and regenerate rather than
+# `git reset`. Moving the SDK tag is still done by carrying the working tree
+# forward (the 3.47.6 -> 3.47.7 commit), which cannot revert a hand-edit the way
+# a fresh apply-point can.
 #
 # !! --material is destructive, and reads the same in patch.ps1: its material flow
 # is `rm -rf material_ui-* && flutter pub get && git apply`, because the patches
@@ -74,7 +78,7 @@ for arg in "$@"; do
   case $arg in
     --check)    CHECK=1 ;;
     --material) WITH_MATERIAL=1 ;;
-    -h|--help)  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -149,7 +153,9 @@ if [ "$rc" = 0 ]; then
 else
   echo "FAILED -- see NEITHER above" >&2
   echo "NEITHER = the patch applies in neither direction, so it does not describe the" >&2
-  echo "file it points at. Usual cause: hand-edits on top of the patch (known case in" >&2
-  echo 'the header comment). Do not "fix" it with a git reset.' >&2
+  echo "file it points at. Usual cause: hand-edits on top of the patch (see the header" >&2
+  echo "for the 2026-10-11 case). Regenerate it from the live SDK diff: " >&2
+  echo "  git -C \$FLUTTER_ROOT diff -- <file> > lib/scripts/<name>.patch" >&2
+  echo 'Do not "fix" it with a git reset.' >&2
 fi
 exit $rc

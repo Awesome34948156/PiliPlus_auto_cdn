@@ -1,5 +1,5 @@
 diff --git a/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart b/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart
-index 96d77f67008..85e42540728 100644
+index 2991edbb379..64658020df9 100644
 --- a/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart
 +++ b/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart
 @@ -127,8 +127,12 @@ class ScrollPositionWithSingleContext extends ScrollPosition implements ScrollAc
@@ -9,7 +9,7 @@ index 96d77f67008..85e42540728 100644
 -    updateUserScrollDirection(delta > 0.0 ? ScrollDirection.forward : ScrollDirection.reverse);
 -    setPixels(pixels - physics.applyPhysicsToUserOffset(this, delta));
 +    final newPixels = pixels - physics.applyPhysicsToUserOffset(this, delta);
-+    if (newPixels != setPixels(newPixels) || _userScrollDirection == ScrollDirection.idle) {
++    if (_userScrollDirection == ScrollDirection.idle || (newPixels != setPixels(newPixels) && newPixels >= 0)) {
 +      updateUserScrollDirection(
 +        delta > 0.0 ? ScrollDirection.forward : ScrollDirection.reverse,
 +      );
