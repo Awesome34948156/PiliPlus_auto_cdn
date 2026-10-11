@@ -34,6 +34,17 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 macOS
 
+      # media_kit's bundled ffmpeg is 6.0 and has no av1_videotoolbox hwaccel,
+      # so AV1 always falls back to libdav1d even on M-series silicon. MPVKit
+      # builds one that has it, but only as static archives; this stages the
+      # relinked dynamic build in their place. Must run after `flutter pub get`
+      # (inside patch.ps1) so the pub-cache checkout exists, and before the
+      # build so `pod install` sees the new framework set. See lib/scripts/mpvkit.
+      - name: Use the AV1-capable libmpv
+        run: bash lib/scripts/mpvkit/stage-mpv.sh macos
+        env:
+          MACOS_TARBALL: https://github.com/Awesome34948156/PiliPlus/releases/download/libmpv-0.41-n9.0.2/libmpv-xcframeworks_v0.6.0_macos-universal-video-default.tar.gz
+
       - name: Build Mac
         run: flutter build macos --release --dart-define-from-file=pili_release.json --no-pub
 

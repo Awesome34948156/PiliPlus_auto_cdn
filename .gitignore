@@ -57,6 +57,11 @@ analysis_benchmark.json
 .pub-cache/
 .pub/
 /build/
+# '/build/' only matches a directory, so it misses the build/ *symlink* to
+# ~/Library/Caches/piliplus-build that macOS/iOS builds need -- see
+# lib/scripts/mpvkit/README.md. Without this a `git add -A` bakes an absolute
+# path to a local cache dir into the tree.
+/build
 flutter_*.png
 linked_*.ds
 unlinked.ds

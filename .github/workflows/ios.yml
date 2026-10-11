@@ -34,6 +34,16 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 iOS
 
+      # media_kit's bundled ffmpeg is 6.0 and has no av1_videotoolbox hwaccel,
+      # so AV1 always falls back to libdav1d even on an A17/A18/M-series chip.
+      # MPVKit builds one that does, but only as static archives; this stages the
+      # relinked dynamic build in their place. Must run after `flutter pub get`
+      # (inside patch.ps1) so the pub-cache checkout exists. See lib/scripts/mpvkit.
+      - name: Use the AV1-capable libmpv
+        run: bash lib/scripts/mpvkit/stage-mpv.sh ios
+        env:
+          IOS_TARBALL: https://github.com/Awesome34948156/PiliPlus/releases/download/libmpv-0.41-n9.0.2/libmpv-xcframeworks_v0.39.0_ios-universal-video-default.tar.gz
+
       - name: Build iOS
         run: |
           flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub
