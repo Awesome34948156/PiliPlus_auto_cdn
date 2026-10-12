@@ -366,8 +366,15 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   /// 重拼一遍 `player.open`。暂停意图靠 `autoplay` 传当前播放态保住 —— 拆的时候
   /// 已经先 `_removeListeners()`，`playerStatus` 冻结在拆之前的值，所以这里读到的
   /// 正是用户原本的意图。
+  ///
+  /// 读的必须是**播放器**那个 `playerStatus`（`_removeListeners()` 取消订阅后它冻在
+  /// 拆之前的值），**不是页面**的 `videoDetailController.playerStatus` —— 后者全仓
+  /// 只有一个写点（`didPushNext`，被别的页盖住时才赋值），没被盖住过的页面读到的
+  /// 恒是 null，`?? false` 于是让每一次重建都把**在播**的视频恢复成暂停
+  /// （log 13 两次实测：那 50 秒里四次正常装载都成对带 `pause=false`，唯独重建
+  /// 那两次只有 `pause=true`）。
   Future<void> _onRenderContextLost() => videoDetailController.playerInit(
-    autoplay: videoDetailController.playerStatus?.isPlaying ?? false,
+    autoplay: videoDetailController.plPlayerController.playerStatus.isPlaying,
   );
 
   @override
