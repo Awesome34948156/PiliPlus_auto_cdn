@@ -398,6 +398,10 @@ mixin CdnSwitchMixin on GetxController {
   @visibleForTesting
   bool get debugCdnAutoBusy => _cdnAutoBusy;
 
+  /// 测试用：上一轮"一个字节都没到"的镜像（[_cdnNoSample]）。
+  @visibleForTesting
+  Set<CDNService> get debugCdnNoSample => _cdnNoSample;
+
   // ---------------------------------------------------------------------------
   // 时钟与闸门。三个时间闸互相独立，谁也别合并谁：
   //   _cdnGiveUpUntil  整集放弃——一轮试完仍不行，60s 内不再响应任何触发
@@ -510,6 +514,11 @@ mixin CdnSwitchMixin on GetxController {
       // 给过坏字节的镜像不是"快不快"的问题，历史记录里它可能正是最快的那个
       // （见 [_cdnBadHosts]）。留着它等于每一轮都白占一个候选位。
       if (service.host == null || _cdnBadHosts.contains(service.host)) continue;
+      // 上一轮一个字节都没到（连接超时 / 403 / 0 样本）：这是"这条链路连不上"
+      // 而不是"慢"，跟换集换对象无关，短时间内不会自愈。让它占着冠军位等于每轮
+      // 白赔一次超时、白占一个候选位。跳过它、让位给轮换；下次真出样本就自动恢复
+      // （见 [_pickFastestCdn] 里的 `_cdnNoSample.remove`）。
+      if (_cdnNoSample.contains(service)) continue;
       // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 [_cdnChampionMisses]。
       if ((_cdnChampionMisses[service] ?? 0) >= _kCdnChampionMisses) {
         debugPrint(
@@ -589,8 +598,11 @@ mixin CdnSwitchMixin on GetxController {
     _cdnGeneration++;
     _cdnAutoBusy = false;
     _cdnAutoAttempts = 0;
-    _cdnTriedAt.clear();
-    _cdnNoSample.clear();
+    // [_cdnTriedAt] / [_cdnNoSample] **不清**：慢（3 分钟）和连不上（30 分钟）是
+    // 链路层状态，换集/换 P 不换链路，冷却应当跨集延续、靠时间戳自然过期。否则
+    // 短视频连划时每集都清空，"冠军连不上（一个字节都没到）"的账记不住，30 分钟
+    // 冷却形同虚设 —— 冠军每集都白占一个候选位、还白赔一次超时（见 [_cdnChampion]
+    // 里的 [_cdnNoSample] 检查，以及 [_cdnRecentlyTried] 对时间戳的依赖）。
     // 换集/换画质是新的对象，坏字节的账也跟着作废：同一条边对另一个视频
     // 完全可能是好的。
     _cdnBadHosts.clear();

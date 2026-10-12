@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/pages/video/cdn_switch_mixin.dart';
@@ -126,6 +127,41 @@ void main() {
   tearDownAll(() async {
     await Hive.close();
     await tempDir.delete(recursive: true);
+  });
+
+  test('冠军连不上（一个字节都没到）后，换集也不白占候选位', () async {
+    // 让 ali 当上历史冠军：cand=1 + 记录里唯一有速度 + 未过期。记录布局见
+    // `_recordCdnSample`（每镜像 3 槽：速度 / 时间戳秒 / 当过候选）。
+    final record = List<int>.filled(CDNService.values.length * 3, 0);
+    final at = CDNService.ali.index * 3;
+    record[at] = 5 * 1000 * 1000; // 5MB/s，单位字节/秒
+    record[at + 1] = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    record[at + 2] = 1;
+    Pref.cdnSpeedRecord = record;
+
+    // 阿里云这个 host 连不上：测速直接抛异常 → 一个字节都没到，进 `_cdnNoSample`。
+    cdn.deadHosts = {CDNService.ali.host!};
+
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    // 第一轮：冠军照旧占位（此刻还没被标记连不上），测速后同时被记进"连不上"。
+    await _waitFor(() => hostA.debugCdnNoSample.contains(CDNService.ali));
+    expect(log.has('含 1 个历史冠军'), isTrue,
+        reason: '第一轮冠军还没被标记连不上，本该占候选位：\n${log.text}');
+
+    // 换集（onReset 走这里）：放弃冷却/位置闸门要清，但"连不上"是链路层状态，
+    // 得跨集留住。不必等第一轮那条换源跑完 —— 它在等假播放器的位置推进，测试里
+    // 永远推进不了；reset 推代际，残留的那轮一拍之内就自己退场。
+    hostA.resetCdnAutoSwitch();
+    expect(hostA.debugCdnNoSample, contains(CDNService.ali),
+        reason: '连不上不该随换集清空，否则 30 分钟冷却形同虚设');
+
+    // 第二轮：这个冠军该让位给轮换了。
+    log.clear();
+    _stall(hostA);
+    await _waitFor(() => log.has('测速 1 基线'));
+    expect(log.has('含 1 个历史冠军'), isFalse,
+        reason: '上一轮连不上的冠军这一轮不该再占候选位：\n${log.text}');
   });
 
   test('被顶掉的那一页不许再动播放器（跨页污染）', () async {
@@ -1640,6 +1676,10 @@ class _FakeCdn {
   /// unmeasurable 轮（F8 / F6 用）。默认假：只有基线那个 host 是慢的。
   bool allTiny = false;
 
+  /// 在这份名单里的 host 直接抛异常 —— 造"一个字节都没到"的候选（连不上），
+  /// 走 `_cdnNoSample` 那条冷却，而不是"测到了但慢"。
+  Set<String> deadHosts = {};
+
   List<({Uri uri, String? range})> get probes =>
       requests.where((r) => r.range == _probeRange).toList();
 
@@ -1664,6 +1704,17 @@ class _FakeAdapter implements HttpClientAdapter {
   ) async {
     final range = options.headers['range'] as String?;
     cdn.requests.add((uri: options.uri, range: range));
+
+    // 连不上的 host：抛连接超时，让 `guarded` 兜住、候选记进 `_cdnNoSample`。
+    // 抛 DioException（而不是裸 Exception）—— 裸异常会被 Dio 额外包一层，在 Zone
+    // 里多出一个未捕获异常，把测试带崩。
+    if (cdn.deadHosts.contains(options.uri.host)) {
+      throw DioException(
+        requestOptions: options,
+        type: DioExceptionType.connectionTimeout,
+        message: 'dead host: ${options.uri.host}',
+      );
+    }
 
     // 探对象总长：只回头部就够了（调用方读完就 cancel）。`parseContentRangeSize`
     // 只取最后一个 `/` 之后的整数。
@@ -1725,6 +1776,8 @@ class _LogCapture {
   }
 
   bool has(String needle) => lines.any((line) => line.contains(needle));
+
+  void clear() => lines.clear();
 
   String get text => lines.join('\n');
 }
