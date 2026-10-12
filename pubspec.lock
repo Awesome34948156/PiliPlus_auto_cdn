@@ -1231,9 +1231,9 @@ packages:
     dependency: "direct main"
     description:
       path: media_kit_video
-      ref: native
-      resolved-ref: fd8421d21eade4d6d12de137fa7df902fec20292
-      url: "https://github.com/bggRGjQaUbCoE/media-kit.git"
+      ref: "2c8dfa71aeab5983270f93bf434036c333f0afeb"
+      resolved-ref: "2c8dfa71aeab5983270f93bf434036c333f0afeb"
+      url: "https://github.com/Awesome34948156/media-kit.git"
     source: git
     version: "1.2.5"
   meta:
