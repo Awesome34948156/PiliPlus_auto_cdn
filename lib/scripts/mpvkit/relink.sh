@@ -132,8 +132,11 @@ run_link() { # $1 = output, rest = args
   local log
   log="$TMPW/link-$(basename "$out").log"
   # TMPDIR is pinned to our scratch dir for the same reason as in build_stubs:
-  # clang leaves a temp directory per -arch job (named after the input file)
-  # behind in $TMPDIR, empty, every single run.
+  # clang's multi-`-arch` driver leaves one temp directory per input per arch job
+  # behind in $TMPDIR (named after the input basename) and never removes it. They
+  # come out empty -- the temp *files* inside are cleaned even when the link
+  # fails -- but a default $TMPDIR collects them run after run. A single `-target`
+  # driver (the iOS slices) spawns none at all; the pin costs nothing there.
   if ! TMPDIR="$TMPW" clang "$@" >"$log" 2>&1; then
     echo "--- link FAILED, full log ---" >&2
     cat "$log" >&2
@@ -149,10 +152,12 @@ run_link() { # $1 = output, rest = args
 # object file built for 'macOS'".
 build_stubs() { # $1 = out.o, rest = target flags
   local out="$1"; shift
-  # TMPDIR is pinned into our scratch dir: clang creates an empty temp directory
-  # per -arch job in $TMPDIR, named after the input basename, and never removes
-  # it -- so a default-TMPDIR run leaks two `stubs-*` dirs per slice on top of
-  # whatever this script leaks itself. Inside $TMPW the EXIT trap sweeps them up.
+  # TMPDIR is pinned into our scratch dir: clang's multi-`-arch` driver creates an
+  # empty temp directory per input per arch job (named after the input basename)
+  # and never removes it, so a default-TMPDIR run leaks them on top of whatever
+  # this script leaks itself. The macOS call below passes two -arch flags and so
+  # leaves two `stubs-*` dirs; the iOS slices pass a single -target and leave none.
+  # Inside $TMPW the EXIT trap sweeps up whatever did appear.
   TMPDIR="$TMPW" clang "$@" -c -o "$out" "$HERE/stubs.c"
 }
 
