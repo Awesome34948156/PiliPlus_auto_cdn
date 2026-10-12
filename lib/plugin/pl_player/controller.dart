@@ -54,7 +54,7 @@ import 'package:PiliPlus/utils/utils.dart';
 import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show kDebugMode, visibleForTesting;
 import 'package:flutter/services.dart'
     show DeviceOrientation, HapticFeedback, KeyDownEvent;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -350,6 +350,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 连续多少个 1s 采样低于阈值才算饥饿。健康锯齿只在谷底停留一两拍。
   static const int _kStarveSeconds = 4;
 
+  /// 一段饥饿**持续**期间，每隔多久补报一次 [onBufferStarve]。
+  ///
+  /// 判据 3 原来是"一段饥饿只报一次"，而"这段饥饿结束"的判据是余量涨回 mpv
+  /// 自己的水位（见 [_sampleStarve] 末尾）—— 镜像持续供不上（或像 2026-10-12
+  /// 那次一样持续喂坏字节）时余量一直趴在低位，那段饥饿**永远不会结束**，
+  /// 于是那一次上报就是最后一次：那次唯一的 `缓冲饥饿` 上报被页面侧的放弃冷却
+  /// 吞掉之后，后面 52 秒再没有任何信号，只能等 2 分钟定期档兜底。
+  ///
+  /// 补报没有改"这段饥饿报过没有"的语义，只是把它变成"每 [_kStarveRepeat]
+  /// 报一次"。页面侧那几道冷却（20s 无法测出 / 30s 小卡顿 / 60s 放弃）本来就是
+  /// "现在别动"的判决，两边节奏相当，重复的上报会被它们照旧吃掉 —— 这本该如此：
+  /// 播放器只管让"还在饿"这件事**持续可见**，切不切由页面判。
+  static const Duration _kStarveRepeat = Duration(seconds: 20);
+
   /// 看门狗心跳间隔。三条判据都只在出事时才出声，没有心跳就无法区分
   /// "一切正常"和"看门狗根本没跑"——两者留下的日志一模一样。
   static const int _kHeartbeatSeconds = 10;
@@ -392,7 +406,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 余量是否已经归零过（[onRebuffer] 的上升沿去重）。
   bool _wasEmpty = false;
   int _starveSeconds = 0;
-  bool _starveFired = false;
+
+  /// 当前这段饥饿的最后一次上报时刻；null = 没有正在上报的饥饿段。
+  ///
+  /// 兼作去重状态：非空即"这段已经报过"，只有余量真的涨回水位才清空（见
+  /// [_sampleStarve]）。存时刻而不是 bool 是为了补报 —— 见 [_kStarveRepeat]。
+  DateTime? _starveLastReportAt;
   DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 落在 [_kDecodeErrorWindow] 里的解码报错时刻，窗口自己滑动淘汰。
@@ -1825,7 +1844,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _wasStalled = false;
         _starveSeconds = 0;
         // 换源后是全新一轮，允许再报一次。
-        _starveFired = false;
+        _starveLastReportAt = null;
         return;
       }
       _sampleRebuffer(now);
@@ -1864,7 +1883,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _wasStalled = false;
     _wasEmpty = false;
     _starveSeconds = 0;
-    _starveFired = false;
+    _starveLastReportAt = null;
   }
 
   /// 进入/推进静默期。任何一次装载（开播、换源、换 P、切换 CDN）以及 seek
@@ -1923,7 +1942,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 余量长期趴在低位是"供不上"，余量涨到 [telemetryDiverged] 是"遥测被音频
   /// 拖走了"，后者正是"只有声音、画面冻住"。
   ///
-  /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束。
+  /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束；**但那一段
+  /// 还没结束时每 [_kStarveRepeat] 补报一次**（理由是坏镜像让"结束"永不发生，
+  /// 见 [_kStarveRepeat]）。
   ///
   /// **片尾必须放行**：`bufferedAhead` 的上界就是剩余时长，所以视频最后
   /// `threshold` 秒里这条判据*必然*成立，跟网速多快无关（推导见 [_atFileTail]）。
@@ -1939,12 +1960,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return;
     }
     if (bufferedAhead < threshold) {
-      if (++_starveSeconds < _kStarveSeconds || _starveFired) return;
-      _starveFired = true;
+      if (++_starveSeconds < _kStarveSeconds) return;
+      if (!_starveReportDue(now)) return;
+      final repeat = _starveLastReportAt != null;
+      _starveLastReportAt = now;
       debugPrint(
-        'CDN 缓冲饥饿: 前方余量 ${bufferedAhead}s < '
-        '${threshold.toStringAsFixed(1)}s (连续 $_kStarveSeconds s) '
-        '@${position.value}s',
+        repeat
+            ? 'CDN 缓冲饥饿: 仍在饥饿，再次上报（余量 ${bufferedAhead}s < '
+                  '${threshold.toStringAsFixed(1)}s）@${position.value}s'
+            : 'CDN 缓冲饥饿: 前方余量 ${bufferedAhead}s < '
+                  '${threshold.toStringAsFixed(1)}s (连续 $_kStarveSeconds s) '
+                  '@${position.value}s',
       );
       onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
       return;
@@ -1952,26 +1978,47 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _starveSeconds = 0;
     // 余量涨到失真：音频在走、画面冻着。`demuxer-cache-time` 被音频轨抬离了
     // 播放位置，余量因此超过缓存上限好几倍 —— 位置还在推进、[isBuffering]
-    // 也是假，判据 1、2 都看不见，只有这里能拦住。同样每段只报一次。
+    // 也是假，判据 1、2 都看不见，只有这里能拦住。同样每段只报一次（可按
+    // [_kStarveRepeat] 补报，跟上面那条共用一个去重状态）。
     if (telemetryDiverged) {
-      if (_starveFired) return;
-      _starveFired = true;
+      if (!_starveReportDue(now)) return;
+      final repeat = _starveLastReportAt != null;
+      _starveLastReportAt = now;
       debugPrint(
-        'CDN 遥测失真: 余量 ${bufferedAhead}s 超过缓存上限 '
-        '${_divergedAheadSec.toStringAsFixed(1)}s 的 ${_kDivergedFactor}x '
-        '(音频在走，画面已冻) @${position.value}s',
+        repeat
+            ? 'CDN 遥测失真: 仍在失真（余量 ${bufferedAhead}s）'
+                  '@${position.value}s'
+            : 'CDN 遥测失真: 余量 ${bufferedAhead}s 超过缓存上限 '
+                  '${_divergedAheadSec.toStringAsFixed(1)}s 的 '
+                  '${_kDivergedFactor}x (音频在走，画面已冻) @${position.value}s',
       );
       onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
       return;
     }
     // 只有补回 mpv 自己的水位才算这段饥饿真的结束了。
     if (bufferedAhead >= threshold / _kStarveFloorFraction) {
-      if (_starveFired) {
+      if (_starveLastReportAt != null) {
         debugPrint('CDN 缓冲饥饿: 已恢复 (${bufferedAhead}s)');
       }
-      _starveFired = false;
+      _starveLastReportAt = null;
     }
   }
+
+  /// 该不该就"还在挨饿"这件事再出声一次：没报过，或者距上次已过 [_kStarveRepeat]。
+  bool _starveReportDue(DateTime now) {
+    final last = _starveLastReportAt;
+    return last == null || now.difference(last) >= _kStarveRepeat;
+  }
+
+  /// 测试缝：判据 3 的一拍。
+  ///
+  /// [_sampleStarve] 本身不需要播放器（只看 `now` 和 [buffered] / [position] /
+  /// [duration] 这几个公开字段），但驱动它的 1s ticker 在测试里跑不起来
+  /// （[_startStallTicker] 要真播放器，见 `_startListeners`）。所以把这一拍直接
+  /// 暴露出来，让"持续饥饿必须补报"这条有测试盯着 —— 它是这一片的盲区里少数
+  /// 能被钉住的东西。生产代码不走这里。
+  @visibleForTesting
+  void debugSampleStarve(DateTime now) => _sampleStarve(now);
 
   /// 统计"缓冲归零"的上升沿 —— 即加载中转圈出现的次数。
   ///

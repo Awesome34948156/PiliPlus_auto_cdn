@@ -718,7 +718,125 @@ void main() {
       reason: 'decode=true 的恢复判据不该去看余量（那是坏镜像最会骗人的一项）：\n${log.text}',
     );
   });
+
+  test('坏字节的一次性上报不许被放弃冷却吞掉', () async {
+    // 播放器侧的风暴上报是**一次性消费**：先清空窗口、再武装 30s 静默、最后才回调，
+    // 而通道是 `void`（`onDecodeError` 没有回执）。所以被下游丢掉的那一次永远不会重
+    // 报 —— 放弃冷却（20~60s）一挡，结果是"零次救援"而不是"晚一点救"。
+    //
+    // 2026-10-12 真机取证：坏镜像喂坏字节（截断在 54MB/788MB + 非法 NAL），那次唯一
+    // 的风暴上报（13:56:10.169）正好落在轮 1 挣来的 20s 冷却里被吞掉，画面冻了 6 分
+    // 半，直到定期档碰巧撞上"基线无有效样本 → 直接切换"才恢复。
+    //
+    // 解码错误是唯一**跳过比值、直接换源**的触发，它自己的节流是播放器侧的
+    // `_kDecodeErrorCooldown`（一次故障只报一次）—— 这里再压一道等于双保险变零保险。
+    // 所以它像绕过进展闸那样，也绕过放弃冷却。
+    cdn.allTiny = true; // 造一轮 unmeasurable，顺手把 20s 冷却装上（与 F6 同法）
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => log.has('放弃，20s 内不再尝试'));
+    expect(
+      log.has('放弃，20s 内不再尝试（无法测出更快的 CDN，暂不切换）'),
+      isTrue,
+      reason: '这一轮没落到 unmeasurable 那档冷却上，用例前提不成立：\n${log.text}',
+    );
+
+    // 先确认这道冷却对**别的**触发照旧有效 —— 否则下面的否定是空的。
+    _stall(hostA);
+    expect(
+      log.has('冷却中，忽略卡顿'),
+      isTrue,
+      reason: '冷却没挡住非解码触发，用例前提不成立：\n${log.text}',
+    );
+
+    // 同一窗口里的解码错误上报必须当场起步（`_describeTrigger` 打在闸门之后）。
+    PlPlayerController.getInstance().onDecodeError!(const Duration(seconds: 100));
+    expect(
+      log.has('冷却中，忽略解码错误'),
+      isFalse,
+      reason: '坏字节上报又被放弃冷却吞了，而它是一次性消费、不会再来：\n${log.text}',
+    );
+    await _waitFor(() => log.has('解码错误 @100s，当前镜像给的是坏字节'));
+  });
+
+  test('持续饥饿每 20s 补报一次，恢复后重新武装', () {
+    // 病灶（2026-10-12 真机取证）：播放器判据 3 的去重是"一段饥饿只报一次"，
+    // 而"这段结束"的判据是余量涨回 mpv 自己的水位 —— 镜像持续供不上（或像那次
+    // 一样持续喂坏字节）时它**永远不结束**，于是那唯一一次上报被页面侧的放弃冷却
+    // 吞掉之后，后面 52 秒再没有任何信号，只能等 2 分钟定期档兜底。
+    //
+    // 这条用例盯的是"还在饿就每 20s 再出声一次"，以及"恢复之后不许继承上一个
+    // 20s 的节流"。放在这个文件里是因为播放器单例的状态（Hive / Pref / `buffer`
+    // 那个 late final）在这里已经摆好了 —— 而 `_sampleStarve` 只看 `now` 和几个
+    // 公开 Rx 字段，不需要真播放器（驱动它的 1s ticker 才需要，见
+    // `controller.dart` 的 `debugSampleStarve`）。
+    final pc = PlPlayerController.getInstance();
+    var reports = 0;
+    pc.onBufferStarve = (_) => reports++;
+    // 静默期（`_armRebufferSuppress`，8s）是与挂钟比较的，所以时间戳取在未来，
+    // 免得撞上前一个用例留下的窗口。
+    final base = DateTime.now().add(const Duration(minutes: 5));
+    DateTime at(int s) => base.add(Duration(seconds: s));
+
+    pc
+      // 拿 reload 当"从头开始"：任何一次真实装载都会这样归零三条判据。`dataSource`
+      // 是 `late`，不摆好这里会抛。
+      ..dataSource = NetworkSource(videoSource: _baselineUrl, audioSource: null)
+      ..refreshPlayer()
+      ..buffer['demuxer-hysteresis-secs'] = '10' // 阈值 6.0s → 判据启用
+      ..duration.value = 3600
+      ..position.value = 100
+      ..buffered.value = 100; // 前方余量 0：趴在低位
+
+    // 攒够连续采样之前不许出声（去重状态已被上面那次 reload 清空）。
+    for (var i = 0; i < 3; i++) {
+      pc.debugSampleStarve(at(i));
+    }
+    expect(reports, 0, reason: '还没攒够 $_kStarveSecondsExpect 拍就上报了：\n${log.text}');
+
+    pc.debugSampleStarve(at(3));
+    expect(reports, 1, reason: '攒够了却没上报：\n${log.text}');
+    expect(
+      log.has('缓冲饥饿: 前方余量 0s < 6.0s (连续 4 s) @100s'),
+      isTrue,
+      reason: log.text,
+    );
+
+    // 同一段饥饿里 20s 之内不许重复，越过 20s 必须再报。
+    pc.debugSampleStarve(at(18));
+    expect(reports, 1, reason: '20s 之内就重复上报了：\n${log.text}');
+    pc.debugSampleStarve(at(23));
+    expect(reports, 2, reason: '越过 20s 还没补报 —— 这正是那次裸奔 52 秒：\n${log.text}');
+    expect(log.has('缓冲饥饿: 仍在饥饿，再次上报'), isTrue, reason: log.text);
+
+    // 余量回到 mpv 自己的水位（6.0 / 0.6 = 10s）→ 这段饥饿结束、去重清空。
+    // 抬到 120 而不是随便一个更大的数：余量超过缓存上限的 3 倍会先落进
+    // "遥测失真"那一支（`_divergedAheadSec` = 16s × 3 = 48s）。
+    pc.buffered.value = 120;
+    pc.debugSampleStarve(at(24));
+    expect(log.has('缓冲饥饿: 已恢复 (20s)'), isTrue, reason: log.text);
+    expect(reports, 2, reason: '恢复本身不该上报：\n${log.text}');
+
+    // 新的一段立刻可以出声：它离上一次上报只有 5s，靠的正是"恢复时把节流清空"。
+    pc.buffered.value = 100;
+    for (var i = 25; i < 28; i++) {
+      pc.debugSampleStarve(at(i));
+    }
+    expect(reports, 2, reason: '新一段还没攒够就上报了：\n${log.text}');
+    pc.debugSampleStarve(at(28));
+    expect(reports, 3, reason: '恢复之后的新一段被上一段的节流压住了：\n${log.text}');
+
+    // 新的一段里补报照旧。
+    pc.debugSampleStarve(at(43));
+    expect(reports, 3, reason: '新一段里 20s 之内就重复了：\n${log.text}');
+    pc.debugSampleStarve(at(48));
+    expect(reports, 4, reason: '新一段里越过 20s 没补报：\n${log.text}');
+  });
 }
+
+/// 判据 3 的连续采样拍数（`controller.dart:_kStarveSeconds`）。只用在失败原因里，
+/// 别跟着生产常量一起改。
+const _kStarveSecondsExpect = 4;
 
 /// 把触发打进播放器上报口 —— 这就是真实的机制（页面不直接调 mixin 的私有方法）。
 ///

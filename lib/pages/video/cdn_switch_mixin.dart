@@ -645,8 +645,19 @@ mixin CdnSwitchMixin on GetxController {
       return false;
     }
 
+    // 解码错误同样不吃放弃冷却（理由和下面绕过进展闸那一条同源）：病在**字节**上、
+    // 画面当场就是冻的，冷却期那 20~60s 等不起；而它自己的节流是播放器侧的
+    // [_kDecodeErrorCooldown]（一次故障只报一次）—— 两道闸叠起来就是"永远不救"。
+    //
+    // 2026-10-12 真机取证：那次**唯一**的风暴上报（13:56:10.169）正好落在轮 1 挣来的
+    // 20s 冷却（`_kCdnUnmeasuredCooldown`）里，被这里吞掉；而播放器侧上报是**一次性
+    // 消费**（先清窗口、再武装 30s 静默、最后才回调，通道是 `void` 没有回执），所以
+    // 那个瞬时风暴再也不会重报 —— 画面一直冻到 6 分钟后定期档碰巧撞上"基线无有效
+    // 样本 → 直接切换"才恢复。
     final cooldownUntil = _cdnGiveUpUntil;
-    if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
+    if (trigger != _CdnTrigger.decode &&
+        cooldownUntil != null &&
+        DateTime.now().isBefore(cooldownUntil)) {
       debugPrint('CDN 自动切换: 冷却中，忽略$what @${position.inSeconds}s');
       return false;
     }
