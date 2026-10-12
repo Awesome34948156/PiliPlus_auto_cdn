@@ -1118,6 +1118,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   Future<Player> _initPlayer() async {
     assert(_videoPlayerController == null);
+    // 旧渲染上下文可能还在拆（见 [_playerTeardown]）：不等它，我们这里的
+    // `VideoController.create` 就会和那边的 `VideoOutputManager.Dispose` +
+    // `unregisterTexture` 撞在一起抢同一个 handle / textureId。我们自己的那次
+    // 重载不会被挡在这里 —— [_runRenderContextRebuild] 是先 await 完拆除才请页面
+    // 重载的，走到这里时 [_playerTeardown] 已经清空。
+    if (_playerTeardown case final teardown?) {
+      await teardown;
+    }
     final opt = {
       'video-sync': Pref.videoSync,
       if (Platform.isAndroid) 'ao': Pref.audioOutput,
@@ -1157,6 +1165,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         hwdec: hwdec,
       ),
     );
+    // 渲染上下文出生：连同 [_runRenderContextRebuild] 里销毁那次的递增，
+    // 「gen 变了 ⇔ 上下文对象换了」这条不变量闭合。递增必须在这里而不是调用者那里 ——
+    // 页面自己发起的装载（换集 / 换画质 / 失败后再试）也会走到这里，只认一个口子
+    // 才不会漏（漏了 UI 就抱着上一个已经被 dispose 的 controller 不动了）。
+    renderContextGen.value++;
 
     if (Platform.isAndroid) {
       // Avoid sizing the surface using mpv's idle window between media loads.
@@ -1188,7 +1201,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 重建渲染上下文自己也要走这条路（见 [_runRenderContextRebuild]），别把自己
     // 的额度一起清掉 —— 清了就是"探满 4 → 自愈失败 → 重建 → 探满 4 → …"的无限
     // 重建。只有用户发起的装载（换集 / 换画质 / CDN 换源）才重新给额度。
-    if (!_rebuildingRenderContext) {
+    //
+    // 判据是 _ownReload 而不是 _rebuildingRenderContext：用户**恰好在重建窗口里**
+    // 换集时后者也是 true，会把用户这次装载的额度白白吃掉（新媒体一上来就背着
+    // 上一个媒体烧完的账）。
+    if (!_ownReload) {
       _noVideoRebuilds = 0;
     }
 
@@ -1553,6 +1570,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// null，视频区那几个节点要忍住别把播放器判成"该塌"。
   bool _rebuildingRenderContext = false;
 
+  /// 正在跑的正是**我们自己的**那次重载（见 [_runRenderContextRebuild]）。
+  ///
+  /// 它与"用户在这一刻发起了装载"在 [_createVideoController] 里长得一模一样
+  /// （那时 [_rebuildingRenderContext] 也还是 true），只能靠这个标志区分：
+  /// 额度只在用户发起的装载上重新给，我们自己的重载不能给自己续命 —— 否则就是
+  /// "探满 → 重建 → 探满 → …" 的无限重建。
+  bool _ownReload = false;
+
+  /// 旧 [Player] 正在拆（[Player.dispose] 里有 `VideoOutputManager.Dispose` +
+  /// `unregisterTexture`，最长 2s）。
+  ///
+  /// 拆旧期间两个字段已经被置空，任何并发装载者都会去建**新**的渲染上下文
+  /// （这是我们故意留的：不能让他们复用正在拆的对象）；让他们在 [_initPlayer]
+  /// 开头等这一个 Future，原生那边的 Create 与 Dispose 才不会同时抢一个 handle。
+  Future<void>? _playerTeardown;
+
   /// 见 [_rebuildingRenderContext]。
   bool get rebuildingRenderContext => _rebuildingRenderContext;
 
@@ -1610,13 +1643,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _noVideoHealed = true;
       // 链在 Future **之后**升级，不能写进 [_healNoVideoTrack] 的失败分支里：
       // 那里仍在 try 内，finally 的 unpin() 会 setSize 打在已经拆掉的
-      // controller 上。这里保证升级发生在自愈彻底收尾之后。
+      // controller 上。链在这里，成功的自愈路径就**不会**升级重建。
       unawaited(_healNoVideoTrack().then((ok) {
         if (!ok) _rebuildRenderContextOnNoVideo();
       }));
       return;
     }
     // 本媒体已经钉过尺寸、画面还是没起来 —— 升级到重建渲染上下文（受额度限制）。
+    //
+    // 这条路**故意不设 [_healingNoVideo] 闸**：自愈卡在 setSize 上永不返回时
+    // （正是这个死锁最坏的形态），上面那条 `.then` 永远不触发，只有这里能救 ——
+    // 所以"升级一定发生在自愈收尾之后"这句只在成功路径上成立，别把它当不变量。
+    // 自愈那边醒来时 unpin() 是 `videoController?.setSize` 且整体 try/catch，
+    // 打到已经拆掉的 controller 上不会抛。
     _rebuildRenderContextOnNoVideo();
   }
 
@@ -1675,6 +1714,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   set debugRebuildingRenderContext(bool value) => _rebuildingRenderContext = value;
 
+  /// [`_healNoVideoTrack`] 只探一次（[_noVideoHealed]），而这个标志位在测试进程里
+  /// **没有复位点** —— 它唯一的复位在 [_createVideoController] 里，测试够不到。
+  /// 不复位就会污染后面的用例：那条"升级链"用例之所以能把删掉 `.then` 的变异抓红，
+  /// 全靠它自己恰好是第一个探满的用例，一旦有人先探过就变成假绿。
+  @visibleForTesting
+  set debugNoVideoHealed(bool value) => _noVideoHealed = value;
+
+  /// 同上：[_renderReloadListeners] 只在页面 `dispose()` 里清，测试里没有页面，
+  /// 用例里那条 `remove` 又写在断言之后 —— 断言一抛就漏，后面的用例看到非空集合，
+  /// 会被连带弄红（看起来像它自己的问题）。
+  @visibleForTesting
+  void debugClearRenderReloadListeners() => _renderReloadListeners.clear();
+
   @visibleForTesting
   void debugCheckNoVideoTrack() => _checkNoVideoTrack();
 
@@ -1693,14 +1745,26 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     try {
       // 次序不可换：_removeListeners 先跑（取消 ticker + 把 _subscriptions 置
       // null，否则 _startListeners 的 assert 会炸、旧订阅也会泄漏），两个字段
-      // 都置空后 _initPlayer 的两条 assert 才成立。旧 player 必须 await 掉 ——
-      // 它的 release 里在跑 VideoOutputManager.Dispose + unregisterTexture，
-      // 不等就建新输出会让两个 VideoOutput 抢同一个 handle。
+      // 都置空后 _initPlayer 的两条 assert 才成立。
       _removeListeners();
       final old = _videoPlayerController!;
       _videoPlayerController = null;
       _videoController = null;
-      await old.dispose();
+      // 上下文**没了**也是变了一代：UI 只认 Rx，不递增它就不会重跑，视频区会一直
+      // 抱着已经 dispose 的那个 controller。销毁与重建各递增一次（见 [_initPlayer]），
+      // "gen 变了 ⇔ 上下文对象换了"这条不变量才闭合。
+      renderContextGen.value++;
+      // 旧 player 必须等它拆完才能建新的：它的 release 里在跑
+      // VideoOutputManager.Dispose + unregisterTexture，不等就建新输出会让两个
+      // VideoOutput 抢同一个 handle。**并且**要把这个 Future 挂出去：这段时间里
+      // 任何并发装载者都会看到 player == null 而去建新的（这是我们故意留的 ——
+      // 不让他们复用正在拆的对象），让他们在 [_initPlayer] 开头等这一件事。
+      final teardown = old.dispose();
+      _playerTeardown = teardown;
+      await teardown;
+      if (identical(_playerTeardown, teardown)) {
+        _playerTeardown = null;
+      }
       _noVideoProbes = 0;
       if (_playerCount == 0) {
         return;
@@ -1708,13 +1772,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 请页面重载。用户在这段 await 里自己换了集也无妨：页面那次 playerInit
       // 会先建成新 player，我们这轮再 playerInit 只是把它重新 open 一遍
       // （_createVideoController 见 player != null 就复用），不会出现两个 Player。
+      // _ownReload 让 _createVideoController 分清"这是我们自己的重载"与"用户发起的
+      // 装载"—— 两者在它眼里都带着 _rebuildingRenderContext == true。
+      _ownReload = true;
       for (final reload in _renderReloadListeners.toList()) {
         await reload();
       }
-      if (_videoController != null) {
-        renderContextGen.value++;
-      }
     } finally {
+      _ownReload = false;
       _rebuildingRenderContext = false;
       _noVideoProbes = 0;
       _resetStallWatchdog();

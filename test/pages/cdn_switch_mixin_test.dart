@@ -866,6 +866,10 @@ void main() {
   // `_videoPlayerController` 恒为 null，`_kNoVideoProbes` 探满之后
   // `_healNoVideoTrack` 第一句就 return false），所以断言落在"闸门说了什么"和
   // "失败之后有没有去叩那道门"上。两者都是这次新增的代码路径，去掉修复即红。
+  //
+  // 已知覆盖不到的一处：`_renderRebuildBlocker` 里"换源/换集在途"（`_processing`）
+  // 那道闸门 —— 它排在"播放器不存在"**之后**，而测试进程里 player 恒为 null，
+  // 所以永远停在前一条。别给 `_processing` 加测试缝去凑：缝有了也走不到。
   group('无视频轨自愈失败 → 就地重建渲染上下文', () {
     late PlPlayerController pc;
 
@@ -874,16 +878,29 @@ void main() {
         // setUp 每次都 `getInstance()`，`_playerCount` 跨用例只增不减，摆不成
         // "恰好一个页面持有单例"这个前提。
         ..debugPlayerCount = 1
-        ..debugNoVideoRebuilds = 0;
+        ..debugNoVideoRebuilds = 0
+        // 下面这几样在测试进程里**没有别的复位点**（生产里的复位分别在
+        // `_createVideoController` 与页面 `dispose()`，测试都够不到），不在这里
+        // 摆干净就会把后面的用例污染成另一种初始状态。
+        ..debugNoVideoHealed = false
+        ..debugRebuildingRenderContext = false
+        ..debugClearRenderReloadListeners();
     });
 
     tearDown(() {
       pc
         ..debugRebuildingRenderContext = false
+        ..debugNoVideoHealed = false
         ..debugNoVideoRebuilds = 0
         ..debugPlayerCount = 1
+        ..debugClearRenderReloadListeners()
         // `isBuffering` 的初值就是 true（`controller.dart:222`），还回原样。
-        ..isBuffering.value = true;
+        ..isBuffering.value = true
+        // openNoVideoGates 摆过、又不属于本 group 的字段，同样还回去。
+        ..isSeeking.value = false
+        ..onlyPlayAudio.value = false
+        ..isLive = false
+        ..position.value = 0;
     });
 
     /// 把 [_checkNoVideoTrack] 的六道门全部放开。
@@ -925,8 +942,19 @@ void main() {
       pc
         ..addRenderReloadListener(reload)
         ..debugPlayerCount = 2;
+      // 卸在 tearDown 而不是断言之后：断言抛了就轮不到它执行，集合会漏进后面的
+      // 用例（那边的日志会变成另一个理由，看起来像它自己的毛病）。
+      addTearDown(() => pc.removeRenderReloadListener(reload));
       expect(pc.debugRenderRebuildBlocker(), '播放器单例被 2 个页面共用');
-      pc.removeRenderReloadListener(reload);
+    });
+
+    test('已经在重建时不许重入：拆第二遍会让两个 Player 抢同一个 handle', () {
+      Future<void> reload() async {}
+      pc
+        ..addRenderReloadListener(reload)
+        ..debugRebuildingRenderContext = true;
+      addTearDown(() => pc.removeRenderReloadListener(reload));
+      expect(pc.debugRenderRebuildBlocker(), '已在重建');
     });
 
     test('额度用完先放弃，不再往下问别的条件', () {

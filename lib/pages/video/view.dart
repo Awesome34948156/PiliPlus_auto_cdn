@@ -180,10 +180,29 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     videoDetailController.queryVideoUrl(autoFullScreenFlag: true);
     if (videoDetailController.autoPlay) {
       plPlayerController = videoDetailController.plPlayerController;
-      plPlayerController!
-        ..addStatusLister(playerListener)
-        ..addPositionListener(positionListener);
+      _attachPlayerListeners();
     }
+  }
+
+  /// 认领播放器的四条路（开自动播放进详情页 / 起播回调 / 手点播放 / 从二级页返回）
+  /// 共用这一组监听，注销那两条（退出页面 / 被别的页面盖住）共用 [_detachPlayerListeners]。
+  ///
+  /// 拆开逐个写就会漏：P3 第一版只把 [_onRenderContextLost] 挂在 `handlePlay`（手点
+  /// 播放那条路）上，于是**开着"进入详情页自动播放"的用户永远不认领重载** ——
+  /// `_renderRebuildBlocker` 一直判"没有页面认领重载"，自愈失败后照旧黑屏。四条路
+  /// 上挂什么、卸什么，从此只有这一处说了算。
+  void _attachPlayerListeners() {
+    plPlayerController
+      ?..addStatusLister(playerListener)
+      ..addPositionListener(positionListener)
+      ..addRenderReloadListener(_onRenderContextLost);
+  }
+
+  void _detachPlayerListeners() {
+    plPlayerController
+      ?..removeStatusLister(playerListener)
+      ..removePositionListener(positionListener)
+      ..removeRenderReloadListener(_onRenderContextLost);
   }
 
   void positionListener(Duration position) {
@@ -214,9 +233,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
 
   Future<void>? playCallBack() {
     if (!isShowing) {
-      plPlayerController
-        ?..addStatusLister(playerListener)
-        ..addPositionListener(positionListener);
+      _attachPlayerListeners();
     }
     return plPlayerController?.play();
   }
@@ -321,10 +338,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     final plPlayerController = this.plPlayerController =
         videoDetailController.plPlayerController;
     videoDetailController.autoPlay = true;
-    plPlayerController
-      ..addStatusLister(playerListener)
-      ..addPositionListener(positionListener)
-      ..addRenderReloadListener(_onRenderContextLost);
+    _attachPlayerListeners();
     if (plPlayerController.preInitPlayer) {
       if (plPlayerController.autoEnterFullScreen) {
         plPlayerController.triggerFullScreen();
@@ -352,10 +366,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
 
   @override
   void dispose() {
-    plPlayerController
-      ?..removeStatusLister(playerListener)
-      ..removePositionListener(positionListener)
-      ..removeRenderReloadListener(_onRenderContextLost);
+    _detachPlayerListeners();
 
     Get.delete<HorizontalMemberPageController>(
       tag: videoDetailController.heroTag,
@@ -410,10 +421,11 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       ..brightness = plPlayerController?.brightness.value;
     if (plPlayerController != null) {
       videoDetailController.makeHeartBeat();
-      plPlayerController!
-        ..removeStatusLister(playerListener)
-        ..removePositionListener(positionListener)
-        ..pause();
+      // 被别的页面盖住时跟着 status/position 一起卸掉认领：[didPopNext] 返回时会连
+      // renderReload 一起重挂。少了这一步，被盖住的那段时间里重建会回调到看不见的
+      // 这一页上。
+      _detachPlayerListeners();
+      plPlayerController!.pause();
     }
   }
 
@@ -465,9 +477,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       }
     }
 
-    plPlayerController
-      ?..addStatusLister(playerListener)
-      ..addPositionListener(positionListener);
+    _attachPlayerListeners();
     if (videoDetailController.autoPlay) {
       videoDetailController.playerInit(
         autoplay: videoDetailController.playerStatus?.isPlaying ?? false,
