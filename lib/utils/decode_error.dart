@@ -6,20 +6,26 @@
 ///
 /// 这是换源型故障的**另一半**。另外几条 CDN 判据（位置冻结、缓冲饥饿、余量
 /// 失真）看的都是"喂不饱"；而镜像把**坏字节**喂进来时，吞吐、余量、位置、hwdec
-/// 全是健康的。2026-10-11 手机上的实测：一条 1080P AV1 流，余量 27s、位置一路
-/// 推进、`hwdec videotoolbox` 正常，同时 mpv 在刷 400+ 条解码报错，而画面冻在
-/// 最后一帧上（音频是另一条 EDL 源，照常播）。唯一看得见这件事的，就是解码器
-/// 自己的报错 —— 而当时的换源逻辑只测吞吐，于是判定"基线健康 —— 卡顿多半不在
-/// CDN"，然后放它过去。
+/// 全是健康的。2026-10-11 手机上的实测（档案 log 4）：一条 1080P AV1 流，余量
+/// 27s、位置一路推进、`hwdec videotoolbox` 正常，同时 mpv 在刷 **524 行**解码
+/// 报错、**横跨只有 44 毫秒**，而画面冻在最后一帧上（音频是另一条 EDL 源，照常播）。
+/// 唯一看得见这件事的，就是解码器自己的报错 —— 而当时的换源逻辑只测吞吐，于是
+/// 判定"基线健康 —— 卡顿多半不在 CDN"，然后放它过去。
 ///
 /// **只收解码层**的说法。网络层的 `tcp: ffurl_read returned` /
 /// `Stream ends prematurely` / `Failed to open https://` 是"没喂到"，另有
 /// `stream.error` 那条恢复路径管；把它们混进来，一次普通网络抖动就会触发换源。
 ///
-/// 每一条都取自实测日志，不是猜的：AV1 那一族来自上面那局的 `pili-console.log`
-/// （400+ 条，`av1: obu_forbidden_bit out of range` 之类），H.264 的两条来自同一
-/// 份日志里换集边界上的零星报错 —— 那种一两条就停，不该触发换源，所以判定门槛
-/// （`PlPlayerController._kDecodeErrorBurst`）卡在两者之间。
+/// 每一条都取自实测日志，不是猜的：AV1 那一族来自 2026-10-11 那局的
+/// `pili-console.log`（档案 log 4，`av1: obu_forbidden_bit out of range` 之类），
+/// H.264 的两条来自换集边界上的零星报错 —— 那种一两条就停，不该触发换源。
+///
+/// 判定门槛（`PlPlayerController._kDecodeErrorBurst` = 12 条 / 6 秒）数的是
+/// **去重后**的条数，不是原始行数 —— 两者的比由爆发有多密决定，**不是固定的
+/// 3:1**（去重按时间间隔合并，不是按"一个包报几层"）。实测依据（档案 log 4 /
+/// log 7，2026-10-12 复核）：log 4 的 524 行全挤在 44 毫秒里，去重后**只剩 9 条**
+/// （够不到 12）；log 7 的 58 行横跨 2.4 秒，去重后 6 秒窗内峰值 **17 条**（够得到，
+/// 余量 1.42×）。门槛正好卡在"换集边界 1~2 条"与"风暴十几条"中间。
 const List<String> kDecoderCorruptionSignatures = [
   // AV1：ffmpeg 自己的 parser（`av1:`，以及还没绑上解码器时的无前缀 `NULL:`）
   // 和 libdav1d 软解回退。硬解失败会掉到后者，所以两种前缀会交替出现。
@@ -82,7 +88,7 @@ bool isDecoderCorruptionLog(String text) {
 /// `av1: HW accel end frame fail.` **不收**：它们是**通用症状** —— 坏字节时也刷，
 /// 而 `PLPlayerController` 里那段 `video-reload` 的事故记录（见 `_healNoVideoTrack`
 /// 上方的注释）正是我们自己的重载弄出来的 92 行同类报错。收进来会在**真正的坏
-/// 字节风暴**里（那一族本该命中 400+ 条并换源）把动作从"换源"改成"重建解码器"，
+/// 字节风暴**里（那一族本该命中几百行并换源）把动作从"换源"改成"重建解码器"，
 /// 等于治错了病。
 const List<String> kDecoderSessionFailureSignatures = [
   // VideoToolbox 的 DecompressionSession 被系统作废。iOS 在 app 被挂起时会这么干；
