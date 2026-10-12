@@ -1899,7 +1899,10 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                   plPlayerController.playerStatus.isPlaying)) {
             return Center(
               child: GestureDetector(
-                onTap: plPlayerController.refreshPlayer,
+                onTap: () {
+                  debugPrint('缓冲遮罩被点: refreshPlayer @${plPlayerController.position.value}s');
+                  plPlayerController.refreshPlayer();
+                },
                 child: Container(
                   padding: const EdgeInsets.all(20),
                   decoration: const BoxDecoration(

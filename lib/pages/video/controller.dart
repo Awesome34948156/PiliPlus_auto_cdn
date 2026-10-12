@@ -724,6 +724,9 @@ class VideoDetailController extends GetxController
       audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
     }
 
+    debugPrint(
+      '换画质/音质: 重新装载（画质 ${currentVideoQa.code} 解码 ${currentDecodeFormats.name}）@${playedTime?.inSeconds}s',
+    );
     playerInit();
   }
 

@@ -516,12 +516,18 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
 
     _attachPlayerListeners();
     if (videoDetailController.autoPlay) {
+      debugPrint(
+        '视频页返回: 重新装载（autoplay=${videoDetailController.playerStatus?.isPlaying ?? false}）@${videoDetailController.playedTime?.inSeconds}s',
+      );
       videoDetailController.playerInit(
         autoplay: videoDetailController.playerStatus?.isPlaying ?? false,
       );
     } else if (videoDetailController.plPlayerController.preInitPlayer &&
         !videoDetailController.isQuerying &&
         videoDetailController.videoUrl != null) {
+      debugPrint(
+        '视频页返回: 重新装载（preInit，autoplay 取默认 ${videoDetailController.autoPlay}）@${videoDetailController.playedTime?.inSeconds}s',
+      );
       videoDetailController.playerInit();
     }
   }
