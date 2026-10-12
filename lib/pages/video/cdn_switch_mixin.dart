@@ -152,7 +152,13 @@ mixin CdnSwitchMixin on GetxController {
 
   PlPlayerController get plPlayerController;
 
-  Future<void> playerInit({bool? autoplay, bool autoFullScreenFlag = false});
+  /// [resumeAt] 是**显式**的起播点，只有 P3 就地重建会传（见
+  /// `utils/resume_seek.dart`）：它压过 [defaultST] / [playedTime]，但零值不算数。
+  Future<void> playerInit({
+    bool? autoplay,
+    bool autoFullScreenFlag = false,
+    Duration? resumeAt,
+  });
 
   // ---------------------------------------------------------------------------
   // 参数：改这些数字就是在改自动切换的性格。触发语义见上面的契约。

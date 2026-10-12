@@ -373,8 +373,25 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   /// 恒是 null，`?? false` 于是让每一次重建都把**在播**的视频恢复成暂停
   /// （log 13 两次实测：那 50 秒里四次正常装载都成对带 `pause=false`，唯独重建
   /// 那两次只有 `pause=true`）。
+  /// 续播点也得在这里交出去：页面自己重新推导（`defaultST ?? playedTime`）在重建
+  /// 这条路上推不出来 —— 重建时 `defaultST` 恒为 null（每次成功装载收尾都清它），
+  /// 落点只剩 `playedTime`，而它会被位置流钉成 0 或停在旧值。真机 log 14 三次重建里
+  /// 两次没带 `Setting option 'start'`，最惨倒退 474 秒。
+  /// 此刻 `position.value` 是可靠的：`_runRenderContextRebuild` 在请页面重载**之前**
+  /// 就 `_removeListeners()` 了，而写它的那条订阅正是被取消的那批 —— 值冻在拆之前
+  /// 最后一拍。下一个可能写它的地方是**下一次**装载的 `setDataSource`；`await
+  /// old.dispose()` 那段窗口没有闸门拦并发装载，但真在那几秒里换了集，读到的 0 也只会
+  /// 回落成旧行为，不会更差。
+  ///
+  /// ⚠️ 必须在**实参表达式**里读：参数求值早于 [playerInit] 函数体，而函数体一进去
+  /// 就会 `setDataSource`，那里会把 `position.value` 重写成新的 `seekTo`。
+  /// ⚠️ 精度是整秒（`position` 是 `RxInt`）。同一条位置事件里冻住的毫秒级
+  /// `playedTime` 也在手边，不用它是因为它不可靠（见上）—— 拿精度换了可靠。
   Future<void> _onRenderContextLost() => videoDetailController.playerInit(
     autoplay: videoDetailController.plPlayerController.playerStatus.isPlaying,
+    resumeAt: Duration(
+      seconds: videoDetailController.plPlayerController.position.value,
+    ),
   );
 
   @override

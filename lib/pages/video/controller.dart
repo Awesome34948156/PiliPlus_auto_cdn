@@ -61,6 +61,7 @@ import 'package:PiliPlus/utils/extension/num_ext.dart';
 import 'package:PiliPlus/utils/extension/size_ext.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
+import 'package:PiliPlus/utils/resume_seek.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/theme_utils.dart';
@@ -743,9 +744,21 @@ class VideoDetailController extends GetxController
   Future<void> playerInit({
     bool? autoplay,
     bool autoFullScreenFlag = false,
+    Duration? resumeAt,
   }) async {
-    Duration? seek = defaultST ?? playedTime;
-    if (seek == .zero) seek = null;
+    // [resumeAt] 只有 P3 就地重建那条路会传（`view.dart` 的
+    // `_onRenderContextLost`）：拆掉渲染上下文之前，播放器手里那个位置比页面
+    // 重新推导出来的可靠 —— log 14 里三次重建有一次从这里掉到 763s
+    // （倒退 474 秒），另一次掉到 0。零值语义、为什么不能写 `??`、
+    // 精度与"第 2 次重建救不了"都记在 [resolveResumeSeek] 的文档里。
+    Duration? seek = resolveResumeSeek(
+      resumeAt: resumeAt,
+      defaultST: defaultST,
+      playedTime: playedTime,
+    );
+    // 这一句**必须留在调用点**、靠 `??=` 短路：`getFirstSegment()` 有副作用
+    // （`_segmentList..sort()` + 弹 skip toast + 消费 `skipOnce` 片段），
+    // 当实参传进去会在"本来就该缓起播"的情况下也跑一遍 —— 那是行为回归。
     seek ??= getFirstSegment();
     await plPlayerController.setDataSource(
       isFileSource

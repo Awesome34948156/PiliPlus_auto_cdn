@@ -1239,6 +1239,9 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
   Future<void> playerInit({
     bool? autoplay,
     bool autoFullScreenFlag = false,
+    // 只是为了让 @override 对得上：这条路的 P3 重建测试里触发不到（拆 Player 要
+    // libmpv），续播点的推导改由纯函数 test/utils/resume_seek_test.dart 覆盖。
+    Duration? resumeAt,
   }) async {
     initCalls++;
     initAutoplay.add(autoplay);
