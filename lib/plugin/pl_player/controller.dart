@@ -1,4 +1,4 @@
-import 'dart:async' show StreamSubscription, Timer;
+import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:convert' show ascii, utf8;
 import 'dart:io' show Platform;
 import 'dart:math' show max, min;
@@ -122,6 +122,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   final RxInt duration = RxInt(0);
+
+  /// 渲染上下文（[Player] + [VideoController] + 原生 textureId）重建一次就 +1。
+  ///
+  /// 视频区那两个渲染节点靠它换 key 把自己的 State 也重建一遍：`SimpleVideo`
+  /// 与 `SubtitleView` 都**没有** `didUpdateWidget`，`_visible` 和 `stream.size` /
+  /// `stream.subtitle` 的订阅在 `initState` 里就绑死在**当时那个** player 上。
+  /// 光换 controller 对象而不重建 State，`_visible` 会停在旧值 false —— 画面
+  /// 永远不出来，等于没修。见 [_runRenderContextRebuild]。
+  final RxInt renderContextGen = RxInt(0);
 
   int durationInMilliseconds = 0;
 
@@ -384,6 +393,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 自愈最多钉几次尺寸。第一次 render 可能正好落在 mpv 拆完旧输出、新输出
   /// 还没建好的缝里，再推一次几乎不要钱（不 seek、不重载、不动位置）。
   static const int _kHealAttempts = 2;
+
+  /// 一种媒体最多就地重建几次渲染上下文。
+  ///
+  /// 与 [_kHealAttempts] 同源：第一次可能正好撞上 mpv 拆旧/建新的缝，第二次几乎
+  /// 不要钱；再多就是拿黑屏时间换递减的收益（每次重建 ≈ 旧 player dispose 2s +
+  /// 重载 1~3s）。用完之后回到老出路：用户手动退出视频页再进来。
+  static const int _kNoVideoRebuildMax = 2;
 
   /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
   static const double _kStarveMinSeconds = 4.0;
@@ -1169,6 +1185,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 换了媒体，「音频在、画面不在」的计数与自愈额度都重新来过。
     _noVideoProbes = 0;
     _noVideoHealed = false;
+    // 重建渲染上下文自己也要走这条路（见 [_runRenderContextRebuild]），别把自己
+    // 的额度一起清掉 —— 清了就是"探满 4 → 自愈失败 → 重建 → 探满 4 → …"的无限
+    // 重建。只有用户发起的装载（换集 / 换画质 / CDN 换源）才重新给额度。
+    if (!_rebuildingRenderContext) {
+      _noVideoRebuilds = 0;
+    }
 
     var player = _videoPlayerController;
 
@@ -1267,6 +1289,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   List<StreamSubscription>? _subscriptions;
   final Set<ValueChanged<Duration>> _positionListeners = {};
   final Set<ValueChanged<PlayerStatus>> _statusListeners = {};
+
+  /// 渲染上下文被拆掉后，能用**当前 URL** 把它重新建起来的页面。
+  ///
+  /// 空集本身就是一道安全阀：没有页面认领时 [_renderRebuildBlocker] 会拦住重建，
+  /// 否则拆掉的播放器没人再建起来，画面反而回不来了。
+  final Set<Future<void> Function()> _renderReloadListeners = {};
 
   Timer? _wakeLockTimer;
 
@@ -1515,6 +1543,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 自愈是否正在跑（里面有 await，采样回调可能重入）。
   bool _healingNoVideo = false;
 
+  /// 本媒体已经就地重建过几次渲染上下文。每换一次媒体在 [_createVideoController]
+  /// 里重置（但**绕开**自己那次重建，理由见那里）。见 [_kNoVideoRebuildMax]。
+  int _noVideoRebuilds = 0;
+
+  /// 渲染上下文正在拆旧重建（里面有 await，采样回调可能重入）。
+  ///
+  /// 它同时是 [renderContextGen] 的空窗信号：这段时间 [_videoController] 会是
+  /// null，视频区那几个节点要忍住别把播放器判成"该塌"。
+  bool _rebuildingRenderContext = false;
+
+  /// 见 [_rebuildingRenderContext]。
+  bool get rebuildingRenderContext => _rebuildingRenderContext;
+
   /// 读一个 mpv 属性，读不到就当空串。
   ///
   /// [NativePlayer.getProperty] 在 player 已 dispose 时会抛，而这里是定时器
@@ -1548,6 +1589,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         position.value <= 0 ||
         isSeeking.value ||
         _processing ||
+        // 重建期间 ticker 会被 _startListeners 重新挂上，而那时画面本来就还没
+        // 起来 —— 不放过的话会把自己刚做完的动作当成新的死锁再探一轮。
+        _rebuildingRenderContext ||
         isBuffering.value) {
       _noVideoProbes = 0;
       return;
@@ -1564,7 +1608,116 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     );
     if (!_noVideoHealed) {
       _noVideoHealed = true;
-      _healNoVideoTrack();
+      // 链在 Future **之后**升级，不能写进 [_healNoVideoTrack] 的失败分支里：
+      // 那里仍在 try 内，finally 的 unpin() 会 setSize 打在已经拆掉的
+      // controller 上。这里保证升级发生在自愈彻底收尾之后。
+      unawaited(_healNoVideoTrack().then((ok) {
+        if (!ok) _rebuildRenderContextOnNoVideo();
+      }));
+      return;
+    }
+    // 本媒体已经钉过尺寸、画面还是没起来 —— 升级到重建渲染上下文（受额度限制）。
+    _rebuildRenderContextOnNoVideo();
+  }
+
+  /// 现在能不能就地重建渲染上下文；不能就返回原因（给日志和测试用）。
+  ///
+  /// 「单例被几个页面共用」与「有没有页面认领重载」这两条是**安全阀**，不是优化：
+  /// 直播间也 `getInstance()`，单例被两个页面共用时拆掉它会把另一页的播放一起
+  /// 掀掉；没有页面认领时拆掉就没人再把它建起来。这两种情况都宁可退化成老出路
+  /// （用户手动退出视频页再进来），也不能在这里动手。
+  String? _renderRebuildBlocker() {
+    if (_rebuildingRenderContext) {
+      return '已在重建';
+    }
+    if (_noVideoRebuilds >= _kNoVideoRebuildMax) {
+      return '本媒体已重建 $_noVideoRebuilds 次';
+    }
+    if (_playerCount != 1) {
+      return '播放器单例被 $_playerCount 个页面共用';
+    }
+    if (_renderReloadListeners.isEmpty) {
+      return '没有页面认领重载';
+    }
+    if (_videoPlayerController == null) {
+      return '播放器不存在';
+    }
+    if (_processing) {
+      return '换源/换集在途';
+    }
+    return null;
+  }
+
+  void _rebuildRenderContextOnNoVideo() {
+    if (_renderRebuildBlocker() case final reason?) {
+      debugPrint('就地重建: 跳过（$reason）');
+      return;
+    }
+    unawaited(_runRenderContextRebuild());
+  }
+
+  // ---- 测试缝（照 debugSampleStarve 的写法：判据本身只看公开/可直接摆的字段）----
+
+  @visibleForTesting
+  String? debugRenderRebuildBlocker() => _renderRebuildBlocker();
+
+  @visibleForTesting
+  int get debugNoVideoRebuilds => _noVideoRebuilds;
+
+  @visibleForTesting
+  set debugNoVideoRebuilds(int value) => _noVideoRebuilds = value;
+
+  /// 测试里 `getInstance()` 每次进 setUp 都会 +1，跨用例只增不减，摆不成"恰好
+  /// 一个页面持有单例"这个前提。
+  @visibleForTesting
+  set debugPlayerCount(int value) => _playerCount = value;
+
+  @visibleForTesting
+  set debugRebuildingRenderContext(bool value) => _rebuildingRenderContext = value;
+
+  @visibleForTesting
+  void debugCheckNoVideoTrack() => _checkNoVideoTrack();
+
+  /// 就地重建渲染上下文 —— "退出视频页再进来"的页内等价物。
+  ///
+  /// 只做一件事：把旧 [Player] 拆干净（它会连带 `VideoOutputManager.Dispose` +
+  /// `unregisterTexture`），然后请页面用**当前 URL** 重跑一次它自己的装载路径。
+  /// 库里不自己重拼一遍 `player.open` —— 那要手抄"退出再进"做过的每一件事
+  /// （`onInit` 恢复字幕、seek 回 `playedTime`、按播放态决定起不起播、倍速、
+  /// volume、shader…），漏一件就是一个新 bug。页面那边本来就有这条路
+  /// （`didPopNext` 里那句 `playerInit(autoplay: playerStatus.isPlaying)`）。
+  Future<void> _runRenderContextRebuild() async {
+    _rebuildingRenderContext = true;
+    _noVideoRebuilds++;
+    debugPrint('就地重建: 开始（第 $_noVideoRebuilds/$_kNoVideoRebuildMax 次）');
+    try {
+      // 次序不可换：_removeListeners 先跑（取消 ticker + 把 _subscriptions 置
+      // null，否则 _startListeners 的 assert 会炸、旧订阅也会泄漏），两个字段
+      // 都置空后 _initPlayer 的两条 assert 才成立。旧 player 必须 await 掉 ——
+      // 它的 release 里在跑 VideoOutputManager.Dispose + unregisterTexture，
+      // 不等就建新输出会让两个 VideoOutput 抢同一个 handle。
+      _removeListeners();
+      final old = _videoPlayerController!;
+      _videoPlayerController = null;
+      _videoController = null;
+      await old.dispose();
+      _noVideoProbes = 0;
+      if (_playerCount == 0) {
+        return;
+      }
+      // 请页面重载。用户在这段 await 里自己换了集也无妨：页面那次 playerInit
+      // 会先建成新 player，我们这轮再 playerInit 只是把它重新 open 一遍
+      // （_createVideoController 见 player != null 就复用），不会出现两个 Player。
+      for (final reload in _renderReloadListeners.toList()) {
+        await reload();
+      }
+      if (_videoController != null) {
+        renderContextGen.value++;
+      }
+    } finally {
+      _rebuildingRenderContext = false;
+      _noVideoProbes = 0;
+      _resetStallWatchdog();
     }
   }
 
@@ -1588,11 +1741,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 就能让 mpv 把视频输出配上，随后立刻把尺寸交还 mpv 自己算。
   ///
   /// 5484 那次线上验证把另外两级砍掉了，它们不修病、只伤身（详情见下面）。
-  /// 全败也不算白跑：日志会记下放弃，用户手动退出视频页再进来仍然能恢复 ——
-  /// 那会新建渲染上下文，是这个死锁的另一条出路。
-  Future<void> _healNoVideoTrack() async {
+  /// 返回值 = 画面是否真的起来了。false —— 包括"压根没有 player 可钉" —— 由
+  /// [_checkNoVideoTrack] 接着升级到 [_runRenderContextRebuild] 就地重建渲染
+  /// 上下文（"用户手动退出视频页再进来"的页内等价物）。两级都用完才真的放弃。
+  Future<bool> _healNoVideoTrack() async {
     if (_videoPlayerController == null || _healingNoVideo) {
-      return;
+      return false;
     }
     _healingNoVideo = true;
     final (w, h) = _nudgeSize;
@@ -1621,7 +1775,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         await Future.delayed(_kHealWait);
         if (_hasVideoTrack) {
           debugPrint('无视频轨自愈成功: 钉住输出尺寸（第 $attempt 次）');
-          return;
+          return true;
         }
         // 先交还再重来：第一次 render 可能正好落在 mpv 拆完旧输出、新输出
         // 还没建好的缝里。重来一次不 seek、不重载、不动位置，几乎不要钱。
@@ -1629,11 +1783,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 否则同一个 setSize(null) 会白发两遍，多一次 render 往返。
         if (attempt < _kHealAttempts) await unpin();
       }
-      debugPrint('无视频轨自愈失败: 钉住尺寸没能让视频输出起来，退出视频页再进来可恢复');
+      debugPrint('无视频轨自愈失败: 钉住尺寸没能让视频输出起来，交给就地重建');
     } finally {
       await unpin();
       _healingNoVideo = false;
     }
+    return false;
   }
 
   /// 钉尺寸用的尺寸。
@@ -2076,6 +2231,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   Future<void> seek(Duration position, {bool isSeek = false}) async {
+    // 重建窗口内旧的 player 已经拆了、新的还没接上，这时候的 seek 只会打空或者
+    // 打到正在拆的对象上。页面的重载路径自己会把位置带回来（seekTo: playedTime）。
+    if (_rebuildingRenderContext) {
+      return;
+    }
     if (isSeek) {
       /// 拖动进度条调节时，不等待第一帧，防止抖动
       await _videoPlayerController?.stream.buffer.first;
@@ -2456,6 +2616,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void removeStatusLister(ValueChanged<PlayerStatus> listener) =>
       _statusListeners.remove(listener);
 
+  /// 认领"渲染上下文没了就重载一次"。见 [_renderReloadListeners]。
+  void addRenderReloadListener(Future<void> Function() listener) {
+    if (_playerCount == 0) return;
+    _renderReloadListeners.add(listener);
+  }
+
+  void removeRenderReloadListener(Future<void> Function() listener) =>
+      _renderReloadListeners.remove(listener);
+
   // 记录播放记录
   Future<void>? makeHeartBeat(
     int progress, {
@@ -2594,6 +2763,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _removeListeners();
     _positionListeners.clear();
     _statusListeners.clear();
+    _renderReloadListeners.clear();
     _stopWakeLockTimer();
     WakelockPlus.disable();
     if (kDebugMode) {

@@ -860,11 +860,131 @@ void main() {
     pc.debugSampleStarve(at(48));
     expect(reports, 4, reason: '新一段里越过 20s 没补报：\n${log.text}');
   });
+
+  // 「无视频轨」自愈失败后的就地重建（P3）。这里能测的只有**判据**：真正拆
+  // `Player`、重建渲染上下文、请页面重载那一段全都要真 libmpv（测试进程里
+  // `_videoPlayerController` 恒为 null，`_kNoVideoProbes` 探满之后
+  // `_healNoVideoTrack` 第一句就 return false），所以断言落在"闸门说了什么"和
+  // "失败之后有没有去叩那道门"上。两者都是这次新增的代码路径，去掉修复即红。
+  group('无视频轨自愈失败 → 就地重建渲染上下文', () {
+    late PlPlayerController pc;
+
+    setUp(() {
+      pc = PlPlayerController.getInstance()
+        // setUp 每次都 `getInstance()`，`_playerCount` 跨用例只增不减，摆不成
+        // "恰好一个页面持有单例"这个前提。
+        ..debugPlayerCount = 1
+        ..debugNoVideoRebuilds = 0;
+    });
+
+    tearDown(() {
+      pc
+        ..debugRebuildingRenderContext = false
+        ..debugNoVideoRebuilds = 0
+        ..debugPlayerCount = 1
+        // `isBuffering` 的初值就是 true（`controller.dart:222`），还回原样。
+        ..isBuffering.value = true;
+    });
+
+    /// 把 [_checkNoVideoTrack] 的六道门全部放开。
+    ///
+    /// 必须显式摆一遍，不能靠默认值：单例跨用例存活，而这些标志位上一批用例
+    /// 早就动过了 —— 尤其 `isBuffering` **初值就是 true**，光看代码会以为它默认
+    /// 是关的。第一版就是栽在这上面：一条日志都没打出来。
+    void openNoVideoGates() {
+      pc
+        ..position.value = 100
+        ..isBuffering.value = false
+        ..isSeeking.value = false
+        ..onlyPlayAudio.value = false
+        ..isLive = false
+        ..debugPlayerCount = 1;
+    }
+
+    test('没有页面认领重载就不许重建：拆了没人把它建回来', () {
+      expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
+    });
+
+    test('认领之后这一条让开，轮到下一道闸门（否定不是空的）', () {
+      Future<void> reload() async {}
+      expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
+
+      pc.addRenderReloadListener(reload);
+      expect(
+        pc.debugRenderRebuildBlocker(),
+        '播放器不存在',
+        reason: '认领了就该放过"没人认领"，在测试进程里停在下一条：没有真 Player',
+      );
+
+      pc.removeRenderReloadListener(reload);
+      expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
+    });
+
+    test('单例被两个页面共用时不重建：会把另一页的播放一起掀掉', () {
+      Future<void> reload() async {}
+      pc
+        ..addRenderReloadListener(reload)
+        ..debugPlayerCount = 2;
+      expect(pc.debugRenderRebuildBlocker(), '播放器单例被 2 个页面共用');
+      pc.removeRenderReloadListener(reload);
+    });
+
+    test('额度用完先放弃，不再往下问别的条件', () {
+      // 有意**不**认领重载、也不把页面数摆成 1：额度这一条必须排在它们前面，
+      // 否则额度用完时还会一路问下去，最后落在别的理由上、放弃得不明不白。
+      pc
+        ..debugPlayerCount = 3
+        ..debugNoVideoRebuilds = _kNoVideoRebuildMaxExpect;
+      expect(pc.debugRenderRebuildBlocker(), '本媒体已重建 2 次');
+    });
+
+    test('探满死锁 → 自愈失败（没有 Player）→ 升级去叩重建那道门', () async {
+      openNoVideoGates();
+      expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
+
+      for (var i = 0; i < _kNoVideoProbesExpect; i++) {
+        pc.debugCheckNoVideoTrack();
+      }
+      // `_healNoVideoTrack().then(...)` 是一次微任务，让它落地。
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+        log.has('无视频轨: 音频正常但画面始终为空'),
+        isTrue,
+        reason: '探满 $_kNoVideoProbesExpect 次就该报现场：\n${log.text}',
+      );
+      expect(
+        log.has('就地重建: 跳过（没有页面认领重载）'),
+        isTrue,
+        reason: '自愈失败之后没有去叩重建那道门：\n${log.text}',
+      );
+    });
+
+    test('重建窗口里不许把自己刚做的动作当成新的死锁再探（红测）', () {
+      // 上一条是这条的对照组：同样的门、同样的探数，唯一的差别是窗口标志。
+      // 没有那一句开门的辅助，这条会**假绿** —— 门本来就关着，什么都不设也过。
+      openNoVideoGates();
+      pc.debugRebuildingRenderContext = true;
+      for (var i = 0; i < _kNoVideoProbesExpect + 2; i++) {
+        pc.debugCheckNoVideoTrack();
+      }
+      expect(
+        log.has('无视频轨:'),
+        isFalse,
+        reason: '重建期间画面本来就还没起来，不该把这个当成新的死锁：\n${log.text}',
+      );
+    });
+  });
 }
 
 /// 判据 3 的连续采样拍数（`controller.dart:_kStarveSeconds`）。只用在失败原因里，
 /// 别跟着生产常量一起改。
 const _kStarveSecondsExpect = 4;
+
+/// 「无视频轨」连空几探才动手（`controller.dart:_kNoVideoProbes`）与重建上限
+/// （`controller.dart:_kNoVideoRebuildMax`）。同上：只用在断言里。
+const _kNoVideoProbesExpect = 4;
+const _kNoVideoRebuildMaxExpect = 2;
 
 /// 把触发打进播放器上报口 —— 这就是真实的机制（页面不直接调 mixin 的私有方法）。
 ///

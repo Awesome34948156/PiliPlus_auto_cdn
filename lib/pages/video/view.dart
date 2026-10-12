@@ -323,7 +323,8 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     videoDetailController.autoPlay = true;
     plPlayerController
       ..addStatusLister(playerListener)
-      ..addPositionListener(positionListener);
+      ..addPositionListener(positionListener)
+      ..addRenderReloadListener(_onRenderContextLost);
     if (plPlayerController.preInitPlayer) {
       if (plPlayerController.autoEnterFullScreen) {
         plPlayerController.triggerFullScreen();
@@ -337,11 +338,24 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     }
   }
 
+  /// 播放器把渲染上下文拆掉了（"无视频轨"自愈失败后的就地重建），用**当前
+  /// URL** 重走一次装载把它建回来。
+  ///
+  /// 与 [didPopNext] 里那句 `playerInit(autoplay: playerStatus.isPlaying)` 同一招：
+  /// 位置、倍速、音量、字幕、起不起播全都沿用页面已有的状态，播放器那边不用
+  /// 重拼一遍 `player.open`。暂停意图靠 `autoplay` 传当前播放态保住 —— 拆的时候
+  /// 已经先 `_removeListeners()`，`playerStatus` 冻结在拆之前的值，所以这里读到的
+  /// 正是用户原本的意图。
+  Future<void> _onRenderContextLost() => videoDetailController.playerInit(
+    autoplay: videoDetailController.playerStatus?.isPlaying ?? false,
+  );
+
   @override
   void dispose() {
     plPlayerController
       ?..removeStatusLister(playerListener)
-      ..removePositionListener(positionListener);
+      ..removePositionListener(positionListener)
+      ..removeRenderReloadListener(_onRenderContextLost);
 
     Get.delete<HorizontalMemberPageController>(
       tag: videoDetailController.heroTag,
@@ -1229,7 +1243,12 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       () =>
           !videoDetailController.videoState.value ||
               !videoDetailController.autoPlay ||
-              plPlayerController?.videoController == null
+              // 这个 Obx 只在 videoState / autoPlay 变化时重算，而重建渲染上下文
+              // 恰好会短暂出现 videoController == null。那一下要放过：真判成"该塌"
+              // 就会把整个播放器卸载，而 onInit 只是把 videoState 再设成 true
+              // （值没变 → 不发通知），塌了就再也回不来。
+              (plPlayerController?.videoController == null &&
+                  plPlayerController?.rebuildingRenderContext != true)
           ? const SizedBox.shrink()
           : PLVideoPlayer(
               maxWidth: width,

@@ -131,7 +131,6 @@ class PLVideoPlayer extends StatefulWidget {
 class _PLVideoPlayerState extends State<PLVideoPlayer>
     with WidgetsBindingObserver, TickerProviderStateMixin {
   late AnimationController _animationController;
-  late VideoController videoController;
   late final CommonIntroController introController = widget.introController!;
   late final VideoDetailController videoDetailController =
       widget.videoDetailController!;
@@ -265,7 +264,6 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
       vsync: this,
       duration: const Duration(milliseconds: 100),
     );
-    videoController = plPlayerController.videoController!;
 
     if (PlatformUtils.isMobile) {
       Future.microtask(() {
@@ -1374,12 +1372,25 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             child: IgnorePointer(
               ignoring: !plPlayerController.enableDragSubtitle,
               child: Obx(
-                () => SubtitleView(
-                  controller: videoController,
-                  configuration: plPlayerController.subtitleConfig.value,
-                  enableDragSubtitle: plPlayerController.enableDragSubtitle,
-                  onUpdatePadding: plPlayerController.onUpdatePadding,
-                ),
+                () {
+                  // 这行必须在空安全提前返回**之前**：Obx 的依赖是在构建期按
+                  // 实际读到的 Rx 登记的，走了没有读它的分支就等于没登记 —— 那
+                  // 之后 gen 再变也不会重跑，画面永远回不来。
+                  final gen = plPlayerController.renderContextGen.value;
+                  final ctr = plPlayerController.videoController;
+                  // 重建渲染上下文的那一小段窗口里 videoController 是 null；先不建。
+                  if (ctr == null) return const SizedBox.shrink();
+                  return SubtitleView(
+                    // key 既是"重建 State"的扳机，也是上面那次依赖读的用处 ——
+                    // SubtitleView 的 didUpdateWidget 不重绑 stream.subtitle，
+                    // 光换 controller 对象它还会听着旧 player。
+                    key: ValueKey(gen),
+                    controller: ctr,
+                    configuration: plPlayerController.subtitleConfig.value,
+                    enableDragSubtitle: plPlayerController.enableDragSubtitle,
+                    onUpdatePadding: plPlayerController.onUpdatePadding,
+                  );
+                },
               ),
             ),
           ),
@@ -2047,6 +2058,12 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             child: Obx(
               () {
                 final videoFit = plPlayerController.videoFit.value;
+                // 必须在空安全提前返回**之前**读（见 SubtitleView 那处的说明）：
+                // 走了没读它的分支就等于没登记依赖，之后 gen 再变也不会重跑。
+                final gen = plPlayerController.renderContextGen.value;
+                // 重建渲染上下文的那一小段窗口里 videoController 是 null；先不建。
+                final ctr = plPlayerController.videoController;
+                if (ctr == null) return const SizedBox.shrink();
                 return Transform.flip(
                   flipX: plPlayerController.flipX.value,
                   flipY: plPlayerController.flipY.value,
@@ -2054,7 +2071,11 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                     fit: videoFit.boxFit,
                     alignment: widget.alignment,
                     child: SimpleVideo(
-                      controller: plPlayerController.videoController!,
+                      // 见 SubtitleView 那处：SimpleVideoState 的 _visible 和它
+                      // 绑的 stream.size 订阅都在 initState 里定死，不换 key 的话
+                      // 换了 controller 它还会永久停在"看不见"。
+                      key: ValueKey(gen),
+                      controller: ctr,
                       fill: widget.fill,
                       aspectRatio: videoFit.aspectRatio,
                     ),
