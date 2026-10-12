@@ -254,7 +254,13 @@ abstract final class LocalCacheKey {
       timeStamp = 'timeStamp',
       cdnMirrorRotation = 'cdnMirrorRotation',
       cdnSpeedRecord = 'cdnSpeedRecordV3',
-      buvid = 'buvid';
+      buvid = 'buvid',
+      /// iCloud 日志同步那个文件夹的 security-scoped bookmark（`Uint8List`）。
+      ///
+      /// 放 localCache 而**不是** setting box：`GStorage.exportAllSettings()`
+      /// 只导出 setting + video，bookmark 跟着导出到别的设备就是个死 token
+      /// （它绑的是这台机器上这个 app 的沙箱）。
+      iCloudLogBookmark = 'iCloudLogBookmark';
 }
 
 abstract final class VideoBoxKey {

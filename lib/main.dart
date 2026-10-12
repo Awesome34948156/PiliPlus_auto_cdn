@@ -23,6 +23,7 @@ import 'package:PiliPlus/utils/device_utils.dart';
 import 'package:PiliPlus/utils/extension/core_palettes_ext.dart';
 import 'package:PiliPlus/utils/extension/theme_ext.dart';
 import 'package:PiliPlus/utils/font_utils.dart';
+import 'package:PiliPlus/utils/ios/icloud_log_sync.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/json_file_handler.dart';
 import 'package:PiliPlus/utils/max_screen_size.dart';
@@ -124,6 +125,9 @@ void main() async {
       if (Pref.horizontalScreen) ?fullMode() else ?portraitUpMode(),
       setupServiceLocator(),
       if (Platform.isIOS) IOSPipHelper.init(),
+      // 必须排在 `GStorage.init()`（上面）之后 —— 书签存在 Hive 里；
+      // 也排在 `_initAppPath()` 之后 —— 快照文件要落在应用支持目录。
+      if (Platform.isIOS) ICloudLogSync.init(),
     ]);
   } else if (Platform.isWindows) {
     if (await WebViewEnvironment.getAvailableVersion() != null) {

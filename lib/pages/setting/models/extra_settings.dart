@@ -29,6 +29,7 @@ import 'package:PiliPlus/pages/setting/models/model.dart';
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/pages/setting/widgets/slider_dialog.dart';
 import 'package:PiliPlus/pages/video/reply/widgets/reply_item_grpc.dart';
+import 'package:PiliPlus/services/console_log.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
@@ -37,8 +38,10 @@ import 'package:PiliPlus/utils/feed_back.dart';
 import 'package:PiliPlus/utils/filtering_text.dart';
 import 'package:PiliPlus/utils/global_data.dart';
 import 'package:PiliPlus/utils/image_utils.dart';
+import 'package:PiliPlus/utils/ios/icloud_log_sync.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
+import 'package:PiliPlus/utils/share_utils.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
@@ -52,6 +55,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:material_design_icons_flutter/material_design_icons_flutter.dart';
 import 'package:material_ui/material_ui.dart' hide RefreshIndicator;
+import 'package:share_plus/share_plus.dart';
 
 List<SettingsModel> get extraSettings => [
   if (PlatformUtils.isDesktop) ...[
@@ -80,6 +84,25 @@ List<SettingsModel> get extraSettings => [
       setKey: SettingBoxKey.enableDocProvider,
       defaultVal: Pref.enableDocProvider,
       onChanged: AndroidHelper.updateDocProvider,
+    ),
+  // 没有开关位：「绑定了一个文件夹」就是开启，「取消绑定」就是关闭 ——
+  // 少一个状态就少一处能不一致的地方。
+  if (Platform.isIOS && ICloudLogSync.isAvailable)
+    NormalModel(
+      title: 'iCloud 日志同步',
+      getSubtitle: () {
+        if (ICloudLogSync.folderName case final name?) {
+          final synced = ICloudLogSync.lastSyncedAt;
+          if (synced == null) return '$name · 尚未同步';
+          return '$name · 上次同步 '
+              '${synced.hour.toString().padLeft(2, '0')}:'
+              '${synced.minute.toString().padLeft(2, '0')}:'
+              '${synced.second.toString().padLeft(2, '0')}';
+        }
+        return ICloudLogSync.lastError == null ? '未设置' : '未设置（上次失败）';
+      },
+      leading: const Icon(Icons.cloud_upload_outlined),
+      onTap: _showICloudLogDialog,
     ),
   SplitModel(
     normalModel: const NormalModel.split(
@@ -784,6 +807,81 @@ void _showDownPathDialog(BuildContext context, VoidCallback setState) {
           },
           child: const Text('设置新路径', style: TextStyle(fontSize: 14)),
         ),
+      ],
+    ),
+  );
+}
+
+/// iCloud 日志同步。四个动作都在这一层，没有二级页面 —— 绑定状态本身就是开关。
+///
+/// 「分享日志」是兜底：书签一旦失效（文件夹被改名/移走），自动那条路就断了，
+/// 这时至少还能把文件手动导出去。它读的是**本地**那份 `pili-console.log`，
+/// 不依赖任何权限。
+void _showICloudLogDialog(BuildContext context, VoidCallback setState) {
+  showDialog(
+    context: context,
+    builder: (context) => SimpleDialog(
+      clipBehavior: Clip.hardEdge,
+      contentPadding: const EdgeInsets.symmetric(vertical: 12),
+      children: [
+        DialogOption(
+          onPressed: () async {
+            Get.back();
+            final ok = await ICloudLogSync.pickFolder();
+            setState();
+            if (ok) {
+              SmartDialog.showToast('已绑定，日志每分钟同步一次');
+            } else if (ICloudLogSync.lastError case final msg?) {
+              // 选了文件夹却什么都没发生 = 最让人摸不着头脑的一种失败。
+              // 用 lastError 非空把**失败**和**用户取消**分开（pickFolder
+              // 进去时先清空）。
+              SmartDialog.showToast(msg);
+            }
+          },
+          child: Text(
+            ICloudLogSync.isConfigured ? '更换文件夹' : '选择 iCloud Drive 文件夹',
+          ),
+        ),
+        if (ICloudLogSync.isConfigured)
+          DialogOption(
+            onPressed: () {
+              Get.back();
+              ICloudLogSync.syncNow();
+              // 同步是异步的，这里只是给个"按下去了"的反馈；真实时刻看副标题。
+              SmartDialog.showToast('已请求同步，稍后看文件夹');
+            },
+            child: const Text('立即同步', style: TextStyle(fontSize: 14)),
+          ),
+        DialogOption(
+          onPressed: () async {
+            Get.back();
+            final file = consoleLogFile;
+            if (file == null || !file.existsSync()) {
+              SmartDialog.showToast('当前没有日志文件');
+              return;
+            }
+            // 分享的是**本地**那份，所以先冲一次缓冲，别漏掉最后 2 秒。
+            await flushConsoleLog();
+            await SharePlus.instance.share(
+              ShareParams(
+                files: [XFile(file.path)],
+                // iPad 上不给位置会崩，见 share_utils.dart
+                sharePositionOrigin: await ShareUtils.sharePositionOrigin,
+              ),
+            );
+          },
+          child: const Text('分享日志文件', style: TextStyle(fontSize: 14)),
+        ),
+        if (ICloudLogSync.isConfigured)
+          DialogOption(
+            onPressed: () async {
+              Get.back();
+              await ICloudLogSync.unbind();
+              setState();
+              SmartDialog.showToast('已取消绑定，日志不再上传');
+            },
+            child: const Text('取消绑定', style: TextStyle(fontSize: 14)),
+          ),
       ],
     ),
   );

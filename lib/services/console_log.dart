@@ -71,6 +71,23 @@ Future<void> _queue = Future.value();
 /// 攒着还没写进文件的字节数，用来判上限。
 int _bytesWritten = 0;
 
+/// 把日志送出这个沙盒的钩子（现在只有 iCloud，见
+/// `lib/utils/ios/icloud_log_sync.dart`）。传进来的路径是一份**快照**。
+///
+/// 这个模块**刻意不知道** iCloud 的存在：钩子可空、可换，测试里换成假的就能
+/// 把「什么时候快照、快照给了谁」全测出来，不用碰 method channel。
+Future<void> Function(String stagingPath)? _syncHook;
+
+/// 快照文件的落点。由 [setConsoleLogSyncHook] 一并给出。
+///
+/// 放**应用支持目录**而不是文档目录：文档目录被 Info.plist 的
+/// `UIFileSharingEnabled` 暴露给「文件」App，在那儿多一个中间文件很难看。
+String? _stagingPath;
+
+/// 上一次同步出去的那份内容。用 (大小, 修改时刻) 当指纹 —— 见 [_snapshotStep]。
+int _syncedSize = -1;
+DateTime? _syncedModified;
+
 /// 上限，生产恒为 [_kMaxBytes]；测试可调小，见 [setConsoleLogMaxBytesForTest]。
 int _maxBytes = _kMaxBytes;
 
@@ -82,6 +99,12 @@ final List<String> _pendingLines = [];
 /// mpv 把话全说出来（见 pl_player/controller.dart 的 `logLevel` 与
 /// `stream.log`）。文件打不开时退回原来的安静档，别白白刷屏。
 bool get consoleLogActive => _sink != null;
+
+/// 日志文件本身。装不上（或还没装）时为 `null`。
+///
+/// 给同步器之外的调用方用 —— 现在只有设置页那个「分享日志」：书签一旦失效，
+/// 得能让用户自己把文件手动导出去。
+File? get consoleLogFile => _consoleLogFile;
 
 /// 给一行日志盖上 `HH:mm:ss.SSS`。
 ///
@@ -184,10 +207,106 @@ Future<void> _write(String text) async {
   }
 }
 
+/// 装上把日志送出沙盒的钩子。[onSnapshot] 拿到的是一份**快照文件**的路径。
+///
+/// [stagingPath] 放应用支持目录（`getApplicationSupportDirectory()`），别放
+/// 文档目录。钩子被调时**已经离开 [_queue]**，所以它可以慢。
+///
+/// **钩子抛异常是有意义的**：那表示这次没送出去，于是内容指纹不提交、下一次
+/// 请求会拿同一份内容重试。抛出来不会毒化 [_queue]（调用点自己包了 try），
+/// 也不会有未捕获异常。
+///
+/// 传 `null` 就卸载（没绑定文件夹时别白拷一份 8 MiB）。
+void setConsoleLogSyncHook(
+  Future<void> Function(String stagingPath)? onSnapshot, {
+  String? stagingPath,
+}) {
+  _syncHook = onSnapshot;
+  _stagingPath = stagingPath;
+}
+
+/// 请求把当前日志同步出去一次。即发即忘，随意调 —— 内容没变时会被指纹挡掉。
+void requestConsoleLogSync() {
+  _queue = _queue.then((_) => _snapshotStep());
+}
+
+/// 队列上的一步：推缓冲 → 快照到 staging → 调钩子。
+///
+/// ⚠️ **绝不能走 [_enqueue]** —— 那个函数会把传进去的东西**当成日志行写进
+/// 文件**（`_queue.then((_) => _write(text))`），拿它排一个非文本的动作等于往
+/// 日志里塞垃圾、还会把 [_bytesWritten] 算错。
+///
+/// ⚠️ **必须自己吞掉所有异常。** [_queue] 是裸的 `.then` 链，没有 `onError`；
+/// 从这一步漏出去一个异常，`_queue` 就变成一个失败的 future，**之后每一行日志
+/// 静默消失** —— 正是这个模块存在的理由被打掉。所以整个函数体包在 try 里，
+/// 而且只有"确认失败"才 return，成功路径不留尾巴。
+Future<void> _snapshotStep() async {
+  final hook = _syncHook;
+  final file = _consoleLogFile;
+  final staging = _stagingPath;
+  if (hook == null || file == null || staging == null) return;
+  final int size;
+  final DateTime modified;
+  try {
+    // 先推缓冲：否则快照会漏掉攒在内存里的那最多 2 秒的行。
+    await _flushStep();
+    // statSync 而不是 await file.stat()：本地小文件的一次 stat 是微秒级，
+    // 而这一步本来就排在写入队列上做文件 IO，没有理由为它多绕一次事件循环。
+    final stat = file.statSync();
+    // 内容没变就不传。开了「详细播放日志」时文件能涨到 8 MiB，一分钟一份会把
+    // iCloud 的版本历史搅翻，而系统那条上传通道也不是白给的。
+    if (stat.size == _syncedSize && stat.modified == _syncedModified) return;
+    // 在队列上拷贝 —— 不拷的话 Swift 那边要重读 `pili-console.log`，而它随时
+    // 可能被 [_rotate] 截断，读到的会是空文件。
+    await file.copy(staging);
+    size = stat.size;
+    modified = stat.modified;
+  } catch (_) {
+    return;
+  }
+  // 到这里就离开串行链了：跨语言调 native 可能要几百毫秒到几秒，压在队列上
+  // 等于让 [debugPrint] 排队。异常在这里也不会漏回 [_queue]。
+  _hookInFlight = () async {
+    try {
+      await hook(staging);
+    } catch (_) {
+      // **不提交指纹**：这次没送出去，下一次请求要拿同一份内容重试。
+      // 提交了的话，一次瞬时失败（FileProvider 忙、正在退到后台）会让这份
+      // 内容此后永远"看起来已同步"，日志停在那一刻。
+      return;
+    }
+    // 只有真的送出去了才记。同步器自己会记状态跳变。
+    //
+    // 还得让**更新的那份**说了算：两次快照可以同时在飞（第一次还在传，
+    // 第二次已经拷好了 —— 排队的那一步只看 [_queue]，而钩子跑在它外面），
+    // 而它们完成的先后**不保证**等于开始的先后。没有这一句，先飞的那次
+    // 晚回来会拿自己那份更旧的指纹把新的盖掉，于是同一份内容被反复重传
+    // （实测：46 字节那份刚提交，紧接着被 23 字节那份顶掉）。
+    final committed = _syncedModified;
+    if (committed != null && !modified.isAfter(committed)) return;
+    _syncedSize = size;
+    _syncedModified = modified;
+  }();
+  unawaited(_hookInFlight);
+}
+
+/// 最近一次钩子调用的完成时刻。只为 [syncConsoleLogForTest] 能等它 ——
+/// 钩子跑在 [_queue] 之外，光等队列跑空是等不到它的。
+Future<void> _hookInFlight = Future.value();
+
 /// 排进一次"推缓冲"。即发即忘，但**排在同一条队列上** ——
 /// 见 [_queue] 的第 2 条原因：[IOSink.flush] 不能重叠。
 void _flush() {
   _queue = _queue.then((_) => _flushStep());
+}
+
+/// 立刻把缓冲推出去，并且**等它落地**。
+///
+/// 唯一的调用方是设置页的「分享日志」：那一步读的是本地文件，不冲一下会漏掉
+/// 最多 [_kFlushInterval] 的行 —— 而"刚崩的那几行"恰恰是最想看的那几行。
+Future<void> flushConsoleLog() async {
+  _flush();
+  await _queue;
 }
 
 /// 队列上的一步：先补写 [_pendingLines]（轮换那几毫秒里攒下的），再推缓冲。
@@ -239,6 +358,9 @@ class _ConsoleLogLifecycleObserver with WidgetsBindingObserver {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       _flush();
+      // 同样在 paused 上同步一次 —— 这一条就是「人不在电脑边上，把 app 划到
+      // 后台，Mac 上几秒后就能读到最新日志」的那个入口。
+      requestConsoleLogSync();
     }
   }
 }
@@ -276,6 +398,10 @@ Future<void> resetConsoleLogCaptureForTest() async {
   _consoleLogFile = null;
   _bytesWritten = 0;
   _maxBytes = _kMaxBytes;
+  _syncHook = null;
+  _stagingPath = null;
+  _syncedSize = -1;
+  _syncedModified = null;
   _pendingLines.clear();
   await old?.close();
 }
@@ -289,7 +415,12 @@ void setConsoleLogMaxBytesForTest(int bytes) => _maxBytes = bytes;
 ///
 /// 不这么做的话，测试只能在"写完了"和"还在攒"之间猜一个 sleep。
 @visibleForTesting
-Future<void> flushConsoleLogForTest() async {
-  _flush();
+Future<void> flushConsoleLogForTest() => flushConsoleLog();
+
+/// 请求一次同步，等**队列和钩子都**跑完才返回。见 [_hookInFlight]。
+@visibleForTesting
+Future<void> syncConsoleLogForTest() async {
+  requestConsoleLogSync();
   await _queue;
+  await _hookInFlight;
 }

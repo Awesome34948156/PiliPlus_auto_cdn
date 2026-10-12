@@ -59,6 +59,32 @@
 看控制台。iOS 上 `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace` 都开着，
 所以「文件」App → 我的 iPhone → PiliPlus 里直接就有这个文件。
 
+**iOS 上更省事的一条路（2026-10-12 加，**同日真机已验证 ✅**）：iCloud 日志同步。**
+设置 →「其它设置」
+（`SettingType.extraSetting`）里的一行「iCloud 日志同步」→ 选择 iCloud Drive 里的
+一个文件夹，之后 app **每 60 秒**把日志同步一份过去，**退到后台立刻再同步
+一次**。Mac 上直接读：
+
+```
+ls ~/Library/Mobile\ Documents/com~apple~CloudDocs/Downloads/ForpiliLog/
+```
+
+**验收证据**：2026-10-12 20:32 那一份与同时用 `devicectl` 拉下来的 1500 行
+**逐字节相同、只少最后一行**（那一行是快照之后才写进本地日志的）——
+少的那一行本身就是"这是活体快照"的证明。
+⚠️ **成功时它一行日志都不打**：日志里 grep 不到任何 iCloud 字样 **≠** 没生效。
+上一版踩的坑记在这儿：`bookmarkData` 必须**在** `startAccessingSecurityScopedResource()`
+**之后**调，反过来抛 `The file couldn't be opened because it doesn't exist.`
+（`ios/Runner/ICloudLogPlugin.swift:136-170`）。
+
+人不在电脑边上、手机不在同一个 Wi-Fi 上（`devicectl` 拿不到）时这条是唯一的路。
+每次启动会把上一份改名成 `pili-console-<MMdd-HHmmss>.log`，只留最近 10 份。
+⚠️ 挑文件夹时请挑 **iCloud Drive** 里的，挑成「我的 iPhone」就永远同步不到 Mac ——
+这一点 app 拦不住。⚠️ Mac 上晚几分钟才看到不代表没写：上传是系统的 `bird` 在跑，
+低电量模式、关了蜂窝的 iCloud Drive 都会拖后。**以设置页副标题里那个「上次同步
+时刻」为准。** 书签失效（文件夹被改名/移走）时 app 会自动退回「未设置」并提示重选，
+不会崩也不会刷屏。
+
 **每条物理行都以 `HH:mm:ss.SSS ` 开头**（`_stamp`，2026-10-11 加）。下面表格里那些
 "逐字发出的行"指的是戳**之后**的那一段 —— grep 子串照样命中。加戳的理由：换源的一半
 判据是时间窗判据（6s 内 12 条 / 5ms 内算同一包 / 换源后 ≥8s 干净），而 mpv 的原文
