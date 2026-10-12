@@ -19,23 +19,26 @@ mkdir -p "$ZIPS" "$XC"
 
 while read -r url; do
   [ -n "$url" ] || continue
-  zip=$ZIPS/$(basename "$url")
+  file=$(basename "$url")                 # gmp.xcframework.zip
+  ver=$(basename "$(dirname "$url")")     # 3.8.11 -- the release tag lives in the path
+  dir=${file%.zip}                        # gmp.xcframework -- the dir unzip creates
+  # The version goes in the cache key. Keying on the bare filename meant a
+  # version bump reused the old zip *and* skipped the unpack (the "$XC/$dir"
+  # test below already passed), so a new release was never actually fetched.
+  zip=$ZIPS/$ver-$file
   if [ ! -s "$zip" ]; then
-    echo "==> $(basename "$url")"
+    echo "==> $ver/$file"
     curl -fL --retry 3 --progress-bar "$url" -o "$zip.part"
     mv "$zip.part" "$zip"
   fi
-done < "$HERE/xframeworks.txt"
 
-# Unpack only the frameworks that are not already on disk, so re-running after a
-# partial failure does not redo everything.
-for zip in "$ZIPS"/*.xcframework.zip; do
-  name=$(basename "$zip" .zip)
-  if [ ! -d "$XC/$name" ]; then
-    echo "==> unpack $name"
+  # Unpack only what is not already on disk, so re-running after a partial
+  # failure does not redo everything.
+  if [ ! -d "$XC/$dir" ]; then
+    echo "==> unpack $dir"
     unzip -qo "$zip" -d "$XC"
   fi
-done
+done < "$HERE/xframeworks.txt"
 
 echo
 echo "xframeworks in $XC:"

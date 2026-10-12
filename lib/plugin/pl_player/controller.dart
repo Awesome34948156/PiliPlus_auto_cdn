@@ -1206,7 +1206,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     );
   }
 
-  Future<void>? refreshPlayer() {
+  /// 重开当前 Media 做故障恢复。
+  ///
+  /// [play] 决定重开后是否起播：传 null（默认）时沿用**当前**播放态
+  /// （[playerStatus].isPlaying），显式传入则覆盖。四个调用点全是故障恢复
+  /// （直播/非直播 stream.error、硬解会话失效、CDN 冻结重载），本就该"恢复成
+  /// 用户原来的样子"——旧的 `play: true` 无条件起播，于是用户手动暂停、缓冲
+  /// 也健康时，任意一条恢复都会让画面自己播起来（S1/N4）。
+  Future<void>? refreshPlayer({bool? play}) {
     if (dataSource is FileSource) {
       return null;
     }
@@ -1215,7 +1222,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       var media = ctr.current.last;
       if (!isLive) media = media.copyWith(start: ctr.state.position);
-      return ctr.open(media, play: true);
+      return ctr.open(media, play: play ?? playerStatus.isPlaying);
     }
     return null;
   }
@@ -1402,7 +1409,28 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           if (event.startsWith('tcp: ffurl_read returned ') ||
               event.startsWith("Failed to open https://") ||
               event.startsWith("Can not open external file https://")) {
-            Timer(const Duration(milliseconds: 3000), refreshPlayer);
+            Timer(const Duration(milliseconds: 3000), () {
+              // 直播分支原先无条件重载：连接报错是"事件"不是"采样量"，一次
+              // 瞬时抖动也会把正在正常播放（或用户已手动暂停）的直播拆掉重开。
+              // 补上与非直播分支同源的护栏 —— 只在"前方余量真的见底"时才重载。
+              //
+              // 只取 [bufferedAhead] 这一条，**不复用** `|| telemetryDiverged`——
+              // 这不是取舍，是等价：直播的 mpv 配置走 [liveBuffer]（只有
+              // demuxer-max-bytes、没有 `cache-secs`），而 [telemetryDiverged] 读的
+              // 就是 `cache-secs`：拿不到 → 阈值 `_divergedAheadSec` 恒为 0 → 该
+              // getter 对直播**恒为 false**（`limit > 0` 短路，见其定义）。写全
+              // `|| telemetryDiverged` 不改变结果，但会让读者以为这条路上也在防
+              // "遥测失真"，故省略、只留真正起作用的那半。
+              //
+              // [bufferedAhead] 对直播同样成立：它是 demuxer 缓存末端减播放位置，
+              // 连接断了缓存不再增长、位置继续推进，必然归零；该项遥测若取不到则
+              // 恒为 0 → 护栏退化成放行（旧行为），fail-open，不会把真故障夹死。
+              // `!isSeeking` 对直播恒为真（直播不可 seek），保留只为与非直播分支
+              // 保持同形。
+              if (bufferedAhead <= 0 && !isSeeking.value) {
+                refreshPlayer();
+              }
+            });
           }
           return;
         }

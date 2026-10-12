@@ -439,6 +439,285 @@ void main() {
       reason: 'busy 没在重挂时清掉，这一页的自动换源被永久关闸了：\n${log.text}',
     );
   });
+
+  // ---------------------------------------------------------------------------
+  // 下面这一批打的是"刚修完的下半段"：触发闸门不该顺手消费状态、失败该不该装
+  // 冷却、解码档不许被兜底覆写、预检 pending 不该被静默吃掉、回页不该重新武装。
+  // 每条都配了"删掉守卫必须变红"的验证（见各自注释里点名的生产行）。
+  // ---------------------------------------------------------------------------
+
+  test('解码档（force）不许被"余量失真 → 重载当前源"改写（F8）', () async {
+    // 前提两样，缺一不可：
+    //   - force：走解码档（onDecodeError），它跳过速度门槛，也**跳过**尾段那道
+    //     `!switched && !force && telemetryDiverged` 的覆写；
+    //   - telemetryDiverged 为真：这正是旧行为会踩的雷。解码故障里它恰恰常为真
+    //     （坏镜像余量填得满、位置被音频时钟推着走），于是旧代码把"没找到可换的
+    //     镜像"这个**正确的**结论改写成"重载当前源"，去对同一个坏 Media 再
+    //     refreshPlayer 一次 —— 治错病。
+    PlPlayerController.getInstance()
+      // 兜底那句 `refreshPlayer()` 头一件事是读 `dataSource`（`late`）。不摆好，
+      // 删掉守卫做变红验证时它会在打出"画面已冻"之后抛 LateInitializationError
+      // —— 日志对了、用例照样红，变红的原因就不干净了。
+      ..dataSource = NetworkSource(videoSource: _baselineUrl, audioSource: null)
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 200
+      ..position.value = 0;
+    // 基线、候选**都**拿不出有效速度 → 这一轮测成 unmeasurable，正是"没得换"
+    // 那个结论的来源。
+    cdn.allTiny = true;
+    hostA.attachCdnSwitch();
+
+    PlPlayerController.getInstance().onDecodeError!(
+      const Duration(seconds: 100),
+    );
+    await _waitFor(() => log.has('放弃，'));
+
+    // 前提自检：不成立的话下面两句"没有/有"就什么也证明不了。
+    expect(
+      PlPlayerController.getInstance().telemetryDiverged,
+      isTrue,
+      reason: '覆写那条判据的前提不成立，这条用例空转了',
+    );
+    // 正面证据：force 真的生效了 —— 结论是解码档专属那句，不是普通那轮的
+    // "无法测出更快的 CDN"。
+    expect(
+      log.has('当前镜像的字节解不出画面，但没找到可换的镜像'),
+      isTrue,
+      reason: 'force 没生效，或这一轮没走到 unmeasurable：\n${log.text}',
+    );
+    expect(
+      log.has('无法测出更快的 CDN，暂不切换'),
+      isFalse,
+      reason: '这是非 force 那一档的说法，说明 force 丢了：\n${log.text}',
+    );
+    // 被守护的那件事：force 不该落进那条覆写。
+    expect(
+      log.has('画面已冻（余量失真），重载当前源'),
+      isFalse,
+      reason: '解码档不该去重载同一个坏 Media（治错病）：\n${log.text}',
+    );
+  });
+
+  test('host 改写后地址为空：这次失败要装冷却（N10）', () async {
+    // `_switchTo` 里 `newVideo.isEmpty` 那条：host 改写对这条镜像压根不生效、
+    // 一个可用 URL 都拿不出来。它是**真的失败**，不是作废轮 —— 不装冷却的话，
+    // 下一次触发照样选中它、照样空手而归，无限重试。
+    //
+    // 造法：`_pickFastestCdn` 在**开头**就把 `firstVideo.playUrls` 拷了一份
+    // （`urls`）供整轮用，此后一串 await；而 `_switchTo` 读的是**当时的**
+    // `firstVideo.playUrls`。卡在"探对象总长"那一发上把视频轨的 baseUrl 抹掉，
+    // 那一轮便照着旧拷贝选中候选、却在 `_switchTo` 里读到一个空列表。
+    cdn.holdProbe = Completer<void>();
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => cdn.probes.isNotEmpty);
+
+    hostA.videoItemUrl = null; // host 改写拿不出 URL（playUrls 变空）
+    cdn.holdProbe!.complete();
+
+    await _waitFor(() => log.has('host 改写后地址为空，放弃本次并冷却'));
+    // 正面证据：这一轮真的选出了候选、走到了 `_switchTo`（否则那句"冷却"可能是
+    // 别的路径打出来的）。
+    expect(log.has('第1次 ->'), isTrue, reason: '这一轮没走到换源：\n${log.text}');
+    expect(
+      log.has('放弃，'),
+      isFalse,
+      reason: '这条失败路径在 `_switchTo` 里就地 return，不该走到收尾那句：\n${log.text}',
+    );
+
+    // 冷却真的装上了：紧接着的下一次触发被冷却闸挡下。
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    _stall(hostA, const Duration(seconds: 200));
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(
+      log.has('冷却中，忽略卡顿 @200s'),
+      isTrue,
+      reason: '没装冷却 —— 下一次触发又冲了上去（就是那个无限重试）：\n${log.text}',
+    );
+  });
+
+  test('generation 作废的那一轮不装冷却（N10 的对照组）', () async {
+    // N10 修的是"真的失败"要装冷却；但**作废**的一轮是另一回事：它什么都没试过
+    // （用户换了视频/画质 → `resetCdnForNewObject` 推了代际），装冷却是错的 ——
+    // 那会把一个刚换了对象的页面按在 60s 冷却里，而它其实什么坏事都没发生。
+    // `_autoSwitchLoop` 在循环口那道 `_roundVoided(generation)` 复查上直接 return，
+    // 压根走不到收尾写冷却那一句。
+    cdn.holdProbe = Completer<void>();
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => cdn.probes.isNotEmpty);
+
+    hostA.resetCdnForNewObject(); // 换集/换画质：在途那一轮当场作废
+    cdn.holdProbe!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(
+      log.has('放弃，'),
+      isFalse,
+      reason: '作废的一轮不该走到收尾、更不该写冷却：\n${log.text}',
+    );
+
+    // 直接验证"没装冷却"：再来一发触发。冷却若被装上（60s），这一发会被"冷却中"
+    // 挡下。触发点用 0s，`_restoreResumePosition` 于是立刻返回，这一轮不会在收尾
+    // 留下要等的 800ms 拍。
+    _stall(hostA, Duration.zero);
+    await _waitFor(() => log.has('卡顿 @0s，开始找可用镜像'));
+    expect(
+      log.has('冷却中，忽略'),
+      isFalse,
+      reason: '作废那轮装了冷却，把这一发正常触发挡下了：\n${log.text}',
+    );
+  });
+
+  test('小卡顿的节流只在探测真起步后才消费（F7）', () async {
+    // `_onPlayerRebuffer` 原来的顺序是"先落下时间戳、再交给闸门"。被 busy/冷却/
+    // 进展闸挡下的那一次照样把接下来 30s 的小卡顿探测机会吃掉了 —— 而那几个闸
+    // 说的本来就是"现在别动"，节流却被它顺手消费，画面一直冻着也得干等 30s。
+    //
+    // 造一个被**进展闸**挡下的触发（它最"瞬时"，不像冷却会把后面也一起挡住）：
+    // 先跑一轮把 `_cdnLastAttemptPos` 抬到 100s、卡在重载播放器那一步；再顶掉
+    // 又回来（作废在途轮，但**不清** `_cdnLastAttemptPos`），一秒后发小卡顿。
+    hostA
+      ..holdInit = Completer<void>()
+      ..attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => hostA.initCalls == 1);
+    expect(log.has('第1次 ->'), isTrue, reason: '这一轮没走到选源：\n${log.text}');
+
+    // 顶掉又回来：重挂会让在途那一轮作废，`_cdnLastAttemptPos` 仍停在 100s。
+    hostB.attachCdnSwitch();
+    hostA.attachCdnSwitch();
+    hostA.holdInit!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    // 距上次尝试只推进 1s → 被进展闸挡下，`_onPlayerStall` 返回 false。
+    PlPlayerController.getInstance().onRebuffer!(const Duration(seconds: 101));
+    expect(
+      log.has('距上次尝试只推进了 1s，忽略'),
+      isTrue,
+      reason: '没被进展闸挡下，这条用例的前提不成立：\n${log.text}',
+    );
+    // 紧接着的一发（推进 5s，过闸）必须真的跑起来 —— 若上一发把节流时间戳写了
+    // 下去，这里会被 30s 节流吃掉，只剩一行"小卡顿冷却中"。
+    PlPlayerController.getInstance().onRebuffer!(const Duration(seconds: 105));
+    await _waitFor(() => log.has('小卡顿 @105s'));
+    expect(
+      log.has('小卡顿冷却中'),
+      isFalse,
+      reason: '节流在探测没起步时就消费了：\n${log.text}',
+    );
+  });
+
+  test('预检的 pending 只在被接受后才消费（F6）', () async {
+    // `_onCdnProbeTick` 的预检支原来"先清 pending、把定时器降到 2 分钟档，再去
+    // 调 `_onPlayerStall`"。那一调被冷却/进展闸当场挡下时就漏了：pending 已清、
+    // 定时器已变慢，这次预检**静默消失**，要等整整 2 分钟才轮到下一次。修法是先
+    // 过闸门、拿到 `accepted`，再据此消费。
+    //
+    // 观察点：pending 还在 ⇒ 定时器仍是 2 秒档 ⇒ 被挡下的预检会**再来**（每 2s
+    // 一行"冷却中，忽略预检"）。若 pending 被消费，定时器变 2 分钟档，只剩一行。
+    cdn.allTiny = true; // 造一轮 unmeasurable，顺手把 20s 冷却装上
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => log.has('放弃，20s 内不再尝试'));
+    expect(
+      log.has('放弃，20s 内不再尝试（无法测出更快的 CDN，暂不切换）'),
+      isTrue,
+      reason: '这一轮没落到 unmeasurable 那档冷却上，用例前提不成立：\n${log.text}',
+    );
+
+    // 让预检那一拍走到 `_onPlayerStall`：开播 + 缓冲已过回填水位。
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..buffer['demuxer-hysteresis-secs'] = '30'
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 60
+      ..position.value = 0;
+
+    await _waitFor(
+      () => log.lines.where((l) => l.contains('冷却中，忽略预检')).length >= 2,
+      timeout: const Duration(seconds: 8),
+    );
+    expect(
+      log.lines.where((l) => l.contains('冷却中，忽略预检')).length,
+      greaterThanOrEqualTo(2),
+      reason: '被挡下的预检没有再来的机会 —— pending 被静默消费了：\n${log.text}',
+    );
+  });
+
+  test('回页只重挂定时器，不重新武装预检（F11）', () async {
+    // 首次挂载（页面 onInit）武装装载后那一次预检；回页（didPopNext 再挂一次）
+    // 只重挂定时器 —— 无条件再武装等于每次从相关视频返回都白花一轮 ~6MB 的测速。
+    // 两次调的是同一个方法，只能靠"本页有没有挂载过"来分：
+    // `restartCdnProbe(armPreflight: !_cdnAttachedOnce); _cdnAttachedOnce = true;`。
+    //
+    // 观察点：让首次预检真的跑掉（pending 归假），再模拟"跳走又回来"。回页若又
+    // 把它设回真，就会冒出第二次预检；否则永远只有那一次。
+    hostA.attachCdnSwitch();
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..buffer['demuxer-hysteresis-secs'] = '30'
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 60
+      ..position.value = 0;
+
+    await _waitFor(() => log.has('预检 @'));
+    expect(
+      log.lines.where((l) => l.contains('预检 @')).length,
+      1,
+      reason: '首次预检没跑起来，用例前提不成立：\n${log.text}',
+    );
+
+    // 跳去相关视频（新页抢走回调），又退回来（didPopNext 再挂一次）。
+    hostB.attachCdnSwitch();
+    hostA.attachCdnSwitch();
+    await Future<void>.delayed(const Duration(seconds: 3));
+
+    expect(
+      log.lines.where((l) => l.contains('预检 @')).length,
+      1,
+      reason: '回页把预检又武装了一次 —— 白花一轮测速：\n${log.text}',
+    );
+  });
+
+  test('解码错误档端到端：force 换源 + 只认"不再吐坏字节"的恢复（F10）', () async {
+    // onDecodeError → force=true → `_awaitRecovery(decode: true)`。这一档的两条
+    // 位置/余量判据都不可信（坏镜像余量填得满、位置被音频时钟推着走），只看
+    // "换过去之后还吐不吐坏字节"。这里把回填水位/余量摆成"够健康"的样子：若误走
+    // 非 decode 的判据，会在第一拍就宣布恢复并打出"前向余量回到"。
+    PlPlayerController.getInstance()
+      ..buffer['demuxer-hysteresis-secs'] = '30'
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 60
+      ..position.value = 0;
+    hostA.attachCdnSwitch();
+
+    PlPlayerController.getInstance().onDecodeError!(Duration.zero);
+
+    await _waitFor(() => log.has('第1次 ->'));
+    // force 的独有痕迹之一：触发那条源（正在播的 host）被记入本集黑名单。
+    expect(
+      log.has('$_baselineHost 给的字节解不出画面，本集不再作为候选'),
+      isTrue,
+      reason: 'force 的"坏 host 记账"没走到：\n${log.text}',
+    );
+
+    // 解码档的恢复要等"宽限 4s + 干净窗口 4s"≈8s，比别的用例长。
+    await _waitFor(
+      () => log.has('成功，已切到'),
+      timeout: const Duration(seconds: 20),
+    );
+    expect(
+      log.has('解码错误档换源后'),
+      isTrue,
+      reason: '恢复不是走解码档判据判出来的：\n${log.text}',
+    );
+    expect(
+      log.has('前向余量回到'),
+      isFalse,
+      reason: 'decode=true 的恢复判据不该去看余量（那是坏镜像最会骗人的一项）：\n${log.text}',
+    );
+  });
 }
 
 /// 把触发打进播放器上报口 —— 这就是真实的机制（页面不直接调 mixin 的私有方法）。
@@ -506,6 +785,14 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
   @override
   bool autoPlay = false;
 
+  /// 视频轨的 baseUrl。置空 = "host 改写拿不出 URL"（`firstVideo.playUrls` 变空），
+  /// 用来验证 `_switchTo` 里 `newVideo.isEmpty` 那条冷却（见 N10 用例）。
+  ///
+  /// 它和 [videoUrl]（mixin 的基线）是两件事：`_pickFastestCdn` 探候选读的是
+  /// 这里的 `playUrls`，而基线一直是 [videoUrl]。所以抹掉它不会让那一轮选不出
+  /// 候选，只会让 `_switchTo` 在最后一刻读到一个空列表。
+  String? videoItemUrl = _baselineUrl;
+
   /// 非空时 [playerInit] 会卡在这里 —— 复现"重载播放器那几秒"的关键。
   Completer<void>? holdInit;
   int initCalls = 0;
@@ -519,7 +806,7 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
         VideoItem(
           id: 80,
           quality: VideoQuality.high1080,
-          baseUrl: _baselineUrl,
+          baseUrl: videoItemUrl,
         ),
       ],
     ),
@@ -573,6 +860,10 @@ class _FakeCdn {
   /// 非空时"探对象总长"那一发会卡住（用例 4 用）。
   Completer<void>? holdProbe;
 
+  /// 为真时**所有** host 都只回小样本 —— 造"基线、候选都拿不出有效速度"的
+  /// unmeasurable 轮（F8 / F6 用）。默认假：只有基线那个 host 是慢的。
+  bool allTiny = false;
+
   List<({Uri uri, String? range})> get probes =>
       requests.where((r) => r.range == _probeRange).toList();
 
@@ -613,7 +904,7 @@ class _FakeAdapter implements HttpClientAdapter {
     }
 
     final offset = _rangeStart(range);
-    final fast = options.uri.host != _baselineHost;
+    final fast = !cdn.allTiny && options.uri.host != _baselineHost;
     final bytes = fast ? _autoBytes : _tinyBytes;
     return ResponseBody.fromBytes(
       List<int>.filled(bytes, 0),

@@ -51,5 +51,7 @@ trap 'rm -f "$BIN"' EXIT
 clang -DGL_SILENCE_DEPRECATION=1 -I "$HEADERS" -o "$BIN" "$HERE/mpvgl.c" \
   -framework OpenGL -ldl
 
-# mpvgl.c exits non-zero unless it rendered frames with no render errors.
+# mpvgl.c exits non-zero unless it rendered frames, read back a non-black centre
+# pixel, saw no render errors, and finished with `hwdec-current: videotoolbox` --
+# the exit code is the verdict on all three (see README.md).
 exec "$BIN" "$MEDIA" "$DYLIB"

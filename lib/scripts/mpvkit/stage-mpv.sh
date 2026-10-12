@@ -36,11 +36,15 @@ WORK=${WORK:-$HOME/Library/Caches/piliplus-mpvkit}
 OUTDIR=${OUTDIR:-$WORK/out}
 PILIPLUS=${PILIPLUS:-$(cd "$HERE/../../.." && pwd)}
 
-IOS_VERSION=${IOS_VERSION:-v0.39.0}
-MACOS_VERSION=${MACOS_VERSION:-v0.6.0}
-
-IOS_TARBALL=${IOS_TARBALL:-$OUTDIR/libmpv-xcframeworks_${IOS_VERSION}_ios-universal-video-default.tar.gz}
-MACOS_TARBALL=${MACOS_TARBALL:-$OUTDIR/libmpv-xcframeworks_${MACOS_VERSION}_macos-universal-video-default.tar.gz}
+# The version that names our tarball -- and the .cache file the libs Makefile
+# looks for -- is that package's own MPV_XCFRAMEWORKS_VERSION: its download rule
+# builds the filename from it, so it is the only thing that has to agree with
+# what make expects. Read it out of the Makefile we are about to stage into
+# rather than hard-coding it here (hard-coded values silently drifted and made
+# make ignore our tarball). IOS_VERSION / MACOS_VERSION still override for the
+# rare case of staging against a package we cannot see.
+IOS_VERSION=${IOS_VERSION:-}
+MACOS_VERSION=${MACOS_VERSION:-}
 
 # The iOS libs package comes from the media_kit *fork* at a pinned commit, so
 # which ~/.pub-cache/git/media-kit-<sha> checkout is live depends on
@@ -58,6 +62,17 @@ lock_version() { # $1 = package name in pubspec.lock
     index($0, pkg) == 1 { f = 1 }
     f && /version:/ { gsub(/["\047 ]/, "", $2); print $2; exit }
   ' "$PILIPLUS/pubspec.lock"
+}
+
+# The libs Makefile's own MPV_XCFRAMEWORKS_VERSION -- the version its download
+# rule and .cache filename are built from, so the one our tarball must carry.
+makefile_version() { # $1 = libs package dir (the one holding Makefile)
+  local mk=$1/Makefile v
+  [ -f "$mk" ] || { echo "no Makefile in $1" >&2; return 1; }
+  v=$(sed -n 's/^MPV_XCFRAMEWORKS_VERSION[[:space:]]*=[[:space:]]*//p' "$mk" | head -1)
+  v=${v//[[:space:]]/}
+  [ -n "$v" ] || { echo "no MPV_XCFRAMEWORKS_VERSION in $mk" >&2; return 1; }
+  echo "$v"
 }
 
 require_dir() { # $1 = path
@@ -118,19 +133,36 @@ macos_pkg() {
   require_dir "$HOME/.pub-cache/hosted/pub.dev/media_kit_libs_macos_video-$ver/macos"
 }
 
+# Env override wins; otherwise ask the package's Makefile. A failure to find the
+# package (no pub-cache checkout yet) is fatal so this never silently falls back
+# to a guessed version -- set IOS_VERSION / MACOS_VERSION to force one.
+ios_version() {
+  [ -n "$IOS_VERSION" ] || IOS_VERSION=$(makefile_version "$(ios_pkg)") || exit 1
+  echo "$IOS_VERSION"
+}
+
+macos_version() {
+  [ -n "$MACOS_VERSION" ] || MACOS_VERSION=$(makefile_version "$(macos_pkg)") || exit 1
+  echo "$MACOS_VERSION"
+}
+
 stage_ios() {
-  local pkg
+  local pkg ver tarball
   pkg=$(ios_pkg)   # separate statement so `set -e` catches a lookup failure
-  stage "$pkg" "$IOS_TARBALL" \
-        "libmpv-xcframeworks-${IOS_VERSION}-ios-universal.tar.gz" \
+  ver=$(ios_version)
+  tarball=${IOS_TARBALL:-$OUTDIR/libmpv-xcframeworks_${ver}_ios-universal-video-default.tar.gz}
+  stage "$pkg" "$tarball" \
+        "libmpv-xcframeworks-${ver}-ios-universal.tar.gz" \
         "libmpv-xcframeworks-ios-universal.tar.gz"
 }
 
 stage_macos() {
-  local pkg
+  local pkg ver tarball
   pkg=$(macos_pkg)
-  stage "$pkg" "$MACOS_TARBALL" \
-        "libmpv-xcframeworks-${MACOS_VERSION}-macos-universal.tar.gz" \
+  ver=$(macos_version)
+  tarball=${MACOS_TARBALL:-$OUTDIR/libmpv-xcframeworks_${ver}_macos-universal-video-default.tar.gz}
+  stage "$pkg" "$tarball" \
+        "libmpv-xcframeworks-${ver}-macos-universal.tar.gz" \
         "libmpv-xcframeworks-macos-universal.tar.gz"
 }
 
@@ -146,8 +178,8 @@ case "${1:-all}" in
   ios)     stage_ios ;;
   macos)   stage_macos ;;
   all)     stage_ios; stage_macos ;;
-  restore) restore_one "$(ios_pkg)"   "libmpv-xcframeworks-${IOS_VERSION}-ios-universal.tar.gz"
-           restore_one "$(macos_pkg)" "libmpv-xcframeworks-${MACOS_VERSION}-macos-universal.tar.gz" ;;
+  restore) restore_one "$(ios_pkg)"   "libmpv-xcframeworks-$(ios_version)-ios-universal.tar.gz"
+           restore_one "$(macos_pkg)" "libmpv-xcframeworks-$(macos_version)-macos-universal.tar.gz" ;;
   *)       sed -n '2,10p' "$HERE/stage-mpv.sh"; exit 2 ;;
 esac
 

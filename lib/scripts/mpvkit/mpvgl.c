@@ -156,16 +156,29 @@ int main(int argc, char **argv) {
          render_err);
 
   // Prove a decoded frame really landed: read the middle pixel back.
+  int nonblack = 0;
   if (rendered > 0) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     unsigned char px[4] = {0, 0, 0, 0};
     glReadPixels((int)w / 2, (int)hgt / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    nonblack = (px[0] | px[1] | px[2]) != 0;
     printf("centre pixel readback: R=%u G=%u B=%u A=%u  (%s)\n", px[0], px[1], px[2], px[3],
-           (px[0] | px[1] | px[2]) ? "non-black -> real frame" : "BLACK");
+           nonblack ? "non-black -> real frame" : "BLACK");
   }
+  char *hwdec_cur = p_getstr(mpv, "hwdec-current");
   printf("video-codec:   %s\n", p_getstr(mpv, "video-codec"));
   printf("video-format:  %s\n", p_getstr(mpv, "video-format"));
   printf("hwdec:         %s\n", p_getstr(mpv, "hwdec"));
-  printf("hwdec-current: %s\n", p_getstr(mpv, "hwdec-current"));
-  return (rendered > 0 && render_err == 0) ? 0 : 1;
+  printf("hwdec-current: %s\n", hwdec_cur);
+
+  // The verdict is all three of README's criteria, not just "rendered some
+  // frames": a silent fall back to libdav1d renders clean, non-black frames
+  // too, so a frames-only exit code would pass and hide the exact bug this
+  // check exists to catch. Demand hwdec-current == videotoolbox (the zero-copy
+  // decoder -- mpvtest.c's copy-back reports videotoolbox-copy and must not pass).
+  int hw_ok = hwdec_cur && strcmp(hwdec_cur, "videotoolbox") == 0;
+  if (!hw_ok)
+    fprintf(stderr, "hwdec-current: %s (expected videotoolbox)\n",
+            hwdec_cur ? hwdec_cur : "(null)");
+  return (rendered > 0 && render_err == 0 && nonblack && hw_ok) ? 0 : 1;
 }

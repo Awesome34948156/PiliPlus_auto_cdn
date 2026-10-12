@@ -82,7 +82,7 @@ archives() { # $1 = slice dir, e.g. macos-arm64_x86_64
 split_archives() { # $1 = slice dir
   MPV_ARCHIVE=""
   OTHER_ARCHIVES=()
-  local a
+  local a fws found
   while read -r a; do
     case "$a" in
       */Libmpv.framework/*) MPV_ARCHIVE="$a" ;;
@@ -90,6 +90,20 @@ split_archives() { # $1 = slice dir
     esac
   done < <(archives "$1")
   [ -n "$MPV_ARCHIVE" ] || { echo "no Libmpv archive in slice $1" >&2; exit 1; }
+
+  # Every xcframework on disk has to contribute exactly one archive: the
+  # force-loaded Libmpv plus the rest. archives() skips one silently when it has
+  # no archive for this slice, which would link a dylib quietly short of a
+  # component (an under-populated binary that still links) -- so assert the total
+  # against the on-disk xcframework count, not a hard-coded magic number.
+  fws=("$XC"/*.xcframework)
+  [ -e "${fws[0]}" ] || { echo "no xcframeworks in $XC" >&2; exit 1; }
+  found=$(( 1 + ${#OTHER_ARCHIVES[@]} ))
+  [ "$found" -eq "${#fws[@]}" ] || {
+    echo "slice $1: got $found archives but ${#fws[@]} xcframeworks in $XC" >&2
+    exit 1
+  }
+
   echo "libmpv: $MPV_ARCHIVE"
   echo "others: ${#OTHER_ARCHIVES[@]} archives"
 }

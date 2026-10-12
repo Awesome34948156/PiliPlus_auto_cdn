@@ -2,8 +2,11 @@
 # Assemble the dylibs relink.sh produced into the Mpv.xcframework tarball that
 # media_kit's libs package unpacks, and print the sha256 to pin it with.
 #
-#   ./package.sh ios     -> libmpv-xcframeworks_v0.39.0_ios-universal-video-default.tar.gz
-#   ./package.sh macos   -> libmpv-xcframeworks_v0.6.0_macos-universal-video-default.tar.gz
+#   ./package.sh ios     -> libmpv-xcframeworks_<ios-ver>_ios-universal-video-default.tar.gz
+#   ./package.sh macos   -> libmpv-xcframeworks_<macos-ver>_macos-universal-video-default.tar.gz
+#
+# <*-ver> is read from each libs package's own Makefile (MPV_XCFRAMEWORKS_VERSION,
+# resolved below) rather than fixed here; today that is v0.39.0 / v0.6.0.
 #   ./package.sh all
 #
 # The tarball layout is exactly what the libs Makefile expects: one top-level
@@ -21,15 +24,72 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORK=${WORK:-$HOME/Library/Caches/piliplus-mpvkit}
 XC=${XC:-$WORK/xc}
 OUTDIR=${OUTDIR:-$WORK/out}
+PILIPLUS=${PILIPLUS:-$(cd "$HERE/../../.." && pwd)}
 
 # These versions are the media_kit_libs_* packages' own MPV_XCFRAMEWORKS_VERSION
-# values. They name the tarball and the cached file it gets staged as; the
-# tarball *contents* are ours either way.
-IOS_VERSION=${IOS_VERSION:-v0.39.0}
-MACOS_VERSION=${MACOS_VERSION:-v0.6.0}
+# values: they name the tarball and the cached file stage-mpv.sh stages it as, so
+# they must match the version in the Makefile the package ships. Read them from
+# that Makefile (below) instead of hard-coding, so they cannot drift apart; the
+# tarball *contents* are ours either way. Env override still wins.
+IOS_VERSION=${IOS_VERSION:-}
+MACOS_VERSION=${MACOS_VERSION:-}
 MPV_VERSION=${MPV_VERSION:-0.41.0}
 IOS_MIN=${IOS_MIN:-15.0}
 MACOS_MIN=${MACOS_MIN:-12.0}
+
+# Locate the live media_kit_libs_* checkout the same way stage-mpv.sh does:
+# pubspec.lock names the ref, and the Makefile there carries the version.
+lock_ref() { # $1 = package name in pubspec.lock
+  awk -v pkg="  $1:" '
+    index($0, pkg) == 1 { f = 1 }
+    f && /resolved-ref:/ { gsub(/["\047 ]/, "", $2); print $2; exit }
+  ' "$PILIPLUS/pubspec.lock"
+}
+
+lock_version() { # $1 = package name in pubspec.lock
+  awk -v pkg="  $1:" '
+    index($0, pkg) == 1 { f = 1 }
+    f && /version:/ { gsub(/["\047 ]/, "", $2); print $2; exit }
+  ' "$PILIPLUS/pubspec.lock"
+}
+
+require_dir() { # $1 = path
+  [ -d "$1" ] || { echo "not a directory: $1" >&2; return 1; }
+  echo "$1"
+}
+
+makefile_version() { # $1 = libs package dir (the one holding Makefile)
+  local mk=$1/Makefile v
+  [ -f "$mk" ] || { echo "no Makefile in $1" >&2; return 1; }
+  v=$(sed -n 's/^MPV_XCFRAMEWORKS_VERSION[[:space:]]*=[[:space:]]*//p' "$mk" | head -1)
+  v=${v//[[:space:]]/}
+  [ -n "$v" ] || { echo "no MPV_XCFRAMEWORKS_VERSION in $mk" >&2; return 1; }
+  echo "$v"
+}
+
+ios_pkg() {
+  local ref
+  ref=$(lock_ref media_kit_libs_ios_video)
+  [ -n "$ref" ] || { echo "media_kit_libs_ios_video not in pubspec.lock" >&2; exit 1; }
+  require_dir "$HOME/.pub-cache/git/media-kit-$ref/libs/ios/media_kit_libs_ios_video/ios"
+}
+
+macos_pkg() {
+  local ver
+  ver=$(lock_version media_kit_libs_macos_video)
+  [ -n "$ver" ] || { echo "media_kit_libs_macos_video not in pubspec.lock" >&2; exit 1; }
+  require_dir "$HOME/.pub-cache/hosted/pub.dev/media_kit_libs_macos_video-$ver/macos"
+}
+
+ios_version() {
+  [ -n "$IOS_VERSION" ] || IOS_VERSION=$(makefile_version "$(ios_pkg)") || exit 1
+  echo "$IOS_VERSION"
+}
+
+macos_version() {
+  [ -n "$MACOS_VERSION" ] || MACOS_VERSION=$(makefile_version "$(macos_pkg)") || exit 1
+  echo "$MACOS_VERSION"
+}
 
 # ---------------------------------------------------------------- helpers ----
 
@@ -136,8 +196,10 @@ tarball() { # $1 = top-level dir name, $2 = staging root
 # ------------------------------------------------------------------- iOS -----
 
 package_ios() {
-  local top=libmpv-xcframeworks_${IOS_VERSION}_ios-universal-video-default
-  local stage=$OUTDIR/.stage-ios
+  local ver top stage
+  ver=$(ios_version)   # plain assignment, so `set -e` catches a lookup failure
+  top=libmpv-xcframeworks_${ver}_ios-universal-video-default
+  stage=$OUTDIR/.stage-ios
   rm -rf "$stage"; mkdir -p "$stage/$top/Mpv.xcframework"
 
   echo "### iOS -> $top"
@@ -159,8 +221,10 @@ package_ios() {
 # ----------------------------------------------------------------- macOS -----
 
 package_macos() {
-  local top=libmpv-xcframeworks_${MACOS_VERSION}_macos-universal-video-default
-  local stage=$OUTDIR/.stage-macos
+  local ver top stage
+  ver=$(macos_version)  # plain assignment, so `set -e` catches a lookup failure
+  top=libmpv-xcframeworks_${ver}_macos-universal-video-default
+  stage=$OUTDIR/.stage-macos
   rm -rf "$stage"; mkdir -p "$stage/$top/Mpv.xcframework"
 
   echo "### macOS -> $top"

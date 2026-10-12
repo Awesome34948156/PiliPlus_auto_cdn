@@ -75,9 +75,12 @@ correct and a large size win. **Do not add the siblings back.**
 | macOS tarball | `v0.6.0` | `media_kit_libs_macos_video`'s `MPV_XCFRAMEWORKS_VERSION` |
 
 Those two version numbers only name the files; the contents are always ours.
-They have to keep matching the Makefiles the packages actually ship, so if a
-`media_kit_libs_*` bump is ever taken, change `IOS_VERSION` / `MACOS_VERSION`
-to match (they are overridable as environment variables).
+They have to match the Makefiles the packages actually ship, so both
+`stage-mpv.sh` and `package.sh` now read `MPV_XCFRAMEWORKS_VERSION` straight out
+of the target package's `Makefile` (located via `pubspec.lock`) rather than
+hard-coding it — a `media_kit_libs_*` bump then needs no edit here. `IOS_VERSION`
+/ `MACOS_VERSION` remain as environment overrides for staging against a package
+whose checkout is not in `pub-cache`.
 
 ## Traps already paid for
 
@@ -130,7 +133,12 @@ the API cannot drift — and runs it. mpvgl.c stands up a CGL 3.2 core context a
 calls `mpv_render_context_create(MPV_RENDER_API_TYPE_OPENGL)` with no
 `MPV_RENDER_PARAM_HW_FRAMES`, which is what media_kit's `TextureHW` does, then
 renders into an FBO and reads the centre pixel back. Pass = **non-black readback,
-0 render errors, `hwdec-current: videotoolbox`**, and the exit code is the verdict:
+0 render errors, and `hwdec-current: videotoolbox`** — mpvgl.c folds all three
+into its exit code, which is the verdict. The `hwdec-current` term is the one
+that matters here: a silent fall back to `libdav1d` still renders clean,
+non-black frames, so a frames-only check would pass and hide the very bug this
+exists to catch. The exact `videotoolbox` match is deliberate — `videotoolbox-copy`
+(`mpvtest.c`'s copy-back path) must not pass:
 
 ```
 frames rendered through vo=libmpv + GL render API: 30 (errors: 0)

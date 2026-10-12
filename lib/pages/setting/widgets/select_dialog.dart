@@ -1,7 +1,5 @@
 import 'dart:async';
 
-import 'package:PiliPlus/http/browser_ua.dart';
-import 'package:PiliPlus/http/constants.dart';
 import 'package:PiliPlus/http/video.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
@@ -73,18 +71,9 @@ class SelectDialog<T> extends StatelessWidget {
   }
 }
 
-/// Phase 1 screens every mirror for reachability with a small sample and a
-/// short deadline, running [_kProbeConcurrency] at a time.
-const _kProbeConcurrency = 6;
-const _kProbeBytes = 256 * 1024;
-const _kProbeMicros = 3 * 1000 * 1000;
-const _kProbeConnect = Duration(seconds: 3);
-const _kProbeReceive = Duration(seconds: 3);
-
-/// Phase 2 measures the survivors one at a time so the reported MB/s stays
-/// comparable to a single-stream playback.
-const _kMeasureBytes = 2 * 1024 * 1024;
-const _kMeasureMicros = 8 * 1000 * 1000;
+// The probe/measure budgets live in [CdnSpeedTest] so the manual dialog and the
+// auto-switch cannot drift apart; this dialog keeps only the one deliberate
+// difference — Phase 2 runs serially (see [_testAllCdnServices]).
 
 class CdnSelectDialog extends StatefulWidget {
   final BaseItem? sample;
@@ -115,17 +104,7 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   void initState() {
     _cdnSpeedTest = Pref.cdnSpeedTest;
     if (_cdnSpeedTest) {
-      _dio =
-          Dio(
-              BaseOptions(
-                connectTimeout: const Duration(seconds: 15),
-                receiveTimeout: const Duration(seconds: 15),
-              ),
-            )
-            ..options.headers = {
-              'user-agent': BrowserUa.pc,
-              'referer': HttpString.baseUrl,
-            };
+      _dio = CdnSpeedTest.createDio();
       final length = CDNService.values.length;
       _cdnResList = List.generate(
         length,
@@ -182,17 +161,41 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     }
   }
 
+  /// Object size in bytes for the sample, or 0 when the server will not
+  /// disclose it. Only used to turn a fraction of the object into a byte offset
+  /// for the ranged samples; one mirror answers for all of them since every
+  /// host serves the same object.
+  Future<int> _probeObjectSize(List<String> urls) async {
+    final token = CancelToken();
+    try {
+      return await CdnSpeedTest.probeSize(
+            _dio,
+            urls.first,
+            token,
+            connectTimeout: CdnSpeedTest.probeConnect,
+            receiveTimeout: CdnSpeedTest.probeReceive,
+          ) ??
+          0;
+    } catch (e) {
+      if (kDebugMode) debugPrint('CDN size probe failed: $e');
+      return 0;
+    } finally {
+      if (!token.isCancelled) token.cancel();
+    }
+  }
+
   Future<void> _testAllCdnServices(BaseItem videoItem) async {
     // _startSpeedTest awaits the sample fetch first, so the dialog may already
     // be gone by the time we get here.
     if (_disposed || !mounted) return;
     // playUrls is a lazy sync* generator; materialize it once.
     final urls = videoItem.playUrls.toList();
-    // baseUrl/backupUrl carry no host and are not real mirrors, so there is
-    // nothing to probe.
-    final candidates = CDNService.values
-        .where((e) => e.host != null)
-        .toList(growable: false);
+    // [CdnSpeedTest.mirrors] already drops baseUrl/backupUrl (no host) and the
+    // known-dead hosts, so the manual dialog screens exactly the real mirrors
+    // the auto-switch does. The two dead rows still show in the list (which
+    // renders `CDNService.values`) — they just stay '---' instead of paying two
+    // 3 s NXDOMAIN timeouts each round.
+    final candidates = CdnSpeedTest.mirrors;
 
     if (urls.isEmpty) {
       for (final e in candidates) {
@@ -201,12 +204,29 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
       return;
     }
 
+    // One offset for every mirror keeps the reported MB/s comparable — all
+    // hosts serve the same object. The manual dialog has no live playhead: it
+    // can run before playback (the settings entry point) and, opened from the
+    // player, still measures every mirror at a single fixed offset. So the
+    // playhead inputs are passed as 0, which lands [CdnSpeedTest.targetOffset]
+    // on its interior floor (size × offsetFloor) — well past the fast head that
+    // flatters every mirror equally and hides one that is dead deeper in. The
+    // branch to avoid is the one that returns 0 (the object's head); only a
+    // failed size probe falls back there.
+    final offset = CdnSpeedTest.targetOffset(
+      size: await _probeObjectSize(urls),
+      playheadMs: 0,
+      cacheEndMs: 0,
+      durationMs: 0,
+      onlyPlayAudio: false,
+    );
+
     // Phase 1: screen every mirror for reachability, concurrently.
     _setProgress(0, candidates.length);
     var done = 0;
     for (final chunk in candidates.mapChunked(
-      _kProbeConcurrency,
-      (e) => _probeSingle(e, urls),
+      CdnSpeedTest.probeConcurrency,
+      (e) => _probeSingle(e, urls, offset),
     )) {
       if (_disposed || !mounted) return;
       for (final (item, alive) in await Future.wait(chunk)) {
@@ -218,7 +238,10 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     }
     if (_disposed || !mounted) return;
 
-    // Phase 2: measure the survivors one at a time at full bandwidth.
+    // Phase 2: measure the survivors **one at a time** so the reported MB/s
+    // stays comparable to a single-stream playback. This serial intent is
+    // deliberate — batching it with Phase 1's concurrency would report a
+    // contended rate no single stream ever sees.
     final survivors = candidates
         .where((e) => _alive[e.index])
         .toList(growable: false);
@@ -226,7 +249,7 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     var measured = 0;
     for (final item in survivors) {
       if (_disposed || !mounted) return;
-      await _testSingleCdn(item, urls);
+      await _testSingleCdn(item, urls, offset);
       _setProgress(++measured, survivors.length);
     }
     _setProgress(0, 0);
@@ -235,6 +258,7 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   Future<(CDNService, bool)> _probeSingle(
     CDNService item,
     List<String> urls,
+    int offset,
   ) async {
     try {
       final url = VideoUtils.getCdnUrl(urls, defaultCDNService: item);
@@ -242,10 +266,11 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
       final res = await _measureDownloadSpeed(
         url,
         item.index,
-        maxBytes: _kProbeBytes,
-        maxMicros: _kProbeMicros,
-        connectTimeout: _kProbeConnect,
-        receiveTimeout: _kProbeReceive,
+        offset: offset,
+        maxBytes: CdnSpeedTest.probeBytes,
+        maxMicros: CdnSpeedTest.probeMicros,
+        connectTimeout: CdnSpeedTest.probeConnect,
+        receiveTimeout: CdnSpeedTest.probeReceive,
       );
       return (item, res != null);
     } catch (e) {
@@ -254,7 +279,11 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     }
   }
 
-  Future<void> _testSingleCdn(CDNService item, List<String> urls) async {
+  Future<void> _testSingleCdn(
+    CDNService item,
+    List<String> urls,
+    int offset,
+  ) async {
     final index = item.index;
     try {
       final cdnUrl = VideoUtils.getCdnUrl(urls, defaultCDNService: item);
@@ -263,8 +292,9 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
       final res = await _measureDownloadSpeed(
         cdnUrl,
         index,
-        maxBytes: _kMeasureBytes,
-        maxMicros: _kMeasureMicros,
+        offset: offset,
+        maxBytes: CdnSpeedTest.measureBytes,
+        maxMicros: CdnSpeedTest.measureMicros,
       );
       if (res == null) throw TimeoutException('测速超时');
       _updateSpeedResult(index, res.$1, res.$2);
@@ -277,25 +307,29 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
 
   /// Returns `(bytes downloaded, elapsed microseconds)`, or null when nothing
   /// arrived. Aborting at a cap is a normal result; a genuine network failure
-  /// rethrows.
+  /// rethrows. Reads from [offset] (see [CdnSpeedTest.measureAt]) so a mirror is
+  /// judged on bytes past the head, not on the head that flatters every host.
   Future<(int, int)?> _measureDownloadSpeed(
     String url,
     int index, {
+    required int offset,
     required int maxBytes,
     required int maxMicros,
     Duration? connectTimeout,
     Duration? receiveTimeout,
-  }) {
-    return CdnSpeedTest.measure(
+  }) async {
+    final sample = await CdnSpeedTest.measureAt(
       _dio,
       url,
       _tokens[index] = CancelToken(),
+      offset: offset,
       maxBytes: maxBytes,
       maxMicros: maxMicros,
       connectTimeout: connectTimeout,
       receiveTimeout: receiveTimeout,
       isCancelled: () => _disposed || !mounted,
     );
+    return sample == null ? null : (sample.bytes, sample.micros);
   }
 
   void _updateSpeedResult(int index, int downloaded, int duration) {

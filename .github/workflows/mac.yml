@@ -53,9 +53,27 @@ jobs:
 
       - name: Prepare Upload
         run: |
+          set -euo pipefail
           npm install --global create-dmg
-          create-dmg build/macos/Build/Products/Release/PiliPlus.app || true
-        continue-on-error: true
+          rm -f PiliPlus*.dmg
+          # create-dmg styles the volume with Finder AppleScript and returns
+          # non-zero on headless CI even when the image is perfectly good, so its
+          # exit code alone is not the verdict -- but do not blanket-ignore it
+          # either. A *mid-run* failure leaves a truncated PiliPlus.dmg, and the
+          # `mv` below would rename that and the Release step would publish the
+          # half-written image: worse than a failed build. Verify the artifact
+          # instead of trusting the exit code.
+          if ! create-dmg build/macos/Build/Products/Release/PiliPlus.app; then
+            echo "note: create-dmg exited non-zero; verifying the artifact anyway"
+          fi
+          dmg=""
+          for f in PiliPlus*.dmg; do
+            if [ -e "$f" ]; then dmg=$f; break; fi
+          done
+          [ -n "$dmg" ] || { echo "::error::create-dmg produced no .dmg"; exit 1; }
+          size=$(stat -f%z "$dmg")
+          echo "artifact: $dmg ($size bytes)"
+          [ "$size" -ge 10485760 ] || { echo "::error::$dmg looks truncated ($size bytes)"; exit 1; }
 
       - name: Rename DMG
         run: mv PiliPlus*.dmg PiliPlus_macos_${{ env.version }}.dmg

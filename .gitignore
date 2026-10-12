@@ -154,4 +154,8 @@ pili_release.json
 
 dist
 
+# 从 Flutter 模板抄来的一条（fa85ae47a）。本仓里它唯一命中的路径就是 test/ 目录本身，
+# 于是 test/** 被整片忽略 —— 新加的测试文件不会被 git add 收进去（test/ 下现存那五个
+# 都是当初 git add -f 强加的）。补一条反规则放行 test/，其余原意不变。
 test*
+!test/

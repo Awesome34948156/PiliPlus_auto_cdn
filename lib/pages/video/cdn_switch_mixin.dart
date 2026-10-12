@@ -364,6 +364,11 @@ mixin CdnSwitchMixin on GetxController {
   /// 常规测速只在缓冲吃紧时才跑。见 [_onCdnProbeTick]。
   bool _cdnPreflightPending = false;
 
+  /// 本页**有没有挂载过**。只给 [attachCdnSwitch] 分场合用：页面创建时那一次
+  /// （宿主 `onInit`）要武装装载后的预检，之后每次回页（`didPopNext`）不要 —— 两次
+  /// 调用的是同一个方法，只能靠它区别。见 [restartCdnProbe] 的 `armPreflight`。
+  bool _cdnAttachedOnce = false;
+
   /// 本次预检从什么时候开始等（起播那一刻算起，不是页面创建时刻）。
   DateTime? _cdnPreflightSince;
 
@@ -602,8 +607,14 @@ mixin CdnSwitchMixin on GetxController {
       );
       return;
     }
-    _cdnQuickProbeAt = now;
-    _onPlayerStall(position, trigger: _CdnTrigger.rebuffer);
+    // 节流只在**这次探测真的起步了**之后才算数。原先先写时间戳再交给闸门，
+    // 被 busy/冷却/进展闸挡下的那一次照样把接下来 [_kCdnRebufferCooldown] 秒的
+    // 探测机会吃掉了 —— 那几个闸本来就是"现在别动"，而节流却被它顺手消费，
+    // 于是画面一直冻着也要等满 30s 才轮到下一次。连续 rebuffer 刷不爆：一旦被
+    // 接受，时间戳当场落下，后面的都在节流里。
+    if (_onPlayerStall(position, trigger: _CdnTrigger.rebuffer)) {
+      _cdnQuickProbeAt = now;
+    }
   }
 
   /// 解码错误风暴（见 `PlPlayerController.onDecodeError`）触发的换源。
@@ -614,7 +625,14 @@ mixin CdnSwitchMixin on GetxController {
   void _onDecodeError(Duration position) =>
       _onPlayerStall(position, trigger: _CdnTrigger.decode);
 
-  void _onPlayerStall(
+  /// 返回**这次触发有没有真的起步**（闸门全过、[_autoSwitchLoop] 已起）。调用方
+  /// 靠这个把"这一次没被丢"和"被丢了"分开：小卡顿的节流（[_onPlayerRebuffer]）
+  /// 和预检的 pending（[_onCdnProbeTick]）都只该在起步之后才消费，否则一次被
+  /// 冷却/进展闸挡下的触发会白吃掉下一次机会（"被丢弃的触发不该改状态"）。
+  ///
+  /// 签名仍是 `void Function(Duration)` 可赋值（`onStall` 是 ValueChanged），所以
+  /// 直接挂在播放器上报口上不受影响。
+  bool _onPlayerStall(
     Duration position, {
     _CdnTrigger trigger = _CdnTrigger.stall,
   }) {
@@ -624,13 +642,13 @@ mixin CdnSwitchMixin on GetxController {
         'CDN 自动切换: 忽略$what @${position.inSeconds}s '
         '(busy=$_cdnAutoBusy closed=$isClosed eligible=$_cdnAutoEligible)',
       );
-      return;
+      return false;
     }
 
     final cooldownUntil = _cdnGiveUpUntil;
     if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
       debugPrint('CDN 自动切换: 冷却中，忽略$what @${position.inSeconds}s');
-      return;
+      return false;
     }
 
     // 距上次尝试没有实质进展 → 这个视频是真的放不动，不要再花钱测速。
@@ -652,7 +670,7 @@ mixin CdnSwitchMixin on GetxController {
         'CDN 自动切换: 距上次尝试只推进了 '
         '${(position - _cdnLastAttemptPos).inSeconds}s，忽略',
       );
-      return;
+      return false;
     }
 
     debugPrint('CDN 自动切换: ${_describeTrigger(trigger, position)}');
@@ -671,6 +689,7 @@ mixin CdnSwitchMixin on GetxController {
       // 两条 loop 并发跑。
       if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;
     });
+    return true;
   }
 
   /// 触发时的日志正文（`CDN 自动切换: ` 之后那一段）。
@@ -695,12 +714,22 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 启动后台测速：每 [_kCdnPreflightPoll] 检查一次，做完那一次预检之后就
   /// 改按 [_kCdnProbeInterval] 走。换 P / 换集（[onReset]）会重新计时。
-  void restartCdnProbe() {
-    _cdnPreflightPending = true;
-    _cdnPreflightSince = null;
+  ///
+  /// [armPreflight] 把"重新挂定时器"和"武装预检"两件事分开。回页（[attachCdnSwitch]
+  /// 的第二次及以后）只要前者：那是"重新露面"，不是新视频，无条件再武装一次预检
+  /// 等于每次从相关视频返回都白花一轮 ~6MB 的测速。传假时**不碰**
+  /// [_cdnPreflightPending]，所以被顶掉期间还没做的那次预检照旧留着。传真（默认）
+  /// 的是换 P / 换集（[onReset]）与页面的**首次**挂载。
+  void restartCdnProbe({bool armPreflight = true}) {
+    if (armPreflight) {
+      _cdnPreflightPending = true;
+      _cdnPreflightSince = null;
+    }
     _cdnProbeTimer?.cancel();
+    // 节拍跟着**当前 pending 状态**走，而不是跟着入参：回页时若预检还没做，就
+    // 仍用 [_kCdnPreflightPoll] 让它尽快跑掉；做完了才降到 [_kCdnProbeInterval]。
     _cdnProbeTimer = Timer.periodic(
-      _kCdnPreflightPoll,
+      _cdnPreflightPending ? _kCdnPreflightPoll : _kCdnProbeInterval,
       (_) => _onCdnProbeTick(),
     );
   }
@@ -738,7 +767,7 @@ mixin CdnSwitchMixin on GetxController {
   ///
   /// **幂等**：已经在挂载状态时直接返回。调用方之一是页面重新露面（`didPopNext`，
   /// 关掉弹层/子页后回来），那里每次都调；不幂等的话，一次普通返回就会把正在攒
-  /// 的解码风暴计数清空、把预检重新点火。
+  /// 的解码风暴计数清空、把后台定时器重置。
   void attachCdnSwitch() {
     if (_cdnIsAttached) return;
     // 能走到这里，说明刚才回调不在我手上 —— 典型情形是相关视频跳转时新页抢走了
@@ -762,7 +791,14 @@ mixin CdnSwitchMixin on GetxController {
       ..onBufferStarve = _onPlayerBufferStarve
       ..onRebuffer = _onPlayerRebuffer
       ..onDecodeError = _onDecodeError;
-    restartCdnProbe();
+    // **首次挂载**（页面 `onInit`）要武装装载后那一次预检 —— 那正是"新视频装载
+    // 后测一轮"的入口（初次装载走 `queryVideoUrl`，**不经过** `onReset`，所以不
+    // 能指望 onReset 替它武装）。之后每次**回页**（`didPopNext`）只重挂定时器，
+    // **不**重置 pending：那个视频的预检要么已经做过、要么还留着 pending 在等，
+    // 无条件再武装等于每次从相关视频返回都白花一轮 ~6MB 的测速。两次调用的是
+    // 同一个方法，只能靠"本页有没有挂载过"来分。
+    restartCdnProbe(armPreflight: !_cdnAttachedOnce);
+    _cdnAttachedOnce = true;
   }
 
   /// 页面销毁：只撤掉自己的回调，别把新页面的覆盖掉。
@@ -789,6 +825,22 @@ mixin CdnSwitchMixin on GetxController {
     // 再攒（推迟换源），或者让它在 _awaitRecovery 里因为 lastDecoderCorruptionAt
     // 被抹掉而提前宣布恢复。本页自己的状态照清。
     resetCdnAutoSwitch(resetPlayerAccounting: wasAttached);
+  }
+
+  /// 页面销毁。宿主 `controller.dart` 的 `onClose` 末尾会 `super.onClose()` 一路
+  /// 走到这里（mixin 是 `with` 列表里的最后一个，排在 `BlockMixin` 之上）。
+  ///
+  /// 没有 `dispose` 可重写：GetX 的生命周期钩子是 `onClose`（`GetxController`
+  /// 从 `ListenableMixin` 拿到的那个 `dispose()` 只是 ChangeNotifier 式的通知
+  /// 清理，不是生命周期；Get 删除控制器走的是 `onDelete()` → `onClose()`）。所以
+  /// 关 [Dio] 这件事挂在 `onClose` 上。除了撤回调（[detachCdnSwitch]），还要把
+  /// 测速用的 [Dio] 关掉 —— [_cdnAutoDio] 一旦建起来就常驻（每轮复用它省掉重连
+  /// 开销），不关就跟着页面泄漏。
+  @override
+  void onClose() {
+    _cdnAutoDio?.close();
+    _cdnAutoDio = null;
+    super.onClose();
   }
 
   /// mpv 自己的回填水位；取不到（或过小）返回 null，表示不启用。
@@ -838,6 +890,21 @@ mixin CdnSwitchMixin on GetxController {
           DateTime.now().difference(since) < _kCdnPreflightDeadline) {
         return; // 再等等：初期突发流量还没过去，这时候测不准
       }
+    } else {
+      if (floor == null) return;
+      if (plPlayerController.bufferedAhead >= floor) return;
+    }
+
+    // **先过闸门，再决定要不要消费 pending。** 反过来（先把 pending 清掉、把
+    // 定时器降到 [_kCdnProbeInterval] 档，再去调 [_onPlayerStall]）会漏：那一调
+    // 可能被冷却/进展闸当场挡下，而 pending 已经清、定时器已经变慢，这次预检就
+    // **静默消失**了 —— 要等整整一轮 2 分钟才轮到下一次。[_onPlayerStall] 返回的
+    // 正是"有没有真的起步"，据此消费。
+    final accepted = _onPlayerStall(
+      Duration(seconds: plPlayerController.position.value),
+      trigger: preflight ? _CdnTrigger.preflight : _CdnTrigger.probe,
+    );
+    if (preflight && accepted) {
       _cdnPreflightPending = false;
       _cdnPreflightSince = null;
       _cdnProbeTimer?.cancel();
@@ -845,15 +912,7 @@ mixin CdnSwitchMixin on GetxController {
         _kCdnProbeInterval,
         (_) => _onCdnProbeTick(),
       );
-    } else {
-      if (floor == null) return;
-      if (plPlayerController.bufferedAhead >= floor) return;
     }
-
-    _onPlayerStall(
-      Duration(seconds: plPlayerController.position.value),
-      trigger: preflight ? _CdnTrigger.preflight : _CdnTrigger.probe,
-    );
   }
 
   /// 判据 3 的回调，两头都走这里：前向缓冲在变少（供不上），或者余量涨到失真
@@ -994,7 +1053,12 @@ mixin CdnSwitchMixin on GetxController {
     //
     // 用 [PLPlayerController.telemetryDiverged] **现场取值**而不是记下触发那一刻：
     // 一轮测速要跑好几秒，期间可能自己缓过来了，缓过来就不该动播放器。
-    if (!switched && plPlayerController.telemetryDiverged) {
+    // 解码错误这一档**不走**这条覆写。它的病在**字节**上，不在"音视频两轨时间轴
+    // 分家"上 —— 而 `telemetryDiverged` 在解码故障里恰恰常为真（坏镜像余量填得
+    // 满、位置还被音频时钟推着走），于是原先这里会把"没找到可换的镜像"这个**正确
+    // 的**结论改写成"重载当前源"，去对同一个**坏 Media** 再 refreshPlayer 一次：
+    // 治错病 —— 本机解码会话真坏了的话，换源和重载同一个 Media 都不治。
+    if (!switched && !force && plPlayerController.telemetryDiverged) {
       debugPrint('CDN 自动切换: 画面已冻（余量失真），重载当前源');
       plPlayerController.refreshPlayer();
       giveUp = '画面已冻，没有更快的镜像，已重载当前源';
@@ -1482,7 +1546,19 @@ mixin CdnSwitchMixin on GetxController {
     if (generation != _cdnGeneration) return false;
     final newVideo = VideoUtils.cdnUrlFor(firstVideo.playUrls, service);
     // 永远不要用空的 source 调 setDataSource。
-    if (newVideo.isEmpty) return false;
+    if (newVideo.isEmpty) {
+      // 这是**真的失败**，不是作废轮：上面那句 generation 不符的 return 才是作废
+      // （作废没试过任何东西，不装冷却是对的），而这里 host 改写对这条镜像压根
+      // 不生效、一个可用 URL 都拿不出来。[_autoSwitchLoop] 拿到 false 后直接
+      // return，既不写 [_cdnGiveUpUntil] 也没换过源 —— 于是下一次触发照样选中它、
+      // 照样空手而归，无限重试。装一档冷却把这个死循环掐掉。
+      _cdnGiveUpUntil = DateTime.now().add(_kCdnGiveUpCooldown);
+      debugPrint(
+        'CDN 自动切换: ${service.desc} host 改写后地址为空，放弃本次并冷却 '
+        '${_kCdnGiveUpCooldown.inSeconds}s',
+      );
+      return false;
+    }
 
     // 续播点不能用实时 position：换源会重载播放器，重载期间它短暂归零、也可能
     // 停在 seek 中途的中间值。实测一次换源本应在 1619s，重载完却停在 351s，
