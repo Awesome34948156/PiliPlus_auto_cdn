@@ -47,8 +47,14 @@ typedef _CdnRound = ({
 /// **结论够不够格直接换**。
 ///
 /// 前五个触发是同一套语义：当前镜像"喂不动"，所以要拿候选跟它比速度，赢过
-/// [_kCdnStarveRatio] 才值得付一次重载。[_CdnTrigger.decode] 是唯一的例外 ——
-/// 它比的根本不是速度，见那个成员的注释。
+/// [_kCdnStarveRatio] 才值得付一次重载。剩下两个各例外在一处，**而且例外的
+/// 不是同一件事**：
+///
+/// - **闸门豁免**（放弃冷却 + 进展门槛）= [decode] 和 [diverged]。它们的画面
+///   当场就是冻的，等不起那 20~60 秒。
+/// - **比值关豁免**（`force`）= **只有** [decode]。理由见 [diverged] 的注释。
+///
+/// 这个不对称是有意的，别顺手统一掉。
 enum _CdnTrigger {
   /// 播放器判据 1/2：位置长时间不推进。
   stall,
@@ -73,7 +79,26 @@ enum _CdnTrigger {
   /// **是快的** —— 实测它把垃圾字节以 2~14MB/s 送过来，比健康镜像还快，所以
   /// 每轮测速都判"基线健康 —— 卡顿多半不在 CDN"，然后什么都不做。要比的是
   /// "谁的字节能解出画面"，那是测速测不出来的东西，只有解码器知道。
-  decode;
+  decode,
+
+  /// 判据 3 的另一副面孔：余量**离谱地大**（见 `PlPlayerController.
+  /// onTelemetryDiverged`）—— 音频在走、画面冻着，音视频两轨的时间轴分家了。
+  ///
+  /// 它拿 [decode] 那两条**闸门**豁免（放弃冷却、进展门槛）：病在"画面当场就是
+  /// 冻的"，而那两道闸会把信号按到下一个补报周期之后。2026-10-12 真机就是这么
+  /// 挨的 —— 一次无关尝试留下的 60s 放弃冷却吞掉三次上报里的两次，画面多冻了
+  /// 61 秒；而它的节流是播放器侧的 [_kStarveRepeat]（20s 补报一次），被吞掉的
+  /// 那一次要再等 20 秒。
+  ///
+  /// 但它**不拿** [decode] 的比值关豁免（`force`）。这是两者唯一的不对称，四条
+  /// 理由：① `force` 会关掉 [_autoSwitchLoop] 收尾那道"没找到更快的镜像就重载
+  /// 当前源"的兜底，而那句正是这个故障唯一不换源的解法；② `force && attempt == 0`
+  /// 会把当前 host 整集拉黑，理由是"给的字节解不出画面"—— 而失真这个签名分不出
+  /// "视频轨死了"和"位置读数归零造成的假失真"，后者的字节是好的；③
+  /// `_awaitRecovery(decode: true)` 只看"有没有新的解码错误"，失真故障零解码
+  /// 错误，换完约 8 秒就报"已恢复"—— 画面可能还冻着；④ 它压根不需要：坏源拿不出
+  /// 有效测速样本，[_pickFastestCdn] 本来就会走"基线无有效速度，直接切换"。
+  diverged;
 
   /// 日志/toast 里的简称。
   String get label => switch (this) {
@@ -83,7 +108,18 @@ enum _CdnTrigger {
     _CdnTrigger.preflight => '预检',
     _CdnTrigger.rebuffer => '小卡顿',
     _CdnTrigger.decode => '解码错误',
+    _CdnTrigger.diverged => '画面已冻',
   };
+
+  /// 这个触发要不要**跳过**放弃冷却和进展门槛这两道闸。
+  ///
+  /// 两道闸都是"现在别动"的判决，隐含前提是"这故障可以等"；而 [decode] 和
+  /// [diverged] 的画面**当场就是冻的**，等不起。它们自己的节流在播放器侧
+  /// （[_kDecodeErrorCooldown] / [_kStarveRepeat]），比这两道闸松得多 —— 闸和
+  /// 节流叠起来就是"永远不救"。
+  ///
+  /// 别把它跟 [force] 混为一谈：那一条（跳过比值关）只有 [decode] 有。
+  bool get bypassesGates => this == decode || this == diverged;
 }
 
 // ---------------------------------------------------------------------------
@@ -651,17 +687,22 @@ mixin CdnSwitchMixin on GetxController {
       return false;
     }
 
-    // 解码错误同样不吃放弃冷却（理由和下面绕过进展闸那一条同源）：病在**字节**上、
-    // 画面当场就是冻的，冷却期那 20~60s 等不起；而它自己的节流是播放器侧的
-    // [_kDecodeErrorCooldown]（一次故障只报一次）—— 两道闸叠起来就是"永远不救"。
+    // [decode] 和 [diverged] 不吃放弃冷却（理由和下面绕过进展闸那一条同源）：
+    // 这两档的画面**当场就是冻的**，冷却期那 20~60s 等不起；而它们各自的节流在
+    // 播放器侧 —— [decode] 走 `_kDecodeErrorCooldown`（一次故障只报一次）、
+    // [diverged] 走 `_kStarveRepeat`（20s 补报一次）—— 两道闸叠起来就是"永远不救"。
     //
-    // 2026-10-12 真机取证：那次**唯一**的风暴上报（13:56:10.169）正好落在轮 1 挣来的
-    // 20s 冷却（`_kCdnUnmeasuredCooldown`）里，被这里吞掉；而播放器侧上报是**一次性
-    // 消费**（先清窗口、再武装 30s 静默、最后才回调，通道是 `void` 没有回执），所以
-    // 那个瞬时风暴再也不会重报 —— 画面一直冻到 6 分钟后定期档碰巧撞上"基线无有效
-    // 样本 → 直接切换"才恢复。
+    // 2026-10-12 真机取证（同一天、两次不同的故障，都栽在这道闸上）：
+    // - 13:56:10.169 那次**唯一**的风暴上报正好落在轮 1 挣来的 20s 冷却
+    //   （`_kCdnUnmeasuredCooldown`）里，被这里吞掉；而播放器侧上报是**一次性
+    //   消费**（先清窗口、再武装 30s 静默、最后才回调，通道是 `void` 没有回执），
+    //   所以那个瞬时风暴再也不会重报 —— 画面一直冻到 6 分钟后定期档碰巧撞上
+    //   "基线无有效样本 → 直接切换"才恢复。
+    // - 21:29:22 / 21:29:43 两次「遥测失真」（切画质拿到坏地址，音频在走、画面
+    //   冻着）被 21:28:48 一次**无关**尝试留下的 60s 放弃冷却吞掉，直到 21:30:04
+    //   冷却过期才放行 —— 画面多冻了 61 秒。
     final cooldownUntil = _cdnGiveUpUntil;
-    if (trigger != _CdnTrigger.decode &&
+    if (!trigger.bypassesGates &&
         cooldownUntil != null &&
         DateTime.now().isBefore(cooldownUntil)) {
       debugPrint('CDN 自动切换: 冷却中，忽略$what @${position.inSeconds}s');
@@ -671,16 +712,16 @@ mixin CdnSwitchMixin on GetxController {
     // 距上次尝试没有实质进展 → 这个视频是真的放不动，不要再花钱测速。
     // 缓冲饥饿的位置一直在被音频时钟推着走，通常能正常通过这一关。
     //
-    // 解码错误是例外：它的病在**字节**上，跟位置动不动没关系，而画面冻住时
-    // 位置也常常是冻的 —— 拿位置当门槛等于"冻得越死越不许救"。压住它的是
-    // 播放器那边的 [_kDecodeErrorCooldown]（一次故障只报一次），这里不必再压。
+    // [decode] 和 [diverged] 是例外：它们跟位置动不动没关系，而画面冻住时
+    // 位置也常常是冻的 —— 拿位置当门槛等于"冻得越死越不许救"。压住它们的是
+    // 播放器那边的节流（`_kDecodeErrorCooldown` / `_kStarveRepeat`），这里不必再压。
     // 位置回退（用户回拖、playRepeat 循环）会让下面的差值恒为负，闸门就永远
     // 关上了 —— 直到播回上一次尝试的位置为止。回退一律当作新的播放区间，重开闸。
     // 放在这里（前面几道 return 之后）：被丢弃的触发不该改状态。
     if (_cdnLastAttemptPos != Duration.zero && position < _cdnLastAttemptPos) {
       _cdnLastAttemptPos = Duration.zero;
     }
-    if (trigger != _CdnTrigger.decode &&
+    if (!trigger.bypassesGates &&
         _cdnLastAttemptPos != Duration.zero &&
         position - _cdnLastAttemptPos < _kCdnMinReProgress) {
       debugPrint(
@@ -727,6 +768,9 @@ mixin CdnSwitchMixin on GetxController {
         _CdnTrigger.decode =>
           '解码错误 @${position.inSeconds}s，当前镜像给的是坏字节'
               '（画面已解不出来），直接换源、不看速度',
+        _CdnTrigger.diverged =>
+          '画面已冻 @${position.inSeconds}s，音频在走而画面冻着'
+              '（余量涨到失真），开始找可用镜像',
       };
 
   /// 启动后台测速：每 [_kCdnPreflightPoll] 检查一次，做完那一次预检之后就
@@ -806,6 +850,7 @@ mixin CdnSwitchMixin on GetxController {
       ..resetDecodeErrorAccounting()
       ..onStall = _onPlayerStall
       ..onBufferStarve = _onPlayerBufferStarve
+      ..onTelemetryDiverged = _onTelemetryDiverged
       ..onRebuffer = _onPlayerRebuffer
       ..onDecodeError = _onDecodeError;
     // **首次挂载**（页面 `onInit`）要武装装载后那一次预检 —— 那正是"新视频装载
@@ -828,6 +873,9 @@ mixin CdnSwitchMixin on GetxController {
     }
     if (plPlayerController.onBufferStarve == _onPlayerBufferStarve) {
       plPlayerController.onBufferStarve = null;
+    }
+    if (plPlayerController.onTelemetryDiverged == _onTelemetryDiverged) {
+      plPlayerController.onTelemetryDiverged = null;
     }
     if (plPlayerController.onRebuffer == _onPlayerRebuffer) {
       plPlayerController.onRebuffer = null;
@@ -932,11 +980,24 @@ mixin CdnSwitchMixin on GetxController {
     }
   }
 
-  /// 判据 3 的回调，两头都走这里：前向缓冲在变少（供不上），或者余量涨到失真
-  /// （音频在走、画面冻着 —— 播放器里的 `telemetryDiverged`）。换源型故障只在这
-  /// 里露头，播放器只负责上报，怎么处理由本页决定（和 [onStall] 同一个决策链）。
+  /// 判据 3 低水位那一支的回调：前向缓冲在变少（供不上）。
+  ///
+  /// 判据 3 的**另一支**（余量涨到失真、音频在走而画面冻着）不从这里进来，见
+  /// [_onTelemetryDiverged]。两支曾经共用一个入口，2026-10-12 真机证明那样会让
+  /// 失真那一支拿不到闸门豁免（见 [_CdnTrigger.diverged]）。
+  ///
+  /// 播放器只负责上报，怎么处理由本页决定（和 [onStall] 同一个决策链）。
   void _onPlayerBufferStarve(Duration position) =>
       _onPlayerStall(position, trigger: _CdnTrigger.starve);
+
+  /// 判据 3 余量失真那一支的回调（见 `PlPlayerController.onTelemetryDiverged`）：
+  /// 音频在走、画面冻着，音视频两轨的时间轴分家了。
+  ///
+  /// 与 [decode] 同一套入口，只改一件事：**拿到那两道闸门豁免**（见
+  /// [_CdnTrigger.bypassesGates]）。比值关照旧 —— 为什么不跟 [decode] 一样跳过它、
+  /// 以及这么定的四条理由，见 [_CdnTrigger.diverged]。
+  void _onTelemetryDiverged(Duration position) =>
+      _onPlayerStall(position, trigger: _CdnTrigger.diverged);
 
   /// CDN 切换的三个 toast 都走这里，好让设置页一个开关就能全关掉。
   /// 关掉的只是提示：[debugPrint] 那一路日志不受影响。

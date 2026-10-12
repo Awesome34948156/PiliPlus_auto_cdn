@@ -231,10 +231,25 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 两种卡顿判据都看不到，只有缓冲余量在悄悄变少。
   /// 与 [onStall] 一样，播放器只上报事实，如何恢复由页面决定。
   ///
-  /// 同一条判据还负责另一半：余量**离谱地大**（见 [_kDivergedFactor]）同样是
-  /// 这个故障的指纹——那时不是"余量变少"而是音视频两轨的时间轴已经分家。只防
-  /// 低的一侧会让画面冻着而三个判据同时失明，实测就是这样。
+  /// 只负责低的那一侧（余量在变少）。反过来的那一侧——余量**离谱地大**、
+  /// 音视频两轨时间轴分家——走 [onTelemetryDiverged]：虽然是同一个故障的指纹，
+  /// 但页面侧的处置完全不同，见那个字段。
   ValueChanged<Duration>? onBufferStarve;
+
+  /// 遥测失真回调：前方余量**离谱地大**（见 [_kDivergedFactor]），音视频两轨的
+  /// 时间轴已经分家——"只有声音、画面冻住"最可靠的那条信号。只防低的一侧会让
+  /// 画面冻着而判据 1、2 同时失明，实测就是这样。
+  ///
+  /// 与 [onBufferStarve] 同源（都是 [bufferedAhead] 这个读数），但病不一样，
+  /// 恢复手段也不一样：那边是"供不上"，换条更快的镜像就行；这边位置还被音频
+  /// 时钟推着走，只有重开连接让两轨重新对齐才治得了。所以拆成两条回调——页面侧
+  /// 给"画面当场就是冻的"开的那几道豁免（放弃冷却、进展门槛），这条要拿到，
+  /// [onBufferStarve] 不该拿：2026-10-12 真机上，一次跟它无关的尝试留下 60s
+  /// 放弃冷却，把三次失真上报吞掉两次，画面多冻了 61 秒。
+  ///
+  /// 去重与补报跟 [onBufferStarve] **共用**一套状态（见 [_kStarveRepeat]）：两支
+  /// 说的是同一段"没在正常播放"，分开计时只会让复位点翻倍。
+  ValueChanged<Duration>? onTelemetryDiverged;
 
   /// 最敏感的一条：前向余量**一归零**就上报一次（每次归零只报一次，补回来
   /// 才重新武装）。前三条判据都要等 —— [onStall] 等 8 秒冻结、[_sampleRebuffer]
@@ -359,7 +374,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 连续多少个 1s 采样低于阈值才算饥饿。健康锯齿只在谷底停留一两拍。
   static const int _kStarveSeconds = 4;
 
-  /// 一段饥饿**持续**期间，每隔多久补报一次 [onBufferStarve]。
+  /// 一段饥饿**持续**期间，每隔多久补报一次 [onBufferStarve]（以及 [onTelemetryDiverged]，
+  /// 两支共用这一份节奏和去重状态）。
   ///
   /// 判据 3 原来是"一段饥饿只报一次"，而"这段饥饿结束"的判据是余量涨回 mpv
   /// 自己的水位（见 [_sampleStarve] 末尾）—— 镜像持续供不上（或像 2026-10-12
@@ -410,7 +426,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 到不了 2 倍。而"只有声音、画面冻住"时音频轨的读指针还在推进，
   /// `demuxer-cache-time` 被音频一路抬到上千秒，于是余量涨成上限的几十倍 ——
   /// **离谱地大**本身就是故障指纹，跟判据 3 的"趴在低位"是同一个故障的两副
-  /// 面孔，所以共用一条回调。
+  /// 面孔 —— 但页面侧的处置完全不同（一个换源就够，一个只有重开连接才治），
+  /// 所以走 [onTelemetryDiverged]，不跟"趴在低位"共用 [onBufferStarve]。
   static const double _kDivergedFactor = 3.0;
 
   Timer? _stallTicker;
@@ -2053,7 +2070,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     refreshPlayer();
   }
 
-  /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条走 [onBufferStarve]。
+  /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条的两副面孔分别走
+  /// [onBufferStarve]（余量趴在低位）和 [onTelemetryDiverged]（余量失真）。
   ///
   /// 1. 位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
   ///    不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
@@ -2247,6 +2265,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 播放位置，余量因此超过缓存上限好几倍 —— 位置还在推进、[isBuffering]
     // 也是假，判据 1、2 都看不见，只有这里能拦住。同样每段只报一次（可按
     // [_kStarveRepeat] 补报，跟上面那条共用一个去重状态）。
+    //
+    // 出口是 [onTelemetryDiverged]，**不是**上面那条低水位支走的 [onBufferStarve]：
+    // 两副面孔的恢复手段不同，理由见那个字段。
     if (telemetryDiverged) {
       if (!_starveReportDue(now)) return;
       final repeat = _starveLastReportAt != null;
@@ -2259,7 +2280,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                   '${_divergedAheadSec.toStringAsFixed(1)}s 的 '
                   '${_kDivergedFactor}x (音频在走，画面已冻) @${position.value}s',
       );
-      onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
+      onTelemetryDiverged?.call(
+        videoPlayerController?.state.position ?? Duration.zero,
+      );
       return;
     }
     // 只有补回 mpv 自己的水位才算这段饥饿真的结束了。

@@ -861,6 +861,205 @@ void main() {
     expect(reports, 4, reason: '新一段里越过 20s 没补报：\n${log.text}');
   });
 
+  // 判据 3 的两支分流（2026-10-12 log 17 取证）。原来"前向余量趴在低位"和"余量
+  // 涨到失真（音频在走、画面冻着）"共用 `onBufferStarve` 一条回调、共用
+  // `_CdnTrigger.starve` 一个标签，于是后者拿不到页面侧的闸门豁免 —— 那局真机日志
+  // 里，三次失真上报被一次**无关**尝试留下的 60s 放弃冷却吞掉两次，画面多冻了
+  // 61 秒，而它自己的节流是 20s 补报一次。修法是把失真那一支拆成独立触发
+  // `_CdnTrigger.diverged`（日志里叫「画面已冻」），给它 `decode` 那两条**闸门**
+  // 豁免，但**不给**比值关豁免。
+  //
+  // 这里盯三件事：出口分得干净、闸门豁免真的生效、以及没顺手拿到比值关豁免
+  // （那是被否掉的方案）。后两件都靠 log 17 的现场复放。
+  //
+  // 已知测不到的一处：进展闸（`position - _cdnLastAttemptPos < 3s`）那半截与冷却
+  // 那半截共用同一个谓词（`_CdnTrigger.bypassesGates`），所以下面那条用例的红证只
+  // 能证明冷却那半截。要单独红证进展闸得先让 `_cdnLastAttemptPos` 非零，而那要求
+  // 一轮真的换过源、且 `_awaitRecovery` 跑满 12s 窗口才返回 false —— 这半边在
+  // `decode` 档上同样是盲区，不是这次新欠的。别以为它测过了。
+  group('画面已冻独立成触发（判据 3 的两支分流）', () {
+    late PlPlayerController pc;
+
+    setUp(() {
+      pc = PlPlayerController.getInstance()
+        // 拿 reload 当"从头开始"：任何一次真实装载都会这样归零三条判据。
+        // `dataSource` 是 `late`，不摆好这里会抛。
+        ..dataSource = NetworkSource(videoSource: _baselineUrl, audioSource: null)
+        ..refreshPlayer()
+        ..buffer['demuxer-hysteresis-secs'] = '10' // 饥饿线 6.0s → 判据启用
+        ..buffer['cache-secs'] = '30' // 失真线 30 × 3 = 90s
+        ..duration.value = 3600
+        ..position.value = 100
+        ..buffered.value = 100
+        // 这两个是单例上的字段，上一个用例留下的闭包会跨用例计数。
+        ..onBufferStarve = null
+        ..onTelemetryDiverged = null;
+    });
+
+    tearDown(() {
+      pc
+        ..onBufferStarve = null
+        ..onTelemetryDiverged = null
+        // `buffer` 是 late final，两个键都会跨用例留下。全局 setUp 只归零
+        // hysteresis；`cache-secs` 留着 30 会让后面用例的 `telemetryDiverged`
+        // 凭空为真（失真线从 0 变成 90s）。
+        ..buffer['demuxer-hysteresis-secs'] = '0'
+        ..buffer['cache-secs'] = '0';
+    });
+
+    test('余量失真走新出口，低水位那支收不到', () {
+      var starve = 0;
+      var diverged = 0;
+      // 余量 95s：高过失真线 90s，也高过饥饿线 6.0s —— 只有失真那一支够得着。
+      // 它不需要连续几拍（那是低水位那支的规矩），一拍就该出声。
+      pc
+        ..onBufferStarve = (_) {
+          starve++;
+        }
+        ..onTelemetryDiverged = (_) {
+          diverged++;
+        }
+        ..position.value = 100
+        ..buffered.value = 195
+        ..debugSampleStarve(_sampleAt(0));
+
+      expect(diverged, 1, reason: '失真那一支没走新出口：\n${log.text}');
+      expect(
+        starve,
+        0,
+        reason: '失真那一支还落在 onBufferStarve 上 —— 拆分没做到：\n${log.text}',
+      );
+      expect(
+        log.has(
+          'CDN 遥测失真: 余量 95s 超过缓存上限 90.0s 的 3.0x '
+          '(音频在走，画面已冻) @100s',
+        ),
+        isTrue,
+        reason: '失真那支自己的判据没成立（余量算错了？）：\n${log.text}',
+      );
+    });
+
+    test('低水位仍走旧出口，新出口收不到', () {
+      var starve = 0;
+      var diverged = 0;
+      // 余量 0：趴在低位。这一支要连续 4 拍 —— 顺手钉住"这次改动没把它一起改了"。
+      pc
+        ..onBufferStarve = (_) {
+          starve++;
+        }
+        ..onTelemetryDiverged = (_) {
+          diverged++;
+        }
+        ..position.value = 100
+        ..buffered.value = 100
+        ..debugSampleStarve(_sampleAt(0));
+      for (var i = 1; i < 3; i++) {
+        pc.debugSampleStarve(_sampleAt(i));
+      }
+      expect(starve, 0, reason: '还没攒够 $_kStarveSecondsExpect 拍就出声了：\n${log.text}');
+      pc.debugSampleStarve(_sampleAt(3));
+
+      expect(starve, 1, reason: '低水位那一支的出口被这次改动带走了：\n${log.text}');
+      expect(diverged, 0, reason: '低水位那一支不该走新出口：\n${log.text}');
+      expect(
+        log.has('缓冲饥饿: 前方余量 0s < 6.0s (连续 $_kStarveSecondsExpect s) @100s'),
+        isTrue,
+        reason: log.text,
+      );
+    });
+
+    test('画面已冻的上报不许被放弃冷却吞掉', () async {
+      // log 17 那 61 秒就是这个：21:28:48 一次无关尝试挣出 60s 冷却，21:29:22 与
+      // 21:29:43 两次失真上报被 `冷却中，忽略缓冲饥饿` 吞掉，直到 21:30:04 冷却
+      // 过期才放行。
+      cdn.allTiny = true; // 造一轮 unmeasurable，顺手把冷却装上（与 F8 同法）
+      hostA.attachCdnSwitch();
+      _stall(hostA);
+      await _waitFor(() => log.has('放弃，20s 内不再尝试'));
+
+      // 先确认这道冷却对**别的**触发照旧有效 —— 否则下面的否定是空的。
+      _stall(hostA);
+      expect(
+        log.has('冷却中，忽略卡顿'),
+        isTrue,
+        reason: '冷却没挡住非豁免触发，用例前提不成立：\n${log.text}',
+      );
+
+      // 同一窗口里的失真上报必须当场起步（`_describeTrigger` 打在闸门之后）。
+      // 红证：把 `_CdnTrigger.bypassesGates` 改回只认 decode，这句断言变红。
+      _diverge();
+      expect(
+        log.has('冷却中，忽略画面已冻'),
+        isFalse,
+        reason: '画面已冻的上报又被放弃冷却吞了 —— 正是 log 17 那 61 秒：\n${log.text}',
+      );
+      await _waitFor(() => log.has('画面已冻 @100s，'));
+    });
+
+    test('坏源那一局能自己走出来，且不许给新触发开 force（log 17 复放）', () async {
+      // log 17 的现场：切画质拿到坏地址 → 视频轨不吐数据 → 余量涨到失真。那条真机
+      // 日志里它靠"定期档碰巧撞上基线无有效样本"才恢复。这里把那条路径重放一遍：
+      // 基线留在 [_baselineUrl]（假适配器只回 8KiB 小样本 = 拿不出有效速度），于是
+      // 这一轮必然走"基线无有效速度，直接切换"。
+      hostA.attachCdnSwitch();
+      _diverge();
+
+      await _waitFor(() => log.has('画面已冻 @100s，'));
+      await _waitFor(() => log.has('基线无有效速度，直接切换'));
+      expect(log.has('第1次 ->'), isTrue, reason: '触发起步了却没换源：\n${log.text}');
+
+      // 这一轮**真的换过源**（上一句就是证据），所以下面两条否定不是空的：`force`
+      // 会给正在播的 host 定罪并把整集拉黑，理由写的是"字节解不出画面"—— 而失真
+      // 这个签名分不出"视频轨死了"和"位置读数归零造成的假失真"，后者的字节是好的。
+      expect(
+        log.has('给的字节解不出画面，本集不再作为候选'),
+        isFalse,
+        reason: '给新触发开了 force，把当前 host 冤枉拉黑了：\n${log.text}',
+      );
+      expect(
+        log.has('当前镜像的字节解不出画面'),
+        isFalse,
+        reason: '给新触发开了 force，套用了解码档的措辞：\n${log.text}',
+      );
+    });
+
+    test('画面已冻时"没找到更快的镜像就重载当前源"这条兜底仍然可达', () async {
+      // 与 F 组「没被顶掉时兜底重载照旧」同一个局面，只把入口换成失真上报。锁的是
+      // **被否掉的那个方案**：若照抄 decode 给新触发也开 `force`，`_autoSwitchLoop`
+      // 收尾那句 `if (!switched && !force && telemetryDiverged)` 就不成立，这句日志
+      // 会消失 —— 而它正是这个故障唯一不换源的解法。
+      //
+      // 前提摆两样（同 F 组）：`cache-secs` 30s × 3 = 90s 是失真线、余量 200s 压在
+      // 上面；基线挪到 [_steadyBaselineUrl]，让这一轮落成一条**不切换**的裁定。
+      PlPlayerController.getInstance()
+        ..dataSource = NetworkSource(
+          videoSource: _steadyBaselineUrl,
+          audioSource: null,
+        )
+        ..buffer['cache-secs'] = '30'
+        ..buffered.value = 200
+        ..position.value = 0;
+      hostA
+        ..videoUrl = _steadyBaselineUrl
+        ..attachCdnSwitch();
+
+      _diverge(Duration.zero);
+
+      await Future<void>.delayed(const Duration(seconds: 3));
+      expect(
+        log.has('-> 不切换'),
+        isTrue,
+        reason: '这一轮本该判成不切换（基线健康、候选不快）—— 裁定变了就不是这条用例在测的东西了：'
+            '\n${log.text}',
+      );
+      expect(
+        log.has('画面已冻（余量失真），重载当前源'),
+        isTrue,
+        reason: '给新触发开了 force，这句兜底被关掉了：\n${log.text}',
+      );
+    });
+  });
+
   // 「无视频轨」自愈失败后的就地重建（P3）。这里能测的只有**判据**：真正拆
   // `Player`、重建渲染上下文、请页面重载那一段全都要真 libmpv（测试进程里
   // `_videoPlayerController` 恒为 null，`_kNoVideoProbes` 探满之后
@@ -1134,6 +1333,16 @@ const _kNoVideoRebuildMaxExpect = 2;
 /// 直接返回，这一轮立刻进到等恢复。
 void _stall(_CdnHost host, [Duration at = const Duration(seconds: 100)]) =>
     PlPlayerController.getInstance().onStall!(at);
+
+/// 把失真上报打进播放器的新出口（`PlPlayerController.onTelemetryDiverged`）。
+/// 和 [_stall] 一样：页面不直接调 mixin 的私有方法，走真实的机制。
+void _diverge([Duration at = const Duration(seconds: 100)]) =>
+    PlPlayerController.getInstance().onTelemetryDiverged!(at);
+
+/// 采样时刻。取在**未来**：`_armRebufferSuppress` 那 8s 静默期是跟挂钟比的，
+/// 沿用上一个用例留下的窗口会让采样静悄悄地全部落空。
+DateTime _sampleAt(int seconds) =>
+    DateTime.now().add(Duration(minutes: 5, seconds: seconds));
 
 Future<void> _waitFor(
   bool Function() ready, {
