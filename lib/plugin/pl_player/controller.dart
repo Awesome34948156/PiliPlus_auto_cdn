@@ -1339,16 +1339,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final hw = hwdec;
     if (ctr == null || hw == null || hw == 'no') return;
     try {
-      // 两个 command 必须**同步连发**（中间不 await）：async 函数体在第一个 await 前
-      // 同步跑，mpv 队列顺序才是 no → 原值。若在中间 await，play 的 pause=false 会
-      // 插进来，续播会先软解再切硬解。
+      // 三个 command 必须**同步连发**（中间不 await）：async 函数体在第一个 await 前
+      // 同步跑，mpv 队列顺序才是 no → 原值 → seek。若在中间 await，play 的 pause=false
+      // 会插进来。
+      //
+      // 补 seek 是这次的关键：切 hwdec 会清空参考帧池，续播位置若在 GOP 中间就解不出
+      // （Missing reference frame / Sequence Header 风暴，被看门狗误判成坏字节换源）。
+      // seek 到当前位置强制 mpv 落到关键帧、重建参考帧，续播才干净。
+      final pos = ctr.state.position.inMilliseconds / 1000.0;
       final futures = [
         ctr.command(['set', 'hwdec', 'no']),
         ctr.command(['set', 'hwdec', hw]),
+        ctr.command(['seek', pos.toStringAsFixed(3), 'absolute']),
       ];
       await Future.wait(futures);
     } catch (_) {
-      // 切 hwdec 失败宁可带旧会话续播，也别把返回动作搞丢。
+      // 切 hwdec / seek 失败宁可带旧会话续播，也别把返回动作搞丢。
     }
   }
 
