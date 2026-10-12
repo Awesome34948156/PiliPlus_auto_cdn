@@ -46,6 +46,16 @@
 #     ② 每条重建**自己的 option 块内**有没有 `Setting option 'start'`（带值见过没）。
 #     ③ `落点 …ms 落后于 …ms，补一次 seek` 的条数 —— 丢点后落点校正会被触发
 #        （`cdn_switch_mixin.dart` 的 `_restoreResumePosition`）。
+#        ⚠️ 这行日志的**第一个数是播放器此刻的位置读数，第二个数才是目标**（发射点
+#        `cdn_switch_mixin.dart:1708`：`落点 ${player.positionInMilliseconds}ms 落后于
+#        ${target.inMilliseconds}ms`）—— **不是"差值"**。所以判据只数「**落点读数 >0ms**」
+#        的那些：那是"播放器已经落在某个位置、但不是目标位置"的真落后；而「落点读数
+#        0ms」是新装载刚起步、位置读数还没跟上的固有形态（此刻发起补 seek 是这套双保险
+#        的正常动作，且常被 mpv `error running command` 顶掉 —— 最终落点由 `start`
+#        决定，判据② 已经管住了）。这个口径是 **2026-10-12 据 log 17 定的**。
+#        ⚠️ 老实说：现有 13 份存档里**每一发补 seek 的落点读数都是 0ms**，所以这条扣分
+#        路径在现有存档上**一次都没触发过** —— ③ 目前只是背景信息，log 14 的「红」完全
+#        由判据② 扛着（3 次该带 start 的重建只带了 1 次）。
 #
 #   会骗人的形态（判据②**必须**限定窗口，跨全篇数会被污染）：
 #     * 换源路 / `refreshPlayer`（硬解会话失效）**平时也打** `Setting option 'start'`，
@@ -55,9 +65,9 @@
 #       形态，**不是**本次修复的整秒值。）
 #     * 所以窗口取「重建行 → 它那次 option 块的收尾行（`Set property: sid="no" -> 1`）」，
 #       而不是一个拍脑袋的固定行数 —— 窗口由日志自己的结构兜住。
-#     * 判据③ **也只数落在重建窗口内的**（与手册 F 节同口径）。换源路本来就有落点校正
-#       这套双保险，它常发生在**首次重建之前**（log 13 那局唯一一发补 seek 就在重建前）——
-#       按全篇数会把「修好的一局」误判成未生效。全篇条数照样打印，只作背景，不进判定。
+#     * 判据③ **也只数落在重建窗口内、「落点读数 >0ms」的**（与手册 F 节同口径）。换源路本来
+#       就有落点校正这套双保险，它常发生在**首次重建之前**（log 13 那局唯一一发补 seek
+#       就在重建前）—— 按全篇数会把「修好的一局」误判成未生效。全篇条数照样打印，只作背景。
 #
 #   两条**不能算功劳、必须剔除**的（脚本会在 ② 统计处标出来）：
 #     * 修复前本来就带 start 的那次：log 14 第一次的 `704.000`，`defaultST` 恰好非零，
@@ -172,12 +182,14 @@ function delta(pv, land) {           # 落点相对「检测位置」的净变�
     if (match(line, /'\''[0-9.]+'\''/)) st_val[sn] = substr(line, RSTART+1, RLENGTH-2)
   }
 
-  # 6) 补 seek（落点校正）
+  # 6) 补 seek（落点校正）—— 顺手抠出「落点 Nms」那个数：判据③只看 N>0 的，
+  #    N==0 说明落点本来就在正确位置（mpv 把 seek 顶掉时的瞬时读数），不扣分。
   if (line ~ /落后于 .*ms，补一次 seek/) {
     kn++
     seek_line[kn] = nr
     seek_ts[kn]   = ts
     if (match(line, /落后于 [0-9]+ms/)) seek_tgt[kn] = num(substr(line, RSTART, RLENGTH))
+    if (match(line, /落点 [0-9]+ms/))   seek_delta[kn] = num(substr(line, RSTART, RLENGTH))
   }
 
   # 7) 块外：留一对 pause 当「正常起播」对照；顺手数裸 pause（用户按键）
@@ -325,8 +337,10 @@ END {
   printf "      ⚠️ 修复前本来就带 start 的那次不能算功劳（log 14 第一次的 704.000，defaultST\n"
   printf "         恰好非零）—— 判据看的是比例，不是 >0 就算修好。\n"
 
-  printf "\n  ③ 补 seek（`落点 …ms 落后于 …ms`）: 共 %d 条（判定只数落在重建窗口内的）\n", kn+0
-  kn_win = 0
+  printf "\n  ③ 补 seek（`落点 …ms 落后于 …ms`）: 共 %d 条（判定只数落在重建窗口内**且落点读数 >0ms** 的）\n", kn+0
+  kn_win  = 0     # 窗口内且「落点读数 >0ms」—— 玩家落在别处，真的落后，判定计数
+  kn_win0 = 0     # 窗口内但「落点读数 0ms」—— 新装载刚起步的固有形态，不扣分
+  kn_out  = 0     # 窗口外 —— 换源路/复位自己的落点校正
   for (k = 1; k <= kn; k++) {
     inwin = 0
     for (i = 1; i <= n; i++) {
@@ -334,13 +348,28 @@ END {
       whi = (i < n) ? rb_line[i+1] : NR + 1
       if (seek_line[k] >= wlo && seek_line[k] < whi) { inwin = 1; break }
     }
-    if (inwin) kn_win++
-    printf "       行 %-5d %s  落后于 %sms%s\n", seek_line[k], seek_ts[k], seek_tgt[k]+0, \
-           (inwin ? "   ← 落在重建窗口内（判定计数）" \
-                  : "   ← 窗口外，换源路/复位的落点校正，不计")
+    sd = seek_delta[k] + 0
+    if (!inwin) {
+      kn_out++
+      printf "       行 %-5d %s  落后于 %sms   ← 窗口外，换源路/复位的落点校正，不计\n", \
+             seek_line[k], seek_ts[k], seek_tgt[k]+0
+    } else if (sd > 0) {
+      kn_win++
+      printf "       行 %-5d %s  落后于 %sms   ← 落在重建窗口内，落点读数 %dms（>0，落在别处）—— 判定计数\n", \
+             seek_line[k], seek_ts[k], seek_tgt[k]+0, sd
+    } else {
+      kn_win0++
+      printf "       行 %-5d %s  落后于 %sms   ← 落在重建窗口内，落点读数 0ms（新装载起始），不扣分\n", \
+             seek_line[k], seek_ts[k], seek_tgt[k]+0
+    }
   }
-  if (kn > kn_win) {
-    printf "      ⚠️ 窗口外那 %d 发是换源路自己的落点校正（那条路本来就有这套双保险，见\n", kn - kn_win
+  if (kn_win0 > 0) {
+    printf "      ⚠️ 窗口内那 %d 发补 seek 的落点读数都是 0ms（新装载刚起步、位置还没跟上；这套\n", kn_win0
+    printf "         双保险此刻发起补 seek 属正常，且常被 mpv 顶掉）—— 按 2026-10-12 据 log 17 定的\n"
+    printf "         口径不算「续播点没到位」，不进判定；最终落点看判据② 的 start 与 restart 落点。\n"
+  }
+  if (kn_out > 0) {
+    printf "      ⚠️ 窗口外那 %d 发是换源路自己的落点校正（那条路本来就有这套双保险，见\n", kn_out
     printf "         手册 F 节）：换源路在**首次重建之前**发生，与重建丢点无关，因此不计入判定。\n"
   }
 
@@ -356,20 +385,22 @@ END {
     printf "\n  B 判定: 未生效 —— %d 次该带 start 的重建里只带了 %d 次\n", b_need, b_have
     b_verdict = "未生效"
   } else if (kn_win > 0) {
-    printf "\n  B 判定: 未生效 —— 重建都带点了，但重建窗口内仍有 %d 发补 seek（续播点没一次到位）\n", kn_win
+    printf "\n  B 判定: 未生效 —— 重建都带点了，但重建窗口内仍有 %d 发补 seek（落点读数 >0 却仍落后，续播点没一次到位）\n", kn_win
     b_verdict = "未生效"
   } else {
-    printf "\n  B 判定: 生效 —— %d 次重建全部带 start，且重建窗口内 0 发补 seek\n", b_have
-    if (kn > 0)
-      printf "      （全篇另有 %d 发窗口外的补 seek，属换源路，不计）\n", kn
+    printf "\n  B 判定: 生效 —— %d 次重建全部带 start，且重建窗口内 0 发「落点读数 >0 却仍落后」的补 seek\n", b_have
+    if (kn_win0 > 0)
+      printf "      （窗口内另有 %d 发补 seek 的落点读数为 0ms，按口径不计）\n", kn_win0
+    if (kn_out > 0)
+      printf "      （全篇另有 %d 发窗口外的补 seek，属换源路，不计）\n", kn_out
     b_verdict = "生效"
   }
 
   # =========================================================================
   printf "\n==== 总评 (%s) ====\n", FILENAME
   if (n > 0)
-    printf "A(暂停对) %s   B(续播点) %s   [重建 %d 次 / 带点 %d/%d / 补 seek %d(%d) 窗内/全篇]\n", \
-           a_verdict, b_verdict, n, b_have, b_need, kn_win+0, kn+0
+    printf "A(暂停对) %s   B(续播点) %s   [重建 %d 次 / 带点 %d/%d / 补 seek 计分 %d · 窗内 %d · 全篇 %d]\n", \
+           a_verdict, b_verdict, n, b_have, b_need, kn_win+0, kn_win+kn_win0, kn+0
   else
     printf "A(暂停对) %s   B(续播点) %s   [本局零重建]\n", a_verdict, b_verdict
 }
