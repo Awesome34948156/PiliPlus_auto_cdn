@@ -1331,6 +1331,27 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return null;
   }
 
+  /// 回前台续播前，把硬解会话重建一遍：iOS 退后台会把 VideoToolbox 会话作废，
+  /// 直接续播会先来一波 `vd: Error while decoding frame (hardware decoding)!`
+  /// 掉帧（画面抽动）。趁还在暂停态拨一下 hwdec，会话变新，续播才干净。
+  Future<void> reinitDecoderAfterBackground() async {
+    final ctr = _videoPlayerController;
+    final hw = hwdec;
+    if (ctr == null || hw == null || hw == 'no') return;
+    try {
+      // 两个 command 必须**同步连发**（中间不 await）：async 函数体在第一个 await 前
+      // 同步跑，mpv 队列顺序才是 no → 原值。若在中间 await，play 的 pause=false 会
+      // 插进来，续播会先软解再切硬解。
+      final futures = [
+        ctr.command(['set', 'hwdec', 'no']),
+        ctr.command(['set', 'hwdec', hw]),
+      ];
+      await Future.wait(futures);
+    } catch (_) {
+      // 切 hwdec 失败宁可带旧会话续播，也别把返回动作搞丢。
+    }
+  }
+
   // 开始播放
   Future<void> _initializePlayer() async {
     if (_instance == null) return;

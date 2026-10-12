@@ -343,6 +343,7 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
       } else {
         if (_pauseDueToPauseUponEnteringBackgroundMode) {
           _pauseDueToPauseUponEnteringBackgroundMode = false;
+          plPlayerController.reinitDecoderAfterBackground(); // 先重建会话，再续播
           player?.play();
         }
       }
