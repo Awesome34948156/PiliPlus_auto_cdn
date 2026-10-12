@@ -393,6 +393,11 @@ mixin CdnSwitchMixin on GetxController {
   @visibleForTesting
   Dio? cdnAutoDioForTest;
 
+  /// 测试用：这一轮是不是还在途。T2 用例要靠它确定"轮次收尾、busy 已清"，
+  /// 而不是靠猜一个 sleep 时长。
+  @visibleForTesting
+  bool get debugCdnAutoBusy => _cdnAutoBusy;
+
   // ---------------------------------------------------------------------------
   // 时钟与闸门。三个时间闸互相独立，谁也别合并谁：
   //   _cdnGiveUpUntil  整集放弃——一轮试完仍不行，60s 内不再响应任何触发
@@ -664,8 +669,17 @@ mixin CdnSwitchMixin on GetxController {
   /// 只改一件事：**结论直接照用**，不跟基线比速度（理由见 [_CdnTrigger.decode]）。
   /// 其余闸门（并发、冷却、换源快照）一件不减 —— 它和别的触发抢的是同一个
   /// 播放器，不能因为"画面冻着更急"就允许并发重载。
-  void _onDecodeError(Duration position) =>
-      _onPlayerStall(position, trigger: _CdnTrigger.decode);
+  ///
+  /// 返回值是**给播放器的回执**：`false` = 这一发现在收不下，播放器应保住它、
+  /// 稍后重发（解码错误是唯一一次性消费的上报，丢了不会自己回来）。解码档
+  /// 只有第一道并发闸会拦下它（冷却 / 进展两道它都豁免，见 [_CdnTrigger.bypassesGates]），
+  /// 所以这里靠三件套就能判出"只是轮次在途"这一格。
+  bool _onDecodeError(Duration position) {
+    if (_onPlayerStall(position, trigger: _CdnTrigger.decode)) return true;
+    // 在途轮次 = 稍后会有人动手 → 回 false，请播放器退避后重发；
+    // 页面已关 / 不符合资格 = 永远没人动手 → 回 true（按已受理回报，免得播放器无限重发）。
+    return !(_cdnAutoBusy && !isClosed && _cdnAutoEligible);
+  }
 
   /// 返回**这次触发有没有真的起步**（闸门全过、[_autoSwitchLoop] 已起）。调用方
   /// 靠这个把"这一次没被丢"和"被丢了"分开：小卡顿的节流（[_onPlayerRebuffer]）
@@ -674,6 +688,11 @@ mixin CdnSwitchMixin on GetxController {
   ///
   /// 签名仍是 `void Function(Duration)` 可赋值（`onStall` 是 ValueChanged），所以
   /// 直接挂在播放器上报口上不受影响。
+  ///
+  /// 现在**只有 [_onDecodeError] 消费这个 bool 的"回执"含义**：它的 `false` 对解码
+  /// 档意味着"可重试"（播放器会保住这一发、稍后重发）；其它调用方
+  /// （[_onPlayerRebuffer] / [_onCdnProbeTick] / 挂 `onStall` 那几个）仍按旧的
+  /// "有没有真的起步"理解，语义不变。
   bool _onPlayerStall(
     Duration position, {
     _CdnTrigger trigger = _CdnTrigger.stall,
@@ -694,10 +713,13 @@ mixin CdnSwitchMixin on GetxController {
     //
     // 2026-10-12 真机取证（同一天、两次不同的故障，都栽在这道闸上）：
     // - 13:56:10.169 那次**唯一**的风暴上报正好落在轮 1 挣来的 20s 冷却
-    //   （`_kCdnUnmeasuredCooldown`）里，被这里吞掉；而播放器侧上报是**一次性
-    //   消费**（先清窗口、再武装 30s 静默、最后才回调，通道是 `void` 没有回执），
+    //   （`_kCdnUnmeasuredCooldown`）里，被这里吞掉；播放器侧上报是**一次性消费**
+    //   （先清窗口、再武装 30s 静默、最后才回调），当时通道是 `void` 没有回执，
     //   所以那个瞬时风暴再也不会重报 —— 画面一直冻到 6 分钟后定期档碰巧撞上
-    //   "基线无有效样本 → 直接切换"才恢复。
+    //   "基线无有效样本 → 直接切换"才恢复。**现在这条通道有回执了**（见
+    //   [_onDecodeError]）：页面在途轮次会回 `false`，让播放器保住这一发、稍后
+    //   重发；而"被冷却闸吞掉"这一问题已由 `bypassesGates` 从另一头解决
+    //   （解码档不再吃这道闸）。
     // - 21:29:22 / 21:29:43 两次「遥测失真」（切画质拿到坏地址，音频在走、画面
     //   冻着）被 21:28:48 一次**无关**尝试留下的 60s 放弃冷却吞掉，直到 21:30:04
     //   冷却过期才放行 —— 画面多冻了 61 秒。

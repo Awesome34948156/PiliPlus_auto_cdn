@@ -271,7 +271,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///
   /// 与其他回调一样只上报事实：怎么恢复（换源、要不要绕过那套"必须明显更快
   /// 才值得重载"的门槛）由页面决定。
-  ValueChanged<Duration>? onDecodeError;
+  ///
+  /// **返回值是回执**：`false` = 页面现在收不下这一发（有一个换源/换画质轮次
+  /// 在途）。解码错误是**唯一一次性消费**的上报 —— 播放器在回调前就清空计数
+  /// 窗口并武装 30s 静默（见 [_sampleDecodeError]），所以页面回 `false` 时必须
+  /// 保住它、稍后重发，否则这一发就永远丢了（2026-10-12 真机冻屏的成因）。
+  /// 真机取证与背景见 `lib/pages/video/cdn_switch_mixin.dart` 里
+  /// `_CdnTrigger.decode` 附近的注释。
+  ///
+  /// 注意这是唯一带回执的回调，兄弟回调（`onStall`/`onBufferStarve`/
+  /// `onTelemetryDiverged`/`onRebuffer`）仍是 [ValueChanged]。
+  bool Function(Duration)? onDecodeError;
 
   /// 位置连续冻结多少秒才算卡顿。普通重新缓冲一般 1~3 秒。
   static const int _kStallSeconds = 8;
@@ -320,6 +330,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 一轮换源（实测 5~10s）长得多，又比 CDN 那边放弃后的冷却（60s）短，于是
   /// 换到坏镜像上时还能再挣扎一次。
   static const Duration _kDecodeErrorCooldown = Duration(seconds: 30);
+
+  /// 页面在途轮次收不下解码风暴时的**退避**：这一发记成"稍后重报"，而不是等满
+  /// [_kDecodeErrorCooldown]（30s）。缩短是有意的 —— 在途轮次通常几秒到几十秒就收尾。
+  /// 但也不立即解锁：拒收期间坏字节可能每秒几十条，不给下限就会刷屏（见
+  /// [_sampleDecodeError] 的回执分支）。
+  static const _kDecodeErrorRetryBackoff = Duration(seconds: 2);
 
   /// 同一个坏包在 ffmpeg 的不同层会各记一行（`av1:` / `libdav1d:` / `NULL:`），
   /// 三行的时刻几乎相同。不合并的话 [_kDecodeErrorBurst] 的 12 条门槛实际只等于
@@ -1977,9 +1993,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// - 密集档：[_kDecodeErrorDenseBurst] 行 / [_kDecodeErrorDenseWindow]，
   ///   **不去重** —— 抓"几十毫秒里挤了几百条"那种短促爆发，也就是去重会把它们
   ///   整段数没的那一档（来由见 [_kDecodeErrorDenseBurst]）。
-  void _sampleDecodeError(String text) {
+  void _sampleDecodeError(String text, {DateTime? at}) {
     if (!isDecoderCorruptionLog(text)) return;
-    final now = DateTime.now();
+    final now = at ?? DateTime.now();
     // 不受静默期限制的"最后一次坏字节"时刻：给换源后的干净窗口判据用。
     lastDecoderCorruptionAt = now;
     // 记账（含窗口淘汰与同包去重）在 [recordDecodeErrorHit] 里，是纯函数。
@@ -2021,7 +2037,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
               ' 内 $_kDecodeErrorDenseBurst 行'}'
       '），当前镜像给的字节解不出画面 —— 上报换源',
     );
-    onDecodeError?.call(videoPlayerController?.state.position ?? Duration.zero);
+    // 回执：页面在途轮次收不下这一发（返回 false）时把静默期缩到 [_kDecodeErrorRetryBackoff]
+    // —— 两个窗口已经在上面清过，再攒够门槛就重报，风暴不会因为"页面正忙"永久丢失。
+    // 用同一个 now（别重新取时钟：语义上应与这一次采样同一时刻）。没有页面挂上来
+    // （null）时行为与旧版完全一致。
+    final listener = onDecodeError;
+    if (listener != null &&
+        !listener(videoPlayerController?.state.position ?? Duration.zero)) {
+      _decodeErrorUntil = now.add(_kDecodeErrorRetryBackoff);
+    }
   }
 
   /// 硬解会话失效的采样：攒够 [_kSessionFailBurst] 条就**重建本机解码器**。
@@ -2322,6 +2346,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 能被钉住的东西。生产代码不走这里。
   @visibleForTesting
   void debugSampleStarve(DateTime now) => _sampleStarve(now);
+
+  @visibleForTesting
+  void debugSampleDecodeError(String text, DateTime at) =>
+      _sampleDecodeError(text, at: at);
 
   /// 统计"缓冲归零"的上升沿 —— 即加载中转圈出现的次数。
   ///

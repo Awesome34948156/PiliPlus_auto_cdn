@@ -98,6 +98,9 @@ void main() {
 
     hostA = _CdnHost(cdn: cdn, url: _baselineUrl);
     hostB = _CdnHost(cdn: cdn, url: _baselineUrl);
+    // 解码账（_decodeErrors / _decodeErrorUntil …）是单例字段，跨用例只增不减；
+    // T1 不 attach host（走不到 attachCdnSwitch 里的复位），所以这里显式清零。
+    PlPlayerController.getInstance().resetDecodeErrorAccounting();
   });
 
   tearDown(() async {
@@ -114,7 +117,9 @@ void main() {
         ..detachCdnSwitch();
     }
     await Future<void>.delayed(const Duration(milliseconds: 20));
-    PlPlayerController.getInstance().onStall = null;
+    PlPlayerController.getInstance()
+      ..onStall = null
+      ..onDecodeError = null;
     log.restore();
   });
 
@@ -748,9 +753,13 @@ void main() {
   });
 
   test('坏字节的一次性上报不许被放弃冷却吞掉', () async {
-    // 播放器侧的风暴上报是**一次性消费**：先清空窗口、再武装 30s 静默、最后才回调，
-    // 而通道是 `void`（`onDecodeError` 没有回执）。所以被下游丢掉的那一次永远不会重
-    // 报 —— 放弃冷却（20~60s）一挡，结果是"零次救援"而不是"晚一点救"。
+    // 播放器侧的风暴上报是**一次性消费**：先清空窗口、再武装 30s 静默、最后才回调。
+    // 这条通道**现在有回执**（`onDecodeError` 返回 `bool`）：页面在途轮次会回 `false`，
+    // 播放器据此把静默期缩成 2s 退避、之后重发 —— 所以"被下游丢掉的那一次永远不会
+    // 重报"这条已经不成立（见下面 T1 / T2 两条用例）。
+    //
+    // 本用例钉的是**另一件**事：放弃冷却（20~60s）那道闸对解码档的豁免。回执管的是
+    // "在途轮次拒收后能不能重发"，豁免管的是"这一发到底会不会被冷却吞掉"—— 两件事。
     //
     // 2026-10-12 真机取证：坏镜像喂坏字节（截断在 54MB/788MB + 非法 NAL），那次唯一
     // 的风暴上报（13:56:10.169）正好落在轮 1 挣来的 20s 冷却里被吞掉，画面冻了 6 分
@@ -783,6 +792,79 @@ void main() {
       log.has('冷却中，忽略解码错误'),
       isFalse,
       reason: '坏字节上报又被放弃冷却吞了，而它是一次性消费、不会再来：\n${log.text}',
+    );
+    await _waitFor(() => log.has('解码错误 @100s，当前镜像给的是坏字节'));
+  });
+
+  test('解码风暴被在途轮次拒收后要退避重报，不是丢了等 30 秒', () {
+    final pc = PlPlayerController.getInstance()..resetDecodeErrorAccounting();
+    var calls = 0;
+    var accept = false;
+    pc.onDecodeError = (_) {
+      calls++;
+      return accept;
+    };
+
+    // 稀疏档 6s / 12 条、去重窗 5ms：10ms 间隔喂 12 条既能稳定达标，
+    // 又不会让密集档（100ms / 20 行）抢先成立。
+    void burst(DateTime end) {
+      for (var i = 0; i < 12; i++) {
+        pc.debugSampleDecodeError(
+          'Invalid NAL unit size (34817 > 5117).',
+          end.subtract(Duration(milliseconds: 10 * (11 - i))),
+        );
+      }
+    }
+
+    final t0 = DateTime(2026, 1, 1);
+    burst(t0);
+    expect(calls, 1, reason: '门槛一到就该上报一次');
+
+    burst(t0.add(const Duration(seconds: 1)));
+    expect(calls, 1, reason: '退避期内不该重报');
+
+    burst(t0.add(const Duration(seconds: 3)));
+    expect(calls, 2, reason: '退避过后必须重报 —— 被在途轮次挡下的这一发不丢');
+
+    accept = true;
+    burst(t0.add(const Duration(seconds: 6)));
+    expect(calls, 3);
+
+    burst(t0.add(const Duration(seconds: 10)));
+    expect(calls, 3, reason: '被受理后走正常的 30s 静默');
+  });
+
+  test('在途轮次里的解码风暴要退回播放器重发，轮次结束后仍能起步', () async {
+    final pc = PlPlayerController.getInstance();
+    // allTiny 让这一轮量不出速度、快速落到"放弃"收尾（同"坏字节的一次性上报不许被
+    // 放弃冷却吞掉"那条用例的手法）—— 注意这一档**不会**选候选、也就不会调 playerInit，
+    // 所以不能用 initCalls 判 busy；busy 是 `_stall` **同步**置上的，直接断言就行。
+    cdn.allTiny = true;
+    hostA.attachCdnSwitch();
+    _stall(hostA); // 默认 position=100s
+    expect(hostA.debugCdnAutoBusy, isTrue, reason: '用例前提：轮次在途');
+
+    // 轮次在途：解码风暴收不下 → 回执 false，且不许起步。
+    expect(
+      pc.onDecodeError!(const Duration(seconds: 100)),
+      isFalse,
+      reason: '轮次在途时必须回 false，播放器才会保住这一发',
+    );
+    expect(log.has('忽略解码错误'), isTrue);
+    // ⚠ 否定断言别用 '解码错误 @100s' —— busy 那行 '忽略解码错误 @100s (busy=…)' 也含这个子串。
+    expect(
+      log.has('当前镜像给的是坏字节'),
+      isFalse,
+      reason: '轮次在途时不该起步换源',
+    );
+
+    await _waitFor(() => !hostA.debugCdnAutoBusy); // 这一轮收尾、busy 已清
+
+    // 收尾后再来一发（模拟播放器退避后的重发）→ 这回该起步。
+    expect(
+      pc.onDecodeError!(const Duration(seconds: 100)),
+      isTrue,
+      reason: '轮次收尾后同一发风暴要能起步（不再丢）',
     );
     await _waitFor(() => log.has('解码错误 @100s，当前镜像给的是坏字节'));
   });
