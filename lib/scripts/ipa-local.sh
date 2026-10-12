@@ -2,8 +2,9 @@
 # Build an unsigned iOS IPA locally so it can be sideloaded with AltSign.
 #
 # This mirrors .github/workflows/ios.yml. It is bash rather than a call to
-# lib/scripts/build.ps1 because pwsh is not installed on this machine; the
-# version-numbering logic below is a faithful copy of that script.
+# lib/scripts/build.ps1 because pwsh is not installed on this machine. The
+# version numbering below is that script's, with one deliberate divergence:
+# it never rewrites pubspec.yaml -- see the version-numbering section.
 #
 #   ./ipa-local.sh
 #
@@ -49,18 +50,24 @@ if [ ! -L build ] || [ "$(readlink build)" != "$BUILD_DIR" ]; then
   echo "==> build -> $BUILD_DIR"
 fi
 
-# ---- version numbering, copied from lib/scripts/build.ps1 -------------------
+# ---- version numbering, borrowed from lib/scripts/build.ps1 -----------------
+# Unlike build.ps1, this never rewrites pubspec.yaml. That file is tracked by
+# git, so a local build used to leave `version: 2.1.6+5513` behind and it had
+# to be excluded by hand before every commit. The number now goes straight to
+# `flutter build` as --build-name/--build-number, which fills the same
+# Info.plist keys (CFBundleShortVersionString / CFBundleVersion) that the
+# rewritten pubspec line produced. In CI the rewrite is harmless -- the
+# checkout is ephemeral -- and build.ps1 still needs it to export $GITHUB_ENV.
 version_name=$(sed -nE 's/^version:[[:space:]]*([0-9]+(\.[0-9]+)*).*/\1/p' pubspec.yaml | head -1)
 [ -n "$version_name" ] || { echo "no version: line in pubspec.yaml" >&2; exit 1; }
 version_code=$(git rev-list --count HEAD)
 commit_hash=$(git rev-parse HEAD)
 
-sed -i '' -E "s|^version:.*|version: ${version_name}+${version_code}|" pubspec.yaml
 printf '{"pili.name":"%s","pili.code":%d,"pili.hash":"%s","pili.time":%d}\n' \
   "$version_name" "$version_code" "$commit_hash" "$(date +%s)" > pili_release.json
 
 echo "==> version ${version_name}+${version_code} (${commit_hash:0:9})"
-echo "    note: pubspec.yaml is now at that version, exactly as a real build leaves it"
+echo "    note: pubspec.yaml is left untouched at $(grep -m1 '^version:' pubspec.yaml | tr -d ' ' | cut -d: -f2)"
 
 # ---- make sure the pub-cache is holding our libmpv -------------------------
 echo "==> staging libmpv"
@@ -70,6 +77,7 @@ bash "$HERE/mpvkit/stage-mpv.sh" ios | sed 's/^/    /'
 if [ -z "${SKIP_BUILD:-}" ]; then
   echo "==> flutter build ios"
   "$FLUTTER" build ios --release --no-codesign \
+    --build-name="$version_name" --build-number="$version_code" \
     --dart-define-from-file=pili_release.json --no-pub
 fi
 
