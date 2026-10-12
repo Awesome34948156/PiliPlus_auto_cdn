@@ -27,7 +27,7 @@ import 'package:hive_ce/hive.dart';
 /// 的节奏乱动"。读代码看得出这件事，只有把时序重放一遍才**证明**它不在。
 ///
 /// **为什么不造假播放器**：`PlPlayerController` 全仓只有一个**私有**构造函数
-/// （`lib/plugin/pl_player/controller.dart:892`），另一个库里 `extends` 不过去，
+/// （`lib/plugin/pl_player/controller.dart:973`），另一个库里 `extends` 不过去，
 /// mockito 那类生成式 mock 同理（dev_dependencies 里也没有）。但它自己的公开字段
 /// 足够把状态摆成想要的样子（`playerStatus` / `position` / `buffered` /
 /// `durationInMilliseconds`），而 `videoPlayerController` 为 null 时
@@ -64,7 +64,7 @@ void main() {
     GStorage.regAdapter();
     // 三个盒都是 `static late final`，跨库可以一次性赋值。顺序要紧：**必须在
     // 第一次碰 Pref 之前**。播放器单例构造时会读 `GStorage.setting` 与
-    // `GStorage.video`（`controller.dart:185/836`），所以 video 盒也要开。
+    // `GStorage.video`（`controller.dart:194/917`），所以 video 盒也要开。
     GStorage.setting = await Hive.openBox('setting');
     GStorage.localCache = await Hive.openBox('localCache');
     GStorage.video = await Hive.openBox('video');
@@ -383,8 +383,8 @@ void main() {
     //     真实墙钟去堆分块延迟，那既慢又不稳（文件头那句"刻意不用速度比来造
     //     better"）。实测这条路上比值一直落在 0.99x 附近，阈值在 1.5。
     //
-    // 播放器单例的 `dataSource` 是 `late`（`controller.dart:180`），兜底那句
-    // `refreshPlayer()` 头一件事就是读它（`:1210`）。不摆好，这条会在打出"画面
+    // 播放器单例的 `dataSource` 是 `late`（`controller.dart:189`），兜底那句
+    // `refreshPlayer()` 头一件事就是读它（`:1321`）。不摆好，这条会在打出"画面
     // 已冻"之后抛 LateInitializationError —— 日志对了、用例照样红。摆成网络源
     // （非 FileSource）才走得到重载那一句。
     PlPlayerController.getInstance()
@@ -429,7 +429,7 @@ void main() {
     // **上一个视频**的地址去指挥这台共享播放器。修复就是让"重挂"顺手作废在途轮。
     //
     // 卡在"探对象总长"那一发上，好让这一轮停在 `_pickFastestCdn` 中间：那里之后
-    // 只有 `_roundVoided` 一道闸、**没有** `_cdnIsAttached` 复查（`:1142`），
+    // 只有 `_roundVoided` 一道闸、**没有** `_cdnIsAttached` 复查（`:1332`），
     // 正是"代际不动就拦不住"的那个缺口。
     cdn.holdProbe = Completer<void>();
     hostA.attachCdnSwitch();
@@ -456,7 +456,7 @@ void main() {
     );
 
     // 半路那道闸不能只关不重开：代际一推进，那一轮的 whenComplete 就认不出自己了
-    // （`:672` 的 `generation == _cdnGeneration` 为假），busy 得在同一口气里放下
+    // （`:770` 的 `generation == _cdnGeneration` 为假），busy 得在同一口气里放下
     // —— 否则 `_cdnAutoBusy` 永远为真，此后每一次触发都只打一行 `busy=true`，
     // 而 `attachCdnSwitch` 是幂等的，再也不会回来救它。
     _stall(hostA, const Duration(seconds: 300));
@@ -1397,6 +1397,81 @@ void main() {
       );
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // `_pickFastestCdn` 那条「基线无有效样本 → 直接切换」出口新增的**佐证**
+  // （2026-10-13，闸门 = `_playerInTrouble`）。log 18 的现场：预检在缓冲补满
+  // （32s）时开测，基线探到一次 `connection timeout`，而播放器正拿**同一条 URL**
+  // 播得好好的（位置一路从 0 走到 6.6s）—— 换完 24 秒，同一个 host 又测出
+  // 3.50MB/s，比换过去的更快。一次并行新连接没建起来跟"这条镜像供不上字节"是
+  // 两回事，不该为此白付一次 ~8 秒的重载。所以放行要佐证：播放器自己也在挨饿/
+  // 冻着（`bufferedAhead` 低于 mpv 回填水位、或正在重新缓冲、或遥测失真）。
+  // 下面两条就是这枚闸的正反两面：健康态掐住、真挨饿放行。
+  // ---------------------------------------------------------------------------
+
+  test('基线没探到样本、但播放器没在挨饿时不许直接换源（新闸门，log 18 复放）', () async {
+    // 健康态，四样缺一不可：
+    //   - position 0 / buffered 32：`bufferedAhead` = 32 - 0 = 32s（**秒**），压过
+    //     回填水位 21.333s；
+    //   - isBuffering **显式设 false**：它是 `RxBool(..true.obs)`，初值就是 true，
+    //     漏了这一句新闸门会因"正在重新缓冲"提前为真 —— 用例假绿；
+    //   - `demuxer-hysteresis-secs` 21.333：抬出一个非零水位，让余量判据真的可判；
+    //   - `cache-secs` 30：把失真线钉在 90s，免得继承来的 0 让 telemetryDiverged 翻转。
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 32
+      ..isBuffering.value = false
+      ..buffer['demuxer-hysteresis-secs'] = '21.333'
+      ..buffer['cache-secs'] = '30';
+    // 基线留在 [_baselineUrl]：假适配器对 [_baselineHost] 只回 8KiB 小样本 → 基线
+    // 必然"拿不出有效速度"，正落在新闸门那条出口上。
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+
+    // 正面证据 + 收尾：出现新行说明那一轮真的走到了这道闸；`放弃，` 说明整轮跑完
+    // 了，下面两句"没有"才不是"还没跑到"的假绿。
+    await _waitFor(() => log.has('基线探测没拿到样本，但播放器没在挨饿'));
+    await _waitFor(() => log.has('放弃，'));
+
+    expect(
+      log.has('基线无有效速度，直接切换'),
+      isFalse,
+      reason: '这一次探测失败只是并行新连接没建起来，不该付一次重载：\n${log.text}',
+    );
+    expect(
+      log.has('第1次 ->'),
+      isFalse,
+      reason: '健康态下"没"到换源这一步，连候选都不该被选中：\n${log.text}',
+    );
+  });
+
+  test('真挨饿时"基线没样本 → 直接换源"照旧（上一条的否定不是空的，log 8 复放）', () async {
+    // 与上一条只差**播放器在不在挨饿**这一件事：余量归零 + 正在重新缓冲。log 8
+    // 那次「钉 cosov → 基线断流 → ~6 秒救走」就是这个形状（余量 0s + 重新缓冲
+    // true），这条出口必须原样放行 —— 否则新闸门把真救援也一起掐了。
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 0
+      ..isBuffering.value = true
+      ..buffer['demuxer-hysteresis-secs'] = '21.333'
+      ..buffer['cache-secs'] = '30';
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+
+    await _waitFor(() => log.has('第1次 ->'));
+    expect(
+      log.has('基线无有效速度，直接切换'),
+      isTrue,
+      reason: '挨饿态下没走那条出口，用例前提不成立：\n${log.text}',
+    );
+    expect(
+      log.has('基线探测没拿到样本，但播放器没在挨饿'),
+      isFalse,
+      reason: '挨饿态下被新闸门拦下了 —— 真救援被掐：\n${log.text}',
+    );
+  });
 }
 
 /// 判据 3 的连续采样拍数（`controller.dart:_kStarveSeconds`）。只用在失败原因里，
@@ -1452,9 +1527,9 @@ const _baselineUrl = 'https://$_baselineHost/upgcxcode/1/2/3/4.m4s';
 /// 把基线当"慢 host"，给它的字节跟候选同一档。
 ///
 /// 为什么需要它：按 host 发字节这件事把一轮的裁定分成了两条互斥的路 ——
-/// 基线拿不出有效样本时永远是"直接切换"（`:1377`），一条**不切换**的裁定
+/// 基线拿不出有效样本时永远是"直接切换"（`:1620`），一条**不切换**的裁定
 /// （`healthy` / `noBetter`）只有基线**拿得出**速度时才出得来，而
-/// `_autoSwitchLoop` 收尾那道兜底重载（`cdn_switch_mixin.dart:988`）恰恰只接
+/// `_autoSwitchLoop` 收尾那道兜底重载（`cdn_switch_mixin.dart:1183`）恰恰只接
 /// 不切换的裁定。
 ///
 /// host 形状还是照旧匹配 `_mirrorRegex`：`getCdnUrl` 只认这个形状，换成别的形状
@@ -1462,7 +1537,7 @@ const _baselineUrl = 'https://$_baselineHost/upgcxcode/1/2/3/4.m4s';
 const _steadyBaselineUrl =
     'https://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3/4.m4s';
 
-/// 假播放器宿主：只实现 mixin 的宿主契约（`cdn_switch_mixin.dart:118-155`），
+/// 假播放器宿主：只实现 mixin 的宿主契约（`cdn_switch_mixin.dart:153-189`），
 /// 外加两个测试钩子。
 class _CdnHost extends GetxController with CdnSwitchMixin {
   _CdnHost({required this.cdn, required String url}) : videoUrl = url {
@@ -1545,7 +1620,7 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
 ///
 /// 基线与候选的差别只有一个字节数：
 /// - 基线给 8KiB（低于 [CdnSpeedTest.autoMinBytes]）→ 样本"不可用"，于是
-///   `_pickFastestCdn` 走"基线拿不出有效速度，直接切换"那条路（`:1358`）。
+///   `_pickFastestCdn` 走"基线拿不出有效速度，直接切换"那条路（`:1611`）。
 ///   刻意不用速度比来造 `better`：那要靠真实墙钟去堆分块延迟，既慢又不稳。
 /// - 候选给满 [CdnSpeedTest.autoBytes] → 样本可用。
 class _FakeCdn {

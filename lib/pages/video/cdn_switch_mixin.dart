@@ -938,6 +938,28 @@ mixin CdnSwitchMixin on GetxController {
     return (floor == null || floor <= 0) ? null : floor;
   }
 
+  /// 播放器**当场**就在挨饿或冻着 —— 这是"这条镜像供不上字节"的旁证。
+  ///
+  /// 专用在 [_pickFastestCdn] 那条「基线无有效样本 → 直接切换」的出口上，见
+  /// [PLPlayerController.bufferedAhead]、[PLPlayerController.isBuffering] 与
+  /// [PLPlayerController.telemetryDiverged]。那条出口原先默认"基线拿不出速度
+  /// = 就是我们要修的那个故障"，2026-10-13 真机证伪了一次：预检那轮基线探到
+  /// 一个 3s 连接超时，而播放器正拿**同一条 URL**播得好好的（位置匀速从 0 走到
+  /// 6.6s，全程没有任何卡顿/饥饿上报）—— 一次并行新连接建不起来跟"这条镜像
+  /// 供不上字节"是两回事。
+  ///
+  /// 三条口径缺一不可：失真那一档 [PLPlayerController.bufferedAhead] 反而很大
+  /// （被音频轨抬起来），只有 [PLPlayerController.telemetryDiverged] 认得出来。
+  ///
+  /// **取的是现场值，不是触发那一刻**：一轮测速要跑好几秒，期间自己缓过来了就
+  /// 不该动 —— 与 [_autoSwitchLoop] 收尾那句 `telemetryDiverged` 同一个口径。
+  bool get _playerInTrouble {
+    final player = plPlayerController;
+    if (player.isBuffering.value || player.telemetryDiverged) return true;
+    final floor = _cdnBufferFloor;
+    return floor != null && player.bufferedAhead < floor;
+  }
+
   /// 定时器只决定"多久考虑一次"；要不要真的花流量，由缓冲决定。
   ///
   /// 常规测速的策略是**只在缓冲吃紧时才换**：余量还在 mpv 的回填水位
@@ -1555,7 +1577,41 @@ mixin CdnSwitchMixin on GetxController {
 
     final base = baseline;
     if (base == null || !usable(base)) {
-      // 基线拿不出可用速度，就是我们要修的那个故障本身：有候选就直接换。
+      // 基线拿不出可用速度，**大概率**就是我们要修的那个故障本身：有候选就直接换。
+      //
+      // 但这条出口的代价是一整次重载（真机实测 ~8 秒没画面 + 5 次补 seek），而它
+      // 的证据只是"这一次探测没拿到样本" —— 分不出"镜像供不上字节"和"这一次并行
+      // 新连接没在 3 秒内建起来"。后者与镜像好坏无关（自己起播那一下的突发流量
+      // 就够把链路占满）。2026-10-13 真机 log 18 就是这么撞上的：预检那轮基线
+      // `upos-sz-mirrorhw` 探到 `connection timeout`，换完 32 秒它自己又测出
+      // 3.50MB/s，比换过去的 `tf_hw`（0.642MB/s）快 5 倍多 —— 白付 8 秒，还换到
+      // 一条更慢的线上。
+      //
+      // ⚠️ 那一局判定时刻的余量**日志里没有采样点**：看门狗每 11s 一行，而那轮
+      // 只有 6.8s，整个落在两行之间。所以"闸门会拦住它"是**推出来的、不是读出来
+      // 的**（那段播放匀速无卡顿、同一 host 32 秒后就跑到 3.50MB/s，推算余量早就
+      // 补满）。真正有采样点的同形态案例是 log 3：看门狗 `余量 32s / 位置 0s /
+      // 重新缓冲 false` 紧跟着这条出口。
+      //
+      // 所以放行要**佐证**：播放器自己也在挨饿/冻着（[_playerInTrouble]）。真坏
+      // 镜像一定同时让播放器饿死，所以 `stall` / `starve` / `rebuffer` / `画面已冻`
+      // 那几条救援路一条都不受影响 —— 延迟最多是它们自己的节流（`starve` 连低 4 秒、
+      // `stall` 冻 8 秒）。log 8 那次「钉 cosov → 基线断流 → ~6 秒救走」就是
+      // `余量 0s + 重新缓冲 true`，照样走这条出口。
+      //
+      // 预检抓"一直喂不上"的本意也完好保留：那种局面缓冲**补不满**，deadline 一到
+      // 时 `bufferedAhead` 就低于回填水位，同样是"在挨饿"。
+      //
+      // [decode] 档（`force`）豁免：它的证据来自解码器而不是探测，且坏镜像以正常
+      // 速度送垃圾字节时 `bufferedAhead` 恰恰是健康的。
+      if (!force && !_playerInTrouble) {
+        return unmeasurable(
+          '基线探测没拿到样本，但播放器没在挨饿'
+          '（余量 ${plPlayerController.bufferedAhead}s、'
+          '重新缓冲 ${plPlayerController.isBuffering.value}）'
+          '—— 一次新连接没建起来不等于镜像坏了',
+        );
+      }
       debugPrint(
         'CDN 自动切换: 基线无有效速度，直接切换 -> ${best.$1.desc} '
         '${_fmtSpeed(best.$2.bytes, best.$2.micros)}',

@@ -130,6 +130,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 | 遥测失真（首报） | `CDN 遥测失真: 余量 Ns 超过缓存上限 Ns 的 3.0x (音频在走，画面已冻) @Ns` |
 | 遥测失真（补报） | `CDN 遥测失真: 仍在失真（余量 Ns）@Ns` |
 | 放弃 | `CDN 自动切换: 放弃，Ns 内不再尝试（<reason>）` |
+| 闸门：基线无样本但不挨饿 | `CDN 自动切换: 基线探测没拿到样本，但播放器没在挨饿（余量 32s、重新缓冲 false）—— 一次新连接没建起来不等于镜像坏了，放弃本轮`（普通档：播放器没挨饿就放弃本轮；`force`/解码档**豁免**这道闸，见条目 21） |
 | 解码档恢复 | `CDN 自动切换: 解码错误档换源后 Ns 无新报错，判定已恢复` |
 | 余量恢复 | `CDN 自动切换: 前向余量回到 Ns（回填水位 N…s），判定已恢复` |
 | 解码风暴（稀疏档） | `CDN 看门狗: 解码错误风暴（6s 内 12 条），当前镜像给的字节解不出画面 —— 上报换源` |
@@ -242,8 +243,8 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 步骤 (b)：同一集里，让一场风暴横跨一次自动换源（重载会排空旧流的报错）。
 通过 (a)：换集后**不立刻**出现看门狗行 —— 必须重新攒满 12 条/6s；旧流的账不带过去
 （页面 `onReset`（`controller.dart:1299`）调 `resetCdnAutoSwitch()`（`:1309`），它再到
-混入层 `:556` 把播放器的解码账清掉（`plPlayerController.resetDecodeErrorAccounting()`）；
-换画质走 `resetCdnForNewObject()`，那条直接清在 `cdn_switch_mixin.dart:582`）。
+混入层 `:608` 把播放器的解码账清掉（`plPlayerController.resetDecodeErrorAccounting()`）；
+换画质走 `resetCdnForNewObject()`，那条直接清在 `cdn_switch_mixin.dart:634`）。
 通过 (b)：换源期间旧流的报错**继续计数** —— 换源前会触发的那场风暴，换源后照样触发
 （`_decodeErrors` 刻意不在 `player.open`/`setDataSource` 里清）。
 失败 (a)：新一集的 host 被上一集残留的风暴瞬间禁掉。
@@ -282,18 +283,18 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 > **正面那一半才是证据。** 回 A 之后 `22:13:36.188 CDN 自动切换: 预检 @37s` 出现，
 > 后面的 `目标偏移 81517065/543447102 字节 (位置 37000ms/2225075ms)` 用的是 **A 的
 > 对象、A 被盖住时的位置**。而 `attachCdnSwitch` 是幂等的
-> （`if (_cdnIsAttached) return;`，`cdn_switch_mixin.dart:743`），预检能重开
+> （`if (_cdnIsAttached) return;`，`cdn_switch_mixin.dart:855`），预检能重开
 > **只可能**是因为重挂那一刻 `_cdnIsAttached` 为假 —— 也就是说 B 在播的那段时间里，
 > A 确实已经不挂在播放器上了。重挂的因果也是闭合的：`restartCdnProbe()` 只有两个
 > 调用点（`controller.dart:1311` 的 `onReset`，只有换 P/换集走得到；
-> `cdn_switch_mixin.dart:765` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
+> `cdn_switch_mixin.dart:884` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
 > 而它在返回路径上的调用点只有 `view.dart:432`（`didPopNext`）。时间也对：
 > 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `_kCdnPreflightPoll`
 > 的 2 s 加上等缓冲那一拍。
 >
 > ⚠️ **负那一半（"旧页面静默"）不构成证据，别拿它当通过的依据。** 旧页面的周期
 > tick 只有在 `bufferedAhead` 低于回填水位时才打印（`_onCdnProbeTick` 里
-> `if (bufferedAhead >= floor) return;`，`cdn_switch_mixin.dart:850`），而那段
+> `if (bufferedAhead >= floor) return;`，`cdn_switch_mixin.dart:1004`），而那段
 > 余量一直 22~31s，很健康 —— 所以"窗口里没有带 A 对象长度的行"这件事，
 > **A 已静默**和**A 仍挂着但没到该响的时候**两种解释都成立。
 > （清单早期版本写过"那 138 秒里一条 `CDN 自动切换:` 都没有"，**是错的**：
@@ -503,7 +504,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 > （早 0.64 s）。机制见条目 8 的 ⚠️ 之外另有一条：`_kCdnPreflightDeadline`（10s）
 > 到期前你退了后台，iOS 冻住定时器，`_cdnPreflightSince` 就悬着 —— 584 秒后回前台
 > 第一拍 `now - since` 早就过线，于是**补做**了那一次预检。它值钱的前提是"位置还在
-> 起点、换源看不出闪"（`cdn_switch_mixin.dart:814`），在 **353 秒**处开火时这个前提
+> 起点、换源看不出闪"（`cdn_switch_mixin.dart:975`），在 **353 秒**处开火时这个前提
 > 已经没了：这时换源就是一次实打实的重载。这一局没造成伤害（基线 4.42MB/s 赢了，
 > 收在 `放弃`），但那是运气 —— 换与不换取决于那一刻谁快，跟"该不该现在换"无关。
 > 这是旧行为，与本条无关，**待定**。
@@ -535,8 +536,8 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 - 重开之后 mpv 一上报 playing，播放器就把 `playerStatus` 置成 `.playing`。用户按的
   暂停**没有任何地方记着**（全仓没有 `userPause` 之类的标记），意图就此丢掉。
 
-对比 **条目 13**：那条是**换源路**，已经修好了 —— `cdn_switch_mixin.dart:1516`
-`final wasPlaying = plPlayerController.playerStatus.isPlaying;` → `:1521`
+对比 **条目 13**：那条是**换源路**，已经修好了 —— `cdn_switch_mixin.dart:1755`
+`final wasPlaying = plPlayerController.playerStatus.isPlaying;` → `:1760`
 `await playerInit(autoplay: wasPlaying);`。本条是**重建路**，还没按同一口径处理；
 修复方向就是让 `refreshPlayer()` 也读一次 `playerStatus.isPlaying` 再传给 `play:`。
 
@@ -563,21 +564,103 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 
 ### 20 — 备注：换源轮次里 `now` 的取样时刻偏早几秒（无需真机验证）
 
-一轮换源的 `now` 是在**轮次开头**取的（`lib/pages/video/cdn_switch_mixin.dart:1057`
-`final now = DateTime.now();`），而它要到探完对象大小（`:1137` 的
+一轮换源的 `now` 是在**轮次开头**取的（`lib/pages/video/cdn_switch_mixin.dart:1243`
+`final now = DateTime.now();`），而它要到探完对象大小（`:1318` 的
 `await CdnSpeedTest.probeSize`，预算 `probeMicros`/`probeConnect`/`probeReceive` 各 3s，
-`lib/utils/cdn_speed_test.dart:19-21`）和并发测速（`:1224-1231` 的 await，`autoMicros`
+`lib/utils/cdn_speed_test.dart:19-21`）和并发测速（`:1407-1414` 的 await，`autoMicros`
 6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:31`/`:41`）**之后**才被拿去记账 ——
 也就是相对"读数真正落地的时刻"偏早约几秒（最多探大小 3s + 测速 6s）。受影响的是它喂的
-那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1109`，窗口 `_kCdnRetryAfter`
-`:209` / `_kCdnDeadRetryAfter` `:219`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
-（`:1247`）、`_cdnChampion` 的 6 小时过期（`:1066`，窗口 `_kCdnRecordExpiry` `:274`）、
-`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`:1322`，`_kCdnRecordReset` `:270`）。
+那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1295`，窗口 `_kCdnRetryAfter`
+`:251` / `_kCdnDeadRetryAfter` `:261`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
+（`:1438`）、`_cdnChampion` 的 6 小时过期（`:1252`，窗口 `_kCdnRecordExpiry` `:316`）、
+`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`:1515`，`_kCdnRecordReset` `:312`）。
 **对着这几档窗口，偏早几秒不产生行为差异**（窗口比误差大两三个数量级），所以它是备注、
 不是 bug。**无需真机验证。**
 
 （注意它**不在**解码恢复那条路上：`_awaitRecovery` 的参照点是等它开始时取的 `start`、
 判据用的是 `elapsed`，那里没有"偏早几秒"的取样。）
+
+### 21 — 余量健康时的一次探测失败不许直接换源（MEDIUM，2026-10-13 新增）
+
+前置：任意一集在播、缓冲补满（心跳行 `CDN 看门狗: 余量 32s 阈值 12.8s 位置 Ns … 重新缓冲 false`
+—— 余量在 mpv 回填水位以上、没在重新缓冲就对了）。然后**让当前正在播的那条 URL 的 host 探测失败**
+—— 代理限速/闪断，或钉一条"测速一读就断"的镜像。最容易撞上的触发是**预检**
+（`预检 @Ns（新视频，在 size×15% 处测一轮，不看缓冲）`）：它是唯一**不看缓冲水位**的触发 ——
+别的触发都得等缓冲先掉下去，那时播放器本来就饿着，落不到本条要考的情形上。它自己等的是
+"缓冲补满（≥21.333s）**或**攒够 10 秒 deadline"（`cdn_switch_mixin.dart:979-1025`；`_cdnPreflightSince`
+只在 `restartCdnProbe(armPreflight: true)` 时清空，`:809`）。log 18 那局 `since` 从 `01:22:55` 就在攒、
+`01:23:12.942` 只是"选流"重载（不是 `armPreflight`），**所以那次预检大概率是 deadline 先到、
+缓冲还没补满就开测的** —— 不要读成"它故意等缓冲补满才测"。
+
+病根：`_pickFastestCdn` 里"基线无有效样本 → 直接切换"那条出口（原 `:1557`，现从 `:1579` 起）
+原先假设"基线拿不出速度 = 就是我们要修的那个故障本身"，于是一次连接超时 / 接收超时 / 0 字节
+就无条件换源，**既不比值、也不看播放器死活**。这条出口的代价是一整次重载。
+
+2026-10-13 真机 log 18（`docs/logs/pili-console-18-2026-10-13.log`，`01:22:02`–`01:29:39`）：
+那一局共 **7 轮测速**（2 次「小卡顿」快速档 + 5 次「预检」）里 **6 轮**判"不切换"，**唯一一次换源**
+出在 `01:23:14.804` 那轮预检里 —— `01:23:20.810` 基线 `upos-sz-mirrorhw.bilivideo.com` 探到
+`DioException [connection timeout]`（`CDN 测速失败 [基线 …]: …`）→ `01:23:20.811`
+`CDN 自动切换: 基线无有效速度，直接切换 -> tf_hw（华为云） 0.889MB/s` + `CDN 自动切换: 第1次 -> tf_hw（华为云） (0.889MB/s)`
+→ `01:23:20.899` 暂停重载（`Setting option 'start' = '6.633'`）→ `落点 0ms 落后于 6633ms，补一次 seek`
+×5（`01:23:21.701` / `22.504` / `23.307` / `24.110` / `24.913`）→ `01:23:28.623 成功，已切到 tf_hw（华为云）`。
+**约 8 秒没画面。** 而 **32 秒后**（`01:23:53.208`，换源后的又一轮预检）同一个 host 测出 `3.50MB/s`：
+`[基线 upos-sz-mirrorhw.bilivideo.com] 3.50MB/s … | [tf_hw（华为云）] 0.642MB/s`，紧接
+`01:23:53.209 判定 最快候选 tf_hw（华为云） 0.642MB/s / 基线 3.50MB/s = 0.183x (阈值 1.5) -> 不切换`，
+这一轮收在 `CDN 都正常，可能是网络问题`。换过去的那条线慢了 5 倍多 —— 白付 8 秒、还换到更差的线上。
+
+⚠️ **诚实边界 —— "这次换源新闸门会不会拦"是推出来的、不是读出来的**：判定那一刻
+（`01:23:20.811`）的余量**日志里没有采样点**（看门狗每 ~11s 一行，那轮只跑了 6.8s，整段落在
+`01:23:14.056` 的 `余量 0s` 与 `01:23:24.952` 的"已换源重载"两行之间）。能推的依据：那段播放
+位置匀速 0→6.633s、零卡顿零饥饿上报，且同 host 32 秒后 3.50MB/s —— 余量早该补满。**同形态、
+有采样点的硬证据在 log 3**（`docs/logs/pili-console-3-2026-10-11.log`）：`22:00:53.757` 那发
+`基线无有效速度，直接切换 -> tf_hw（华为云） 0.440MB/s` 的**前一条**看门狗正是
+`22:00:46.849 CDN 看门狗: 余量 32s 阈值 12.8s 位置 0s (cache-time 32s) 播放中 true 重新缓冲 false`
+—— 基线 `upos-hz-mirrorakam.akamaized.net` 收超时、余量健康，形态与 log 18 逐条相同，
+**这条余量是读出来的**，可以当"新闸门会拦"的铁证。
+
+**修法**：新判据 `_playerInTrouble`（`cdn_switch_mixin.dart:956`）= `isBuffering.value ||
+telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!force && !_playerInTrouble)`
+就 `return unmeasurable(...)`，放行才照旧走那条"直接切换"。`force`（解码档）豁免。**判据取的是现场值、
+不是触发那一刻**：一轮测速要跑好几秒，期间自己缓过来了就不该动 —— 与 `_autoSwitchLoop` 收尾那句
+`telemetryDiverged` 同一个口径。
+
+通过（逐字日志）：
+1. 新行**出现**（`unmeasurable` 助手，`cdn_switch_mixin.dart:1451`，前缀 `CDN 自动切换: ` 与后缀
+   `，放弃本轮` 都由它补齐）：
+   `CDN 自动切换: 基线探测没拿到样本，但播放器没在挨饿（余量 32s、重新缓冲 false）—— 一次新连接没建起来不等于镜像坏了，放弃本轮`
+   随后 `_autoSwitchLoop` 收尾（`:1190`）：`CDN 自动切换: 放弃，20s 内不再尝试（无法测出更快的 CDN，暂不切换）`
+   —— 这 20s 来自 `_kCdnUnmeasuredCooldown`（`cdn_switch_mixin.dart:243`）。
+2. **没有**紧跟的 `CDN 自动切换: 基线无有效速度，直接切换 -> …`（`:1616`），**没有**
+   `CDN 自动切换: 第1次 -> …`，**没有** `Setting option 'start' = …` 重载，**没有**
+   `落点 … 补一次 seek`。
+3. 画面不顿、位置继续往前走（心跳行 `位置 Ns` 照常递增）。
+
+失败的样子（老行为）：新行**不出现**，取而代之是
+`CDN 自动切换: 基线无有效速度，直接切换 -> <svc> <r>`，紧跟 `CDN 自动切换: 第1次 -> <svc> (<r>)`，
+随后一次重载（`Setting option 'start' = …`）并连打几发 `落点 … 补一次 seek` —— 就是 log 18 那 8 秒。
+
+**别读成回归**：
+- **`余量 0s` 才是历史常态。** 把仓里那 14 份 log 逐份扫一遍，每条 `CDN 自动切换: 第N次 ->`
+  与它**前一条看门狗读数**对齐后：**21 条换源记录里 19 条是 `余量 0s`**（log 11 与 log 13 有
+  一处同刻 `17:30:37.963` 的重复存档，去重后 20 次里 18 次）。不是 `余量 0s` 的只有两条：
+  log 3 `22:00:53.757` 的 `余量 32s`（**就是新闸门会拦的那次**）和 log 17 `21:30:20.122`
+  的 `余量 274s`（遥测失真，走 `telemetryDiverged` 放行）。
+  ⚠️ **口径注意**：这是"换源前**最近一条**看门狗读数"，可能早到 11 秒；而一轮测速要跑 6~7 秒，
+  余量在这期间会变 —— log 18 就是按这个口径取到探测开跑那一刻的 `余量 0s`，但判定时可能已经补满
+  （见上面那条"诚实边界"）。新闸门只拦"余量健康 + 只有这一次探测没起来"，那些 `余量 0s`
+  的一条都不碰。
+- **log 8 那局"钉 cosov → 基线断流 → ~6 秒救走"照旧直接切换**（否定对照）：`docs/logs/pili-console-8-2026-10-12.log`
+  里那发 `14:43:59.400 基线无有效速度，直接切换 -> hw（华为云，融合CDN） 1.14MB/s` 的**前一条**看门狗是
+  `14:43:50.718 CDN 看门狗: 余量 0s 阈值 12.8s 位置 720s (cache-time 720s) 播放中 true 重新缓冲 true`
+  —— `余量 0s + 重新缓冲 true`，`_playerInTrouble` 为真，根本走不到新闸门。
+- 新闸门**只改了那一条出口**，别的判定路径一点没动：log 18 那两次「小卡顿」快速档的基线**是测出读数的**
+  （`01:22:15.513` 放弃 `当前 CDN 只有 0.697MB/s，没找到更快的镜像`、`01:22:52.335` 放弃
+  `CDN 都正常，可能是网络问题`），它们走的是比值/健康判定，跟本闸门无关。
+
+已知代价：拦下这一轮会走 `unmeasurable` → 留 **20s 冷却**（`_kCdnUnmeasuredCooldown`，
+`cdn_switch_mixin.dart:243`）：这 20 秒里**播放器侧触发也被这道放弃冷却挡着**，半死镜像最坏
+**晚约 20 秒**才被发现；不过 `解码错误` 与 `画面已冻`（`telemetryDiverged`）两档**不吃**这道冷却，
+真坏到那份上的镜像照旧立刻救。
 
 ---
 
@@ -956,20 +1039,20 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   只能掐掉重载**之后**的动作（补 seek、恢复判定、假"成功"），**掐不掉重载**。
   因为页面侧的 `playerInit`（`lib/pages/video/controller.dart:743`）干的事就是
   `await plPlayerController.setDataSource(NetworkSource(videoSource: videoUrl!, ...))`
-  （`:750`），而 `videoUrl` 是 `_switchTo` 在调用**前**几行写进去的（`cdn_switch_mixin.dart:1494`）
+  （`:750`），而 `videoUrl` 是 `_switchTo` 在调用**前**几行写进去的（`cdn_switch_mixin.dart:1733`）
   —— 也就是**重载发生在 `playerInit` 内部**。`setDataSource`
   （`lib/plugin/pl_player/controller.dart:940`）里没有任何"你是不是现役页"的检查。
-  要紧的是：从 `:910` 那道闸门一路走到 `_switchTo` 里那句 `await playerInit`（`:1521`），
-  **中间一个 `await` 都没有** —— 新地址 `videoUrl = newVideo;`（`:1494`）也是在这段同步
+  要紧的是：从 `:1091` 那道闸门一路走到 `_switchTo` 里那句 `await playerInit`（`:1760`），
+  **中间一个 `await` 都没有** —— 新地址 `videoUrl = newVideo;`（`:1733`）也是在这段同步
   代码里写下去的。所以旧页决定重载的那一刻**它确实还是现役页** —— 用户还没来得及跳走。
   这不算"漏了一处"，是**站在那个点上无从拦起**。
   后果：重载在飞的时候跳相关视频，它仍可能落地（`setDataSource` 里 `await pause()` 之后的
   `_createVideoController` 一样可能在 `playerInit` 返回前跑完），把播放器换成**旧视频**的地址，
   并按 `:1011` 重置共享的 `position`/`buffered`。
-  与 `:999` 那条**不是一回事**：兜底 `refreshPlayer()` 经两个独立分析确认够不着
-  （`!switched` 成立 ⟹ 循环每次都从 `:911`/`:922`/`:926`/`:933` 那几处 `break` 出去，
-  而那几处都在 `:910` 那道闸门之后的**同一段同步代码**里 —— 中间没有 `await`，所以执行到
-  `:997` 兜底那句时本页必然还是现役页；给它加 `_roundLive` 是死代码）。本条则相反：够得着，
+  与 `:1185` 那条**不是一回事**：兜底 `refreshPlayer()` 经两个独立分析确认够不着
+  （`!switched` 成立 ⟹ 循环每次都从 `:1092`/`:1103`/`:1107`/`:1114` 那几处 `break` 出去，
+  而那几处都在 `:1091` 那道闸门之后的**同一段同步代码**里 —— 中间没有 `await`，所以执行到
+  `:1183` 兜底那句时本页必然还是现役页；给它加 `_roundLive` 是死代码）。本条则相反：够得着，
   但无从拦。**要修得给 `PlPlayerController` 加"发起者身份"**（非现役页发起的换源直接丢弃），
   动的是播放器核心，单独一轮做。
   **真机观察项**：跳相关视频后偶发"画面跳回上一个视频 / 缓冲被清空"即命中 —— 这条只能真机看。
@@ -985,7 +1068,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   **真机证据**：`docs/logs/pili-console-3`，22:00:54.646/55.446/56.246/57.054 连打四发
   `CDN 自动切换: 落点 … 补一次 seek`（此时 mpv position 还是 0），而 mpv 直到 22:00:57.497
   才第一次 `timeline: queuing seek to 7.250000` —— 四发全部先悬着、后一起落地。
-  **修法**：`await player.seekTo(target, isSeek: false)`（`cdn_switch_mixin.dart:1561` 一带）。
+  **修法**：`await player.seekTo(target, isSeek: false)`（`cdn_switch_mixin.dart:1800` 一带）。
   `isSeek: false` 跳过那道等待，seek 在 `_roundLive` 复查之后**当场**发出去 —— 窗口从
   「整个重载期」压到「一条 mpv 命令往返」。仓里程序化 seek 本来就多用这一档
   （`bottom_control.dart:44`、`view.dart:980`、`pip_helper.dart:60` 等 10 处）。
@@ -999,7 +1082,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   写成非零，之后也没有东西把它归零），真悬住的是 `stream.buffer.first`。两条都读过才改的口。
 - **被顶掉那一页重新露面后的那几秒，还会接着动播放器（MEDIUM，本轮已修）**：
   相关视频跳转 push 新页，既不 `onClose` 旧页、也不换代。旧页在途的那一轮在
-  `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`:1151`、`:1241`），
+  `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`:1332`、`:1424`），
   **没有 `_cdnIsAttached`** —— 所以被顶掉多久它都活着。用户 pop 回来 → `didPopNext` 调
   旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:432`），它把 `onStall` 等回调**同步**
   装回去，`_cdnIsAttached` **立刻又为真**，而 `_cdnGeneration` 从头到尾没动过 ——
@@ -1009,7 +1092,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   时只把计数 2→1、**不卸载媒体**，所以那几秒确实还是新页的片。）
   **修法**：`attachCdnSwitch` 在幂等闸之后 `_cdnGeneration++;`，**并且同时**
   `_cdnAutoBusy = false;`。后半句不是配套美容，是必须的 —— 一轮收尾那句
-  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`:671-674`）
+  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`:769-773`）
   只在代际相同时清 busy，光换代不清就把 busy **永久钉死在真**，此后所有卡顿/探测都被
   `busy=true` 忽略，而 `attachCdnSwitch` 幂等、再也不会进来救它 —— 这一页的自动换源就死透了。
   **不复用** `resetCdnForNewObject()`：它还会清 `_cdnObjectSize` / `_cdnBadHosts` /
@@ -1024,7 +1107,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   修复后一条不发。两半都单独验过：只删 `_cdnAutoBusy = false;`，第二条断言（重挂之后
   新一轮要能起来）红在 `忽略卡顿 @300s (busy=true …)` 上 —— 清忙不是配套美容。
   它和已有的「被顶掉的那一页连兜底重载都不该碰」只差**重新露面**这一步：不露面时
-  那一轮本来就该停在 `:910` 那道 `!_cdnIsAttached` 上（那条用例正是钉这个的）。
+  那一轮本来就该停在 `:1091` 那道 `!_cdnIsAttached` 上（那条用例正是钉这个的）。
 
 ## 备注
 
