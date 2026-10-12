@@ -924,36 +924,149 @@ void main() {
 
     test('认领之后这一条让开，轮到下一道闸门（否定不是空的）', () {
       Future<void> reload() async {}
+      final pageA = Object();
       expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
 
-      pc.addRenderReloadListener(reload);
+      pc.addRenderReloadListener(pageA, reload);
       expect(
         pc.debugRenderRebuildBlocker(),
         '播放器不存在',
         reason: '认领了就该放过"没人认领"，在测试进程里停在下一条：没有真 Player',
       );
 
-      pc.removeRenderReloadListener(reload);
+      // 卸认领只是**休眠**（页面还在），所以这一条又该拦回来。
+      pc.removeRenderReloadListener(pageA);
       expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
     });
 
-    test('单例被两个页面共用时不重建：会把另一页的播放一起掀掉', () {
+    test('直播间并存时不重建：它计了数却从不认领重载', () {
+      // 这就是"视频页 + 直播间"的形状：两个页面控制器都 `getInstance()`（`_playerCount`
+      // == 2），而只有视频页会认领 —— 直播间从不认领、也不登记休眠，于是落在"计了数却
+      // 没登记身份"的差额里，拆了会把直播间的播放一起掀掉。
+      // 同一形状也覆盖"新页刚 push、认领还没发生"那个瞬时窗口（数值同形，语义不同）。
       Future<void> reload() async {}
+      final pageA = Object();
       pc
-        ..addRenderReloadListener(reload)
+        ..addRenderReloadListener(pageA, reload)
         ..debugPlayerCount = 2;
       // 卸在 tearDown 而不是断言之后：断言抛了就轮不到它执行，集合会漏进后面的
       // 用例（那边的日志会变成另一个理由，看起来像它自己的毛病）。
-      addTearDown(() => pc.removeRenderReloadListener(reload));
-      expect(pc.debugRenderRebuildBlocker(), '播放器单例被 2 个页面共用');
+      addTearDown(() => pc.removeRenderReloadListener(pageA));
+      expect(pc.debugRenderRebuildBlocker(), '有 1 个共用者没登记身份（直播间/装载中）');
+    });
+
+    // ---- 细口径放行：多出来的共用者只要全是"登记过的休眠视频页"就放行 ----
+
+    test('视频页被视频页压住：休眠的旧页可解释 → 放行到下一道闸', () {
+      // 本次要修的场景：旧页被 B 压住时 `didPushNext` 只卸认领、**不** dispose，
+      // `_playerCount` 一直挂着 2 —— 老判据 `_playerCount != 1` 在这里**恒拦**，
+      // 整个覆盖期间用户只能手动退出再进。
+      Future<void> reload() async {}
+      final pageA = Object(); // 被压住的旧页（休眠）
+      final pageB = Object(); // 压在上面的新页（认领中）
+      pc
+        ..addRenderReloadListener(pageA, reload)
+        ..removeRenderReloadListener(pageA)
+        ..addRenderReloadListener(pageB, reload)
+        ..debugPlayerCount = 2;
+      addTearDown(() => pc.removeRenderReloadListener(pageB));
+      expect(
+        pc.debugRenderRebuildBlocker(),
+        '播放器不存在',
+        reason: '休眠页可以解释，该放过"共用者"这一条，停在测试进程的下一条',
+      );
+    });
+
+    test('三个视频页叠加：两层休眠一并放行', () {
+      Future<void> reload() async {}
+      final pageA = Object();
+      final pageB = Object();
+      final pageC = Object();
+      pc
+        ..addRenderReloadListener(pageA, reload)
+        ..removeRenderReloadListener(pageA)
+        ..addRenderReloadListener(pageB, reload)
+        ..removeRenderReloadListener(pageB)
+        ..addRenderReloadListener(pageC, reload)
+        ..debugPlayerCount = 3;
+      addTearDown(() => pc.removeRenderReloadListener(pageC));
+      expect(pc.debugRenderRebuildBlocker(), '播放器不存在');
+      expect(pc.debugRenderReloadClaimants, {pageC});
+      expect(pc.debugDormantRenderClaimants, {pageA, pageB});
+    });
+
+    test('两个页面同时认领时不重建：掀谁都不对', () {
+      Future<void> reload() async {}
+      final pageA = Object();
+      final pageB = Object();
+      pc
+        ..addRenderReloadListener(pageA, reload)
+        ..addRenderReloadListener(pageB, reload)
+        ..debugPlayerCount = 2;
+      addTearDown(() {
+        pc
+          ..removeRenderReloadListener(pageA)
+          ..removeRenderReloadListener(pageB);
+      });
+      expect(pc.debugRenderRebuildBlocker(), '有 2 个页面同时认领重载');
+    });
+
+    test('休眠页消亡后不占名额：页面 dispose 必须 forget，不能只卸认领', () {
+      // 这条钉的是本次唯一"靠纪律"的点：页面消亡时只 `removeRenderReloadListener`
+      // （= 休眠）而不 `forgetRenderReloadOwner`，死 token 会留着占名额 —— 一边计数已减、
+      // 一边名册还挂着，重建闸门的等式就被"抵消"了。这里摆出忘掉 forget 的后果。
+      Future<void> reload() async {}
+      final pageA = Object();
+      final pageB = Object();
+      pc
+        ..addRenderReloadListener(pageA, reload)
+        ..removeRenderReloadListener(pageA)
+        ..addRenderReloadListener(pageB, reload)
+        ..debugPlayerCount = 2;
+      addTearDown(() => pc.removeRenderReloadListener(pageB));
+      // A 那一世结束：计数减 1，身份也从两处抹掉。
+      pc
+        ..debugPlayerCount = 1
+        ..forgetRenderReloadOwner(pageA);
+      expect(pc.debugDormantRenderClaimants, isEmpty);
+      expect(pc.debugRenderRebuildBlocker(), '播放器不存在');
+    });
+
+    test('认领/卸认领反复调用是幂等的，不造幽灵休眠', () {
+      Future<void> reload() async {}
+      final pageA = Object();
+      for (var i = 0; i < 3; i++) {
+        pc
+          ..addRenderReloadListener(pageA, reload)
+          ..removeRenderReloadListener(pageA);
+      }
+      pc.addRenderReloadListener(pageA, reload);
+      addTearDown(() => pc.removeRenderReloadListener(pageA));
+      expect(pc.debugRenderReloadClaimants, {pageA});
+      expect(pc.debugDormantRenderClaimants, isEmpty);
+      expect(pc.debugRenderRebuildBlocker(), '播放器不存在');
+
+      // 反过来：没认领过就卸，什么都不该发生（尤其不能进休眠集）。
+      pc.removeRenderReloadListener(Object());
+      expect(pc.debugDormantRenderClaimants, isEmpty);
+    });
+
+    test('认领之前就 forget 不留幽灵休眠', () {
+      // 同一条纪律的另一半：forget 是"从两处都抹掉"，不是"顺手往休眠集里塞一笔"。
+      final pageA = Object();
+      pc.forgetRenderReloadOwner(pageA);
+      expect(pc.debugRenderReloadClaimants, isEmpty);
+      expect(pc.debugDormantRenderClaimants, isEmpty);
+      expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
     });
 
     test('已经在重建时不许重入：拆第二遍会让两个 Player 抢同一个 handle', () {
       Future<void> reload() async {}
+      final pageA = Object();
       pc
-        ..addRenderReloadListener(reload)
+        ..addRenderReloadListener(pageA, reload)
         ..debugRebuildingRenderContext = true;
-      addTearDown(() => pc.removeRenderReloadListener(reload));
+      addTearDown(() => pc.removeRenderReloadListener(pageA));
       expect(pc.debugRenderRebuildBlocker(), '已在重建');
     });
 

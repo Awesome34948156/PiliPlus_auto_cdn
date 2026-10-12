@@ -94,6 +94,12 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   late final VideoReplyController _videoReplyController;
   PlPlayerController? plPlayerController;
 
+  /// 本页在播放器那边的身份 token（见 `PlPlayerController._renderReloadClaimants`）。
+  ///
+  /// 用独立的小对象而不是 `this`：万一 [PlPlayerController.forgetRenderReloadOwner] 漏调，
+  /// 泄漏的是它，不是整棵已经 dispose 的 State 树。
+  final Object _renderClaimToken = Object();
+
   // intro ctr
   late final CommonIntroController introController;
   late final UgcIntroController ugcIntroController;
@@ -195,14 +201,14 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     plPlayerController
       ?..addStatusLister(playerListener)
       ..addPositionListener(positionListener)
-      ..addRenderReloadListener(_onRenderContextLost);
+      ..addRenderReloadListener(_renderClaimToken, _onRenderContextLost);
   }
 
   void _detachPlayerListeners() {
     plPlayerController
       ?..removeStatusLister(playerListener)
       ..removePositionListener(positionListener)
-      ..removeRenderReloadListener(_onRenderContextLost);
+      ..removeRenderReloadListener(_renderClaimToken);
   }
 
   void positionListener(Duration position) {
@@ -367,6 +373,13 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   @override
   void dispose() {
     _detachPlayerListeners();
+    // 卸认领只表示"休眠"，页面这一世结束要把身份彻底抹掉：不然死 token 会永久占着
+    // `_dormantRenderClaimants` 的名额，把重建闸门的等式"抵消"成假放行。
+    // 取 controller 上的那个单例字段（而不是本页可能还是 null 的 `plPlayerController`）：
+    // autoPlay 关着且从未播放时后者就是 null，而身份该抹还是要抹。
+    videoDetailController.plPlayerController.forgetRenderReloadOwner(
+      _renderClaimToken,
+    );
 
     Get.delete<HorizontalMemberPageController>(
       tag: videoDetailController.heroTag,

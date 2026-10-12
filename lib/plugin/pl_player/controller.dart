@@ -1307,11 +1307,26 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   final Set<ValueChanged<Duration>> _positionListeners = {};
   final Set<ValueChanged<PlayerStatus>> _statusListeners = {};
 
-  /// 渲染上下文被拆掉后，能用**当前 URL** 把它重新建起来的页面。
+  /// 认领「渲染上下文被拆掉后，能用**当前 URL** 把它重新建起来」的页面。
   ///
-  /// 空集本身就是一道安全阀：没有页面认领时 [_renderRebuildBlocker] 会拦住重建，
+  /// 键是**页面身份 token**（`Object()`，纯身份，不重写 `==`），值是它要求的重载动作。
+  /// 合成一个 Map 而不是两个集合并排，是为了让"登记身份"和"挂回调"**在结构上**就是同
+  /// 一次操作 —— 拆成两个集合就得靠纪律维持同步，漏一处 [_renderRebuildBlocker] 的
+  /// 等式立刻失真。
+  ///
+  /// 空表本身就是一道安全阀：没有页面认领时 [_renderRebuildBlocker] 会拦住重建，
   /// 否则拆掉的播放器没人再建起来，画面反而回不来了。
-  final Set<Future<void> Function()> _renderReloadListeners = {};
+  final Map<Object, Future<void> Function()> _renderReloadClaimants = {};
+
+  /// 其中**已休眠**的那部分：被别的页盖住时 `didPushNext` 卸了认领，但页面还在。
+  ///
+  /// 它存在的唯一理由：[_renderRebuildBlocker] 要能回答"`_playerCount` 多出来的那几个
+  /// 到底是谁"。休眠的视频页返回时 `didPopNext` 会重挂认领 + `playerInit` 把自己救回来，
+  /// 所以它们不该拦重建；而直播间只 `getInstance()`、从不登记，就落在等式差额里被拦。
+  ///
+  /// 身份只有三种转移，**没有第四条出路**：[addRenderReloadListener]（认领）、
+  /// [removeRenderReloadListener]（休眠）、[forgetRenderReloadOwner]（页面消亡）。
+  final Set<Object> _dormantRenderClaimants = {};
 
   Timer? _wakeLockTimer;
 
@@ -1661,10 +1676,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 现在能不能就地重建渲染上下文；不能就返回原因（给日志和测试用）。
   ///
-  /// 「单例被几个页面共用」与「有没有页面认领重载」这两条是**安全阀**，不是优化：
-  /// 直播间也 `getInstance()`，单例被两个页面共用时拆掉它会把另一页的播放一起
-  /// 掀掉；没有页面认领时拆掉就没人再把它建起来。这两种情况都宁可退化成老出路
-  /// （用户手动退出视频页再进来），也不能在这里动手。
+  /// 「有没有页面认领重载」与「多出来的共用者是谁」这两条是**安全阀**，不是优化：
+  /// 没有页面认领时拆掉就没人再把它建起来；而单例被别的页面共用时拆掉它会把那一页的
+  /// 播放一起掀掉。两种都宁可退化成老出路（用户手动退出视频页再进来），也不能在这里动手。
+  ///
+  /// 共用者这一条是**细口径**的：`_playerCount` 数的是"实例化过单例的页面"，不区分谁
+  /// 在用 —— 视频页被另一个视频页压住时，旧页只是**休眠**（`didPushNext` 卸了认领，
+  /// 返回时 `didPopNext` 重挂 + `playerInit`），可它的计数一直挂着（减计数在页面
+  /// `dispose()` 里，被压住时不发生）。照老判据 `_playerCount != 1` 会在整个覆盖期间
+  /// 恒拦。所以这里改问两个更准的问题：
+  ///
+  /// - `_playerCount == 登记总数`：每个被计数的页面都在名册里。直播间只 `getInstance()`
+  ///   从不登记，等式就不成立 → 拦。
+  /// - 在册认领者恰好一个：同时有两个页面自认活跃时无法判定掀谁 → 拦。
+  ///
+  /// 反向也安全：任何残留/过期条目都让"登记总数"变大，等式更容易不成立 → 退化成拦。
   String? _renderRebuildBlocker() {
     if (_rebuildingRenderContext) {
       return '已在重建';
@@ -1672,11 +1698,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_noVideoRebuilds >= _kNoVideoRebuildMax) {
       return '本媒体已重建 $_noVideoRebuilds 次';
     }
-    if (_playerCount != 1) {
-      return '播放器单例被 $_playerCount 个页面共用';
-    }
-    if (_renderReloadListeners.isEmpty) {
+    // 「没有认领者」排在"共用者"之前：否则 `_playerCount == 1` 而没有认领者时，下面那条
+    // 会先把这一页判成"没登记身份"，把更有信息量的理由盖掉。
+    if (_renderReloadClaimants.isEmpty) {
       return '没有页面认领重载';
+    }
+    final registered =
+        _renderReloadClaimants.length + _dormantRenderClaimants.length;
+    if (_playerCount != registered) {
+      final extra = _playerCount - registered;
+      return extra > 0
+          ? '有 $extra 个共用者没登记身份（直播间/装载中）'
+          : '共用者登记表比实况多 ${-extra} 个（有残留）';
+    }
+    if (_renderReloadClaimants.length != 1) {
+      return '有 ${_renderReloadClaimants.length} 个页面同时认领重载';
     }
     if (_videoPlayerController == null) {
       return '播放器不存在';
@@ -1721,11 +1757,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   set debugNoVideoHealed(bool value) => _noVideoHealed = value;
 
-  /// 同上：[_renderReloadListeners] 只在页面 `dispose()` 里清，测试里没有页面，
+  /// 同上：认领名册只在页面 `dispose()` 里清，测试里没有页面，
   /// 用例里那条 `remove` 又写在断言之后 —— 断言一抛就漏，后面的用例看到非空集合，
   /// 会被连带弄红（看起来像它自己的问题）。
   @visibleForTesting
-  void debugClearRenderReloadListeners() => _renderReloadListeners.clear();
+  void debugClearRenderReloadListeners() {
+    _renderReloadClaimants.clear();
+    _dormantRenderClaimants.clear();
+  }
+
+  /// 在册认领者的身份（键），用例用来摆"谁认领着、谁休眠着"这两个前提。
+  @visibleForTesting
+  Set<Object> get debugRenderReloadClaimants =>
+      _renderReloadClaimants.keys.toSet();
+
+  @visibleForTesting
+  Set<Object> get debugDormantRenderClaimants => _dormantRenderClaimants;
 
   @visibleForTesting
   void debugCheckNoVideoTrack() => _checkNoVideoTrack();
@@ -1775,7 +1822,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // _ownReload 让 _createVideoController 分清"这是我们自己的重载"与"用户发起的
       // 装载"—— 两者在它眼里都带着 _rebuildingRenderContext == true。
       _ownReload = true;
-      for (final reload in _renderReloadListeners.toList()) {
+      for (final reload in _renderReloadClaimants.values.toList()) {
         await reload();
       }
     } finally {
@@ -2681,14 +2728,36 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void removeStatusLister(ValueChanged<PlayerStatus> listener) =>
       _statusListeners.remove(listener);
 
-  /// 认领"渲染上下文没了就重载一次"。见 [_renderReloadListeners]。
-  void addRenderReloadListener(Future<void> Function() listener) {
+  /// 认领"渲染上下文没了就重载一次"。见 [_renderReloadClaimants]。
+  ///
+  /// [owner] 是这个页面的身份 token，**必填**：身份与回调必须同时登记 —— 缺一个就会让
+  /// [_renderRebuildBlocker] 的等式失真（要么把页面判成"没登记"，要么让名册里躺着一个
+  /// 永远不会被触发的认领）。
+  void addRenderReloadListener(Object owner, Future<void> Function() listener) {
     if (_playerCount == 0) return;
-    _renderReloadListeners.add(listener);
+    _renderReloadClaimants[owner] = listener;
+    _dormantRenderClaimants.remove(owner);
   }
 
-  void removeRenderReloadListener(Future<void> Function() listener) =>
-      _renderReloadListeners.remove(listener);
+  /// 卸认领 = 页面**进入休眠**（被别的页盖住），不等于页面结束 —— 后者走
+  /// [forgetRenderReloadOwner]。只有真的挂着认领时才记一笔休眠：重复调用不会造出
+  /// "没认领过却休眠着"的幽灵名额。
+  void removeRenderReloadListener(Object owner) {
+    if (_renderReloadClaimants.remove(owner) != null) {
+      _dormantRenderClaimants.add(owner);
+    }
+  }
+
+  /// 页面这一世结束（`State.dispose`）：把身份从两处**都**抹掉。
+  ///
+  /// 漏掉这一句，死页面的 token 会永久占着 [_dormantRenderClaimants] 的名额 —— 一边计数
+  /// 已减、一边名册还留着，[_renderRebuildBlocker] 的等式就可能被"抵消"成**假放行**
+  /// （残留一条 + 正好一个直播间）。正常路径下它是页面 `dispose()` 的第二句，但这是本次
+  /// 改动里唯一一处靠纪律守住的点，用例专门钉了它。
+  void forgetRenderReloadOwner(Object owner) {
+    _renderReloadClaimants.remove(owner);
+    _dormantRenderClaimants.remove(owner);
+  }
 
   // 记录播放记录
   Future<void>? makeHeartBeat(
@@ -2828,7 +2897,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _removeListeners();
     _positionListeners.clear();
     _statusListeners.clear();
-    _renderReloadListeners.clear();
+    _renderReloadClaimants.clear();
+    // 计数归零后 `_instance` 也会置 null（本函数后面几行），两套名册其实跟着一起被丢弃；
+    // 这里清是为了让"归零 ⇔ 记录全空"这条读起来成立。
+    _dormantRenderClaimants.clear();
     _stopWakeLockTimer();
     WakelockPlus.disable();
     if (kDebugMode) {
