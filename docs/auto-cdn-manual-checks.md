@@ -599,8 +599,9 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 ### A. 装包（AltSign 侧载最新 IPA）
 
 - 用仓里 `lib/scripts/ipa-local.sh` 打的**最新**未签名 IPA（脚本默认把成品丢到 iCloud 的
-  `Downloads/`，文件名 `PiliPlus_ios_2.1.6+<提交数>.ipa`）。当前 HEAD 是 `74c9c7c4b`
-  → **`2.1.6+5526`**。用 AltSign 侧载。
+  `Downloads/`，文件名 `PiliPlus_ios_2.1.6+<提交数>.ipa`，`<提交数>` 是脚本按**构建那一刻的
+  HEAD** 现算的 `git rev-list --count HEAD`）。**装包前现查一次，别背数字** —— 这里原先写死的
+  `74c9c7c4b` / `+5526` 已经漂移过好几版。用 AltSign 侧载。
 - bundle id 是**带 AltSign 后缀**的那个（本机实测 `com.example.piliplus.895K68AF3F`；
   侧载后可能变 —— 取日志前用 `xcrun devicectl list devices` / 设备信息现确认，见 E）。
 
