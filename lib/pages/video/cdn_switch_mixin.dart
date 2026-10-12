@@ -1189,11 +1189,6 @@ mixin CdnSwitchMixin on GetxController {
         fromRotation++;
       }
     }
-    // 推进量必须跟随**实际从轮换取走的个数**，不能写死 `limit`。冠军占了位子
-    // 时每轮只从轮换取 1 个，相位若仍推进 2，下标就永远落在偶数列 —— 奇数位
-    // 的镜像再也不会被轮到，正是上面那段注释警告过的"跳着走"。
-    Pref.cdnMirrorRotation = (phase + fromRotation) % all.length;
-
     if (candidates.isEmpty) {
       debugPrint('CDN 自动切换: 没有可测的候选镜像');
       return null;
@@ -1256,7 +1251,9 @@ mixin CdnSwitchMixin on GetxController {
           maxMicros: quick ? CdnSpeedTest.quickMicros : CdnSpeedTest.autoMicros,
           connectTimeout: CdnSpeedTest.probeConnect,
           receiveTimeout: CdnSpeedTest.probeReceive,
-          isCancelled: () => isClosed,
+          // 挂载态而不是 isClosed：被顶掉的那一页（detach 但没换代）也该立刻停采样。
+          // 真机是流式 socket，第一块到达就 stop()，省下这一轮 ~6MiB 的移动流量。
+          isCancelled: () => !_roundLive(generation),
         );
       } on DioException catch (e) {
         // 偏移越界只对**基线**意味着整轮作废 —— 基线那份对象的长度是所有镜像的
@@ -1315,6 +1312,14 @@ mixin CdnSwitchMixin on GetxController {
     // 的候选（见 [_cdnChampion]）。
     if (_roundVoided(generation)) return null;
 
+    // 轮换相位只能推进到这里为止。推进量必须跟随**实际从轮换取走的个数**，不能
+    // 写死 `limit`：冠军占了位子时每轮只从轮换取 1 个，相位若仍推进 2，下标就永远
+    // 落在偶数列 —— 奇数位的镜像再也不会被轮到，正是上面那段注释警告过的"跳着走"。
+    //
+    // 压在两道作废复查**之后**：探长和测速各要几秒，被作废的那一轮不该推进相位，
+    // 否则它白拿走的那几个候选位会顶掉下一轮的轮换次序。
+    Pref.cdnMirrorRotation = (phase + fromRotation) % all.length;
+
     // 无论测速成功与否，这一轮候选都进入冷却；[_kCdnRetryAfter] 之后可以重测。
     // 压在两道作废判断**之后**：给旧对象记的冷却，到了新对象手里只是凭白少几个
     // 候选（[_cdnTriedAt] 是刻意为换画质保留下来的）。
@@ -1363,13 +1368,15 @@ mixin CdnSwitchMixin on GetxController {
       }
     }
 
-    /// 样本能不能拿来比较。offset > 0 时服务器必须真的按 Range 回 206。
-    /// 门槛跟着档位走：快速档只有 3 秒预算，用整轮的门槛会把最该采到的样本丢掉。
+    /// 样本能不能拿来比较。判据在 [CdnSpeedTest.usableSample]：micros 必须为正
+    /// （否则 `bytes / micros` 是 Infinity，排序里直接赢下 best），字节门槛跟档位
+    /// 走（快速档只有 3 秒预算，用整轮的门槛会把最该采到的样本丢掉），offset > 0
+    /// 时服务器必须真的按 Range 回 206。
     final minBytes = quick
         ? CdnSpeedTest.quickMinBytes
         : CdnSpeedTest.autoMinBytes;
     bool usable(CdnSample? s) =>
-        s != null && s.bytes >= minBytes && (readOffset == 0 || s.ranged);
+        CdnSpeedTest.usableSample(s, minBytes: minBytes, readOffset: readOffset);
 
     // 记下这一轮的速度当作历史。放在这几道作废判断**之后**：连这一轮自己都判
     // "没法比较"的样本（416、未遵守 Range），也没有资格去当下一轮的冠军。

@@ -41,6 +41,17 @@ MACOS_MIN=${MACOS_MIN:-12.0}
   exit 1
 }
 
+# Scratch space for the stub objects and clang's own temp dirs, plus the link
+# logs.
+#
+# One directory, one trap: every stub object (one per slice) and the (very long)
+# link log live here, so a failure at any point -- including run_link's early
+# `return 1` -- leaves nothing behind. Before this, each site called mktemp -d on its own
+# and never cleaned up, so every run leaked a directory per slice, and a failed
+# link leaked its log on top (the `rm -f` sat after the failure return).
+TMPW=$(mktemp -d)
+trap 'rm -rf "$TMPW"' EXIT
+
 # ---------------------------------------------------------------- helpers ----
 
 # Xcode puts the swift compat libraries under the default toolchain, the
@@ -81,6 +92,12 @@ archives() { # $1 = slice dir, e.g. macos-arm64_x86_64
 # whole point is to drag in everything it references) and the rest.
 split_archives() { # $1 = slice dir
   MPV_ARCHIVE=""
+  # This one may legitimately end up empty -- a slim $XC holding only Libmpv --
+  # so every expansion site guards it. Under bash 3.2, which is what /bin/bash
+  # is on macOS, a bare "${OTHER_ARCHIVES[@]}" on an empty array trips `set -u`
+  # with "unbound variable" and aborts the run; bash 4.4 fixed that. The
+  # `${arr[@]+...}` guard works on both. Do NOT use "${arr[@]:-}" instead --
+  # bash 3.2 mishandles it and expands to a single empty argument.
   OTHER_ARCHIVES=()
   local a fws found
   while read -r a; do
@@ -113,14 +130,16 @@ split_archives() { # $1 = slice dir
 run_link() { # $1 = output, rest = args
   local out="$1"; shift
   local log
-  log=$(mktemp)
-  if ! clang "$@" >"$log" 2>&1; then
+  log="$TMPW/link-$(basename "$out").log"
+  # TMPDIR is pinned to our scratch dir for the same reason as in build_stubs:
+  # clang leaves a temp directory per -arch job (named after the input file)
+  # behind in $TMPDIR, empty, every single run.
+  if ! TMPDIR="$TMPW" clang "$@" >"$log" 2>&1; then
     echo "--- link FAILED, full log ---" >&2
     cat "$log" >&2
     return 1
   fi
   grep -viE 'alignment \(|may result in unaligned|ignoring duplicate' "$log" || true
-  rm -f "$log"
   [ -s "$out" ] || { echo "link produced no output at $out" >&2; return 1; }
 }
 
@@ -130,7 +149,11 @@ run_link() { # $1 = output, rest = args
 # object file built for 'macOS'".
 build_stubs() { # $1 = out.o, rest = target flags
   local out="$1"; shift
-  clang "$@" -c -o "$out" "$HERE/stubs.c"
+  # TMPDIR is pinned into our scratch dir: clang creates an empty temp directory
+  # per -arch job in $TMPDIR, named after the input basename, and never removes
+  # it -- so a default-TMPDIR run leaks two `stubs-*` dirs per slice on top of
+  # whatever this script leaks itself. Inside $TMPW the EXIT trap sweeps them up.
+  TMPDIR="$TMPW" clang "$@" -c -o "$out" "$HERE/stubs.c"
 }
 
 # The thing that actually matters. hwdec registration in ffmpeg is by hwaccel
@@ -166,13 +189,14 @@ link_macos() {
 
   echo "### macOS (${archs[*]}) ###"
   split_archives macos-arm64_x86_64
-  stubs=$(mktemp -d)/stubs.o
+  stubs="$TMPW/stubs-macos.o"
   build_stubs "$stubs" "${archflags[@]}" -mmacosx-version-min="$MACOS_MIN"
 
   run_link "$out" "${archflags[@]}" -mmacosx-version-min="$MACOS_MIN" \
     -dynamiclib -o "$out" \
     -force_load "$MPV_ARCHIVE" \
-    "${OTHER_ARCHIVES[@]}" "${OTHER_ARCHIVES[@]}" \
+    ${OTHER_ARCHIVES[@]+"${OTHER_ARCHIVES[@]}"} \
+    ${OTHER_ARCHIVES[@]+"${OTHER_ARCHIVES[@]}"} \
     "$stubs" \
     -exported_symbols_list "$HERE/mpv.exports" \
     -framework Cocoa -framework IOKit -framework QuartzCore -framework CoreMedia \
@@ -205,12 +229,13 @@ link_ios_slice() { # $1 = out, $2 = target triple, $3 = slice dir
 
   echo "### iOS $triple ($slice) ###"
   split_archives "$slice"
-  stubs=$(mktemp -d)/stubs.o
+  stubs="$TMPW/stubs-$slice.o"
   build_stubs "$stubs" -target "$triple" -isysroot "$sdk"
 
   run_link "$out" -target "$triple" -isysroot "$sdk" -dynamiclib -o "$out" \
     -force_load "$MPV_ARCHIVE" \
-    "${OTHER_ARCHIVES[@]}" "${OTHER_ARCHIVES[@]}" \
+    ${OTHER_ARCHIVES[@]+"${OTHER_ARCHIVES[@]}"} \
+    ${OTHER_ARCHIVES[@]+"${OTHER_ARCHIVES[@]}"} \
     "$stubs" \
     -exported_symbols_list "$HERE/mpv.exports" \
     -framework UIKit -framework Foundation -framework AVFoundation \

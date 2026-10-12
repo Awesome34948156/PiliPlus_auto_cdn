@@ -40,8 +40,10 @@ import 'package:hive_ce/hive.dart';
 /// `flutter_test` 会把全局那个换成"永远回 400"的假货（`_binding_io.dart:365`）
 /// —— 手写适配器根本不碰它，所以整轮测速能离线跑完。
 ///
-/// 注意：仓库的 .gitignore 里 `test*` 是整片忽略的，这个文件默认**不会**被 git
-/// 看到。要纳入版本管理得 `git add -f test/pages/cdn_switch_mixin_test.dart`。
+/// 注意：`.gitignore` 里有 `test*`，但 `test/` 本身已被 `!test/` 反忽略
+/// （`.gitignore:160-161`），所以这个文件能直接 `git add`，**不需要 `-f`**。仍被
+/// 忽略的只有 basename 以 `test` 开头的文件（`test/test_helpers.dart` 之类）——
+/// 新增辅助文件前用 `git check-ignore <路径>` 确认一下，别想当然。
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -277,6 +279,32 @@ void main() {
       cdn.samples,
       isEmpty,
       reason: '这一轮已经作废了，不该再花流量去测速：${cdn.samples}',
+    );
+  });
+
+  test('作废的那一轮不许推进轮换相位', () async {
+    // 轮换游标的提交点在 `_pickFastestCdn` 里**第一个 await 之前**，而作废复查
+    // 在它之后 —— "用户在这几秒里换了画质/换集"这个时机，恰好让被作废的那一轮
+    // 白推进一次相位，下一轮就跳过几个镜像。上一条（「一个格子都不提交」）只看
+    // 采样，看不出游标已经动了：那条在修复前后都绿。
+    cdn.holdProbe = Completer<void>();
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => cdn.probes.isNotEmpty);
+
+    // 正面前提：探长请求只在候选非空**之后**才发出（`candidates.isEmpty` 在它
+    // 前面就 return 了），所以这一轮确实取过候选、游标本该有非零推进量。少了它，
+    // 下面那句 0 就可能是"压根没走到轮换"的假绿。
+    expect(cdn.probes.length, 1);
+
+    hostA.resetCdnForNewObject();
+    cdn.holdProbe!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(
+      Pref.cdnMirrorRotation,
+      0,
+      reason: '被作废的那一轮推进了轮换相位：游标提交落在了作废复查之外',
     );
   });
 

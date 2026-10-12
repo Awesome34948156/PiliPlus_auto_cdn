@@ -42,6 +42,11 @@ void main() {
     // candidates, all in one concurrent batch. If this were any larger the
     // round would need a second batch, and the buffer it is trying to rescue
     // would drain while the first one ran.
+    //
+    // The literal is the point: asserting `autoCandidatesMax == autoConcurrency
+    // - 1` alone pins only the *relation*, so bumping `autoConcurrency` from 3
+    // to 4 would keep the test green while silently changing the batch width.
+    expect(CdnSpeedTest.autoCandidatesMax, 2);
     expect(CdnSpeedTest.autoCandidatesMax, CdnSpeedTest.autoConcurrency - 1);
   });
 
@@ -49,6 +54,8 @@ void main() {
     test('is cheaper than a full round on both axes', () {
       // The quick probe fires while the player is already starving, so every
       // byte it spends is contention against the refill it is trying to rescue.
+      expect(CdnSpeedTest.quickBytes, 512 * 1024);
+      expect(CdnSpeedTest.quickMicros, 3 * 1000 * 1000);
       expect(CdnSpeedTest.quickBytes, lessThan(CdnSpeedTest.autoBytes));
       expect(CdnSpeedTest.quickMicros, lessThan(CdnSpeedTest.autoMicros));
     });
@@ -56,6 +63,8 @@ void main() {
     test('its usability floor fits inside its own window', () {
       // If the floor exceeded what the window can deliver, every sample would be
       // discarded on exactly the slow links this trigger exists for.
+      expect(CdnSpeedTest.quickMinBytes, 128 * 1024);
+      expect(CdnSpeedTest.autoMinBytes, 256 * 1024);
       expect(CdnSpeedTest.quickMinBytes, lessThanOrEqualTo(CdnSpeedTest.quickBytes));
       expect(CdnSpeedTest.quickMinBytes, lessThan(CdnSpeedTest.autoMinBytes));
     });
@@ -64,7 +73,58 @@ void main() {
       // 128 KiB in 3 s implies a floor of ~43 KB/s, well under the ~244 KB/s a
       // 1080p stream needs — so a mirror that clears the floor can be meaningfully
       // ranked, which is the only thing the ratio rule asks of it.
+      expect(CdnSpeedTest.quickMinBytes, 128 * 1024);
       expect(CdnSpeedTest.quickMinBytes, greaterThan(0));
+    });
+  });
+
+  group('usableSample', () {
+    const minBytes = 256 * 1024;
+    const readOffset = 4096;
+
+    bool usable(({int bytes, int micros, bool ranged})? s) =>
+        CdnSpeedTest.usableSample(s, minBytes: minBytes, readOffset: readOffset);
+
+    test('a zero-cost sample is unusable: bytes / 0 takes the ranking outright', () {
+      // `_pickFastestCdn` ranks by `-bytes / micros`, so a sample reporting no
+      // elapsed time is +Infinity, sorts first, and wins `best` — the switch
+      // lands on a mirror that was never actually measured.
+      expect(usable((bytes: 2 * 1024 * 1024, micros: 0, ranged: true)), isFalse);
+    });
+
+    test('a backwards clock step (negative micros) is unusable too', () {
+      expect(usable((bytes: 2 * 1024 * 1024, micros: -1500, ranged: true)), isFalse);
+    });
+
+    test('a normal sample is usable — the control against "nothing is usable"', () {
+      expect(usable((bytes: 2 * 1024 * 1024, micros: 100 * 1000, ranged: true)), isTrue);
+    });
+
+    test('below the byte floor is unusable', () {
+      expect(usable((bytes: minBytes - 1, micros: 100 * 1000, ranged: true)), isFalse);
+      expect(usable((bytes: minBytes, micros: 100 * 1000, ranged: true)), isTrue);
+    });
+
+    test('an unhonoured Range at a non-zero offset is unusable', () {
+      // A mirror that answers from the head still looks fast there — the sample
+      // only proves the head streams.
+      expect(usable((bytes: 2 * 1024 * 1024, micros: 100 * 1000, ranged: false)), isFalse);
+    });
+
+    test('the same unhonoured Range is fine at offset 0', () {
+      // Offset 0 has no Range to honour, so `ranged` carries no information.
+      expect(
+        CdnSpeedTest.usableSample(
+          (bytes: 2 * 1024 * 1024, micros: 100 * 1000, ranged: false),
+          minBytes: minBytes,
+          readOffset: 0,
+        ),
+        isTrue,
+      );
+    });
+
+    test('no sample at all is unusable', () {
+      expect(usable(null), isFalse);
     });
   });
 

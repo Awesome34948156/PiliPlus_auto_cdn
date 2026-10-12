@@ -3,12 +3,11 @@ import 'package:PiliPlus/http/constants.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:dio/dio.dart';
 
-/// One transfer sample: bytes received, wall-clock microseconds, the object's
-/// total size when the server disclosed it, and whether the server actually
-/// answered from the requested offset. [ranged] matters because an edge that
-/// ignores `Range` would otherwise be sampled in the object's head, where a
-/// mirror that is broken deeper in still looks fast.
-typedef CdnSample = ({int bytes, int micros, int? size, bool ranged});
+/// One transfer sample: bytes received, wall-clock microseconds, and whether the
+/// server actually answered from the requested offset. [ranged] matters because
+/// an edge that ignores `Range` would otherwise be sampled in the object's head,
+/// where a mirror that is broken deeper in still looks fast.
+typedef CdnSample = ({int bytes, int micros, bool ranged});
 
 /// Shared transfer measurement, used by both the manual CDN speed-test dialog
 /// and the stall-triggered auto-switch.
@@ -116,6 +115,28 @@ abstract final class CdnSpeedTest {
     final delta = now.difference(recorded);
     return delta.isNegative || delta >= window;
   }
+
+  /// Can this sample be compared against the others?
+  ///
+  /// **[micros] must be checked before any rate is computed.** A zero or
+  /// negative elapsed time (a coarse clock, a step from NTP) makes `bytes /
+  /// micros` either `+Infinity` or negative, and callers rank samples by
+  /// `-bytes / micros` — so the phantom sorts first and wins the round outright,
+  /// landing the switch on a mirror that was never actually measured.
+  ///
+  /// [minBytes] and [readOffset] are the caller's policy, not ours: the byte
+  /// floor follows the budget (a 3 s quick probe cannot reach the full-round
+  /// floor), and a ranged read must be honoured or the sample only proves the
+  /// object's head is fast.
+  static bool usableSample(
+    CdnSample? s, {
+    required int minBytes,
+    required int readOffset,
+  }) =>
+      s != null &&
+      s.micros > 0 &&
+      s.bytes >= minBytes &&
+      (readOffset == 0 || s.ranged);
 
   /// Lower bound of the sample offset, as a fraction of the object. The head is
   /// the "face-saving zone" — a mirror that is dead deeper in still streams the
@@ -278,10 +299,6 @@ abstract final class CdnSpeedTest {
     // Response. Do not use ResponseBody.contentLength — it parses the raw
     // header with int.parse and throws on anything malformed.
     final contentRange = response.headers.value('content-range');
-    var size = parseContentRangeSize(contentRange);
-    if (size == null && response.statusCode == 200) {
-      size = int.tryParse(response.headers.value('content-length') ?? '');
-    }
     final ranged = offset == 0 || response.statusCode == 206 ||
         contentRange != null;
 
@@ -310,7 +327,6 @@ abstract final class CdnSpeedTest {
     return (
       bytes: received,
       micros: DateTime.now().microsecondsSinceEpoch - start,
-      size: size,
       ranged: ranged,
     );
   }
@@ -342,6 +358,10 @@ abstract final class CdnSpeedTest {
               : null);
       // Cancel before subscribing: that closes the response and kills the
       // source subscription, so no data can be delivered to a closed sink.
+      // This cancel — not the drain below — is what bounds the read: measured
+      // against a paced source, only the first chunk is ever pulled. Do not
+      // move it after the drain, or a 200 that ignored the Range gets pulled
+      // end to end.
       if (!token.isCancelled) token.cancel();
       final body = response.data;
       if (body != null) {

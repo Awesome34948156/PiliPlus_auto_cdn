@@ -1,15 +1,21 @@
 diff --git a/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart b/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart
-index 2991edbb379..64658020df9 100644
+index 2991edbb379..27b6e47d178 100644
 --- a/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart
 +++ b/packages/flutter/lib/src/widgets/scroll_position_with_single_context.dart
-@@ -127,8 +127,12 @@ class ScrollPositionWithSingleContext extends ScrollPosition implements ScrollAc
+@@ -127,8 +127,18 @@ class ScrollPositionWithSingleContext extends ScrollPosition implements ScrollAc
  
    @override
    void applyUserOffset(double delta) {
 -    updateUserScrollDirection(delta > 0.0 ? ScrollDirection.forward : ScrollDirection.reverse);
 -    setPixels(pixels - physics.applyPhysicsToUserOffset(this, delta));
 +    final newPixels = pixels - physics.applyPhysicsToUserOffset(this, delta);
-+    if (_userScrollDirection == ScrollDirection.idle || (newPixels != setPixels(newPixels) && newPixels >= 0)) {
++    // Move first, then decide about the direction. `setPixels` must not sit
++    // inside the condition: `||` short-circuits on the idle check, so at the
++    // start of a drag -- exactly when the direction is still idle -- the call
++    // never happened and the gesture's first offset was swallowed.
++    final updated = setPixels(newPixels);
++    if (_userScrollDirection == ScrollDirection.idle ||
++        (newPixels != updated && newPixels >= 0)) {
 +      updateUserScrollDirection(
 +        delta > 0.0 ? ScrollDirection.forward : ScrollDirection.reverse,
 +      );

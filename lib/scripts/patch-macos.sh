@@ -39,6 +39,14 @@
 # forward (the 3.47.6 -> 3.47.7 commit), which cannot revert a hand-edit the way
 # a fresh apply-point can.
 #
+# FOLLOW-UP 2026-10-12 -- the regenerated patch above still called `setPixels`
+# *inside* the condition, and `||` short-circuits: `idle || (... setPixels ...)`
+# skips the call whenever the direction is idle, which is exactly the state at
+# the start of a drag -- so a gesture's first offset moved nothing. Fixed by
+# hoisting the call out of the condition (`final updated = setPixels(newPixels);`).
+# Same behaviour as the original operand order, but it no longer depends on which
+# side of `||` the call sits, which is the fragility that caused this drift.
+#
 # !! --material is destructive, and reads the same in patch.ps1: its material flow
 # is `rm -rf material_ui-* && flutter pub get && git apply`, because the patches
 # only apply to a *pristine* package. That deletes the patched copy in the pub
