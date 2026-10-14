@@ -215,11 +215,15 @@ dependency_overrides:
       url: https://github.com/My-Responsitories/media-kit.git
       path: media_kit_native_event_loop
       ref: native
+  # 探针取证版（2026-10-15 真机跑用）：撤掉 `e88d8416` 的钉尺寸强制渲染（app 侧删掉钉子档后
+  # 那条路径已不可达），换成只出声的 `VideoOutput.Probe` —— 要回答"死锁时 `_updateCallback()`
+  # 到底有没有被叫过"（`n == 0` 即"回调压根没跑"）。
+  # 回滚用旧值：e88d8416fa947efeae0f0ae29b6cf2300bafe8ab（再上一版：2c8dfa71）
   media_kit_video:
     git:
       url: https://github.com/Awesome34948156/media-kit.git
       path: media_kit_video
-      ref: e88d8416fa947efeae0f0ae29b6cf2300bafe8ab
+      ref: 4c7f4f36eb6f0a6de30d2aed3112659f8e14abcd
 
 dev_dependencies:
   flutter_test:
