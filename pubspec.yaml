@@ -215,15 +215,17 @@ dependency_overrides:
       url: https://github.com/My-Responsitories/media-kit.git
       path: media_kit_native_event_loop
       ref: native
-  # 探针取证版（2026-10-15 真机跑用）：撤掉 `e88d8416` 的钉尺寸强制渲染（app 侧删掉钉子档后
-  # 那条路径已不可达），换成只出声的 `VideoOutput.Probe` —— 要回答"死锁时 `_updateCallback()`
-  # 到底有没有被叫过"（`n == 0` 即"回调压根没跑"）。
-  # 回滚用旧值：e88d8416fa947efeae0f0ae29b6cf2300bafe8ab（再上一版：2c8dfa71）
+  # 常驻探针版（2026-10-15，真机未验）：只出声、不改行为的 `VideoOutput.Probe`，随实例常驻 ——
+  # 要回答"死锁时 `_updateCallback()` 到底有没有被叫过"（`n == 0` 即"回调压根没跑"，
+  # `n > 0` 却仍 `configured:false` 即"回调跑了、输出没配上"，两种修法相反）。
+  # 上一版（`4c7f4f36`）只查实例头 7.5 秒，而一个实例能撑 3 分钟 / 59 次装载 ⇒ 后半程的黑屏
+  # 拿不到任何样本，故改成常驻：健康播放整局 0 条，出事给 start →(ongoing…)→ recover 时间轴。
+  # 回滚用旧值：4c7f4f36eb6f0a6de30d2aed3112659f8e14abcd（再上一版：e88d8416fa947efe、2c8dfa71）
   media_kit_video:
     git:
       url: https://github.com/Awesome34948156/media-kit.git
       path: media_kit_video
-      ref: 4c7f4f36eb6f0a6de30d2aed3112659f8e14abcd
+      ref: 7db339df4bbbea8ad72317b66a21df0d398a3639
 
 dev_dependencies:
   flutter_test:
