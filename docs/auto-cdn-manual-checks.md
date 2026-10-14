@@ -48,14 +48,14 @@
   **必须开**：关掉时 `_cdnAutoEligible` 为假，每条检查都会卡在资格门上。
 - **「详细播放日志」** → `SettingBoxKey.mpvVerboseLog` → `Pref.mpvVerboseLog`
   （`lib/utils/storage_pref.dart:517`）。它把 mpv 的 `logLevel` 抬到 `.v`，但
-  **只在控制台出口开着时生效**：`lib/plugin/pl_player/controller.dart:1108`
+  **只在控制台出口开着时生效**：`lib/plugin/pl_player/controller.dart:1207`
   `logLevel: consoleLogActive && Pref.mpvVerboseLog ? .v : (kDebugMode ? .warn : .error)`。
 - **「CDN 切换提示」** → `SettingBoxKey.showCdnSwitchToast`（默认开）。可选，
   给同一批事件做旁证。
 
 **控制台日志开关不是一个用户设置**，别去找：捕获钩子在启动时无条件装上
-（`installConsoleLogCapture()`，`lib/main.dart:99`），开关是 getter
-`consoleLogActive`（`lib/services/console_log.dart:84`，`=> _sink != null`）——
+（`installConsoleLogCapture()`，`lib/main.dart:100`），开关是 getter
+`consoleLogActive`（`lib/services/console_log.dart:101`，`=> _sink != null`）——
 正常手机包上文件能开就是 true，所以只开「详细播放日志」就够了。
 
 日志文件：应用文档目录下的 **`pili-console.log`**（`_kConsoleLogName`，
@@ -242,7 +242,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 步骤 (a)：风暴中途换集（或换画质），新一集得从头攒。
 步骤 (b)：同一集里，让一场风暴横跨一次自动换源（重载会排空旧流的报错）。
 通过 (a)：换集后**不立刻**出现看门狗行 —— 必须重新攒满 12 条/6s；旧流的账不带过去
-（页面 `onReset`（`controller.dart:1299`）调 `resetCdnAutoSwitch()`（`:1309`），它再到
+（页面 `onReset`（`controller.dart:1315`）调 `resetCdnAutoSwitch()`（`:1325`），它再到
 混入层 `:608` 把播放器的解码账清掉（`plPlayerController.resetDecodeErrorAccounting()`）；
 换画质走 `resetCdnForNewObject()`，那条直接清在 `cdn_switch_mixin.dart:634`）。
 通过 (b)：换源期间旧流的报错**继续计数** —— 换源前会触发的那场风暴，换源后照样触发
@@ -286,9 +286,9 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 > （`if (_cdnIsAttached) return;`，`cdn_switch_mixin.dart:855`），预检能重开
 > **只可能**是因为重挂那一刻 `_cdnIsAttached` 为假 —— 也就是说 B 在播的那段时间里，
 > A 确实已经不挂在播放器上了。重挂的因果也是闭合的：`restartCdnProbe()` 只有两个
-> 调用点（`controller.dart:1311` 的 `onReset`，只有换 P/换集走得到；
+> 调用点（`controller.dart:1327` 的 `onReset`，只有换 P/换集走得到；
 > `cdn_switch_mixin.dart:884` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
-> 而它在返回路径上的调用点只有 `view.dart:432`（`didPopNext`）。时间也对：
+> 而它在返回路径上的调用点只有 `view.dart:495`（`didPopNext`）。时间也对：
 > 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `_kCdnPreflightPoll`
 > 的 2 s 加上等缓冲那一拍。
 >
@@ -516,45 +516,52 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 前置：与条目 18 同一档 —— 任意一集在播、**AV1 硬解**（心跳行
 `CDN 看门狗: 余量 … hwdec videotoolbox …` 能看到它）。差别只在**播放状态**：
 **手动按暂停**，画面停在最后一帧、控制条是暂停态；确认心跳行里 `播放中 false`
-（那句取自 `controller.dart:1765` 的 `播放中 ${playerStatus.isPlaying}`，
-`_kHeartbeatSeconds = 10`（`controller.dart:355`），所以 10 秒内必有一拍能对上）。
+（那句取自 `controller.dart:2164` 的 `播放中 ${playerStatus.isPlaying}`，
+`_kHeartbeatSeconds = 10`（`controller.dart:424`），所以 10 秒内必有一拍能对上）。
 
 步骤：**保持暂停**退到后台 **≥5 分钟**（锁屏或切走都行），然后回到 app。
 
-病根与 18 是同一件事：iOS 挂起 app 时作废 `VTDecompressionSession`。但 18 那条判据
-修好的动作本身留了个缺口 —— 它重开 Media 时**不带播放意图**：
+病根与 18 是同一件事：iOS 挂起 app 时作废 `VTDecompressionSession`。18 那条判据修好的
+动作本身曾经留过个缺口 —— 它重开 Media 时**不带播放意图**，用户按的暂停会被丢掉：
 
-- `refreshPlayer()`（`controller.dart:1209`）在 `:1218` 是
+- **那个缺口 2026-10-12 已经修了**（`7eb5a64a2`，已在 main）。修之前 `:1353` 是
   `return ctr.open(media, play: true);` —— `play:` **写死 `true`**，函数签名
-  `Future<void>? refreshPlayer()` 里也没有任何"要不要接着播"的入参。
-  （对照 `:1207` 附近另一条重开路径，用的是 `play: false` —— 差别就在这。）
-- 触发它的 `_sampleDecoderSessionFailure`（`controller.dart:1693`）闸门在
-  `:1709-1718`，只挡 `isSeeking` / `_processing` / `onlyPlayAudio` / `isBuffering` /
-  `bufferedAhead <= 0` / `!_hasVideoTrack` —— **不读 `playerStatus`**，暂停态进得去。
-  命中 6 条 / 3 秒（`_kSessionFailBurst` `:324`、`_kSessionFailWindow` `:328`）后
-  `:1733` 打日志、`:1739` 调 `refreshPlayer()`（返回值忽略）。
-- 重开之后 mpv 一上报 playing，播放器就把 `playerStatus` 置成 `.playing`。用户按的
-  暂停**没有任何地方记着**（全仓没有 `userPause` 之类的标记），意图就此丢掉。
+  `Future<void>? refreshPlayer()` 里也没有"要不要接着播"的入参。现在签名是
+  `Future<void>? refreshPlayer({bool? play})`（`controller.dart:1344`），`:1353` 是
+  `return ctr.open(media, play: play ?? playerStatus.isPlaying);` —— 不传参时按
+  "当前是不是在播"决定，暂停态得以保留。（对照 `:1333` 附近另一条重开路径，用的是
+  `play: false`。）
+- 触发它的 `_sampleDecoderSessionFailure`（`controller.dart:2091`）闸门在
+  `:2107-2116`，只挡 `isSeeking` / `_processing` / `onlyPlayAudio` / `isBuffering` /
+  `bufferedAhead <= 0` / `!_hasVideoTrack` —— **不读 `playerStatus`**，暂停态照样进得来。
+  这是**有意**的：会话作废该修就修，只是修完得把播放意图还原回去。命中 6 条 / 3 秒
+  （`_kSessionFailBurst` `:377`、`_kSessionFailWindow` `:381`）后 `:2131` 打日志、
+  `:2137` 调 `refreshPlayer()`（返回值忽略）。
+- 缺口没修时为什么会丢：重开之后 mpv 一上报 playing，播放器就把 `playerStatus` 置成
+  `.playing`，而用户按的暂停**没有任何地方记着**（全仓没有 `userPause` 之类的标记）。
 
-对比 **条目 13**：那条是**换源路**，已经修好了 —— `cdn_switch_mixin.dart:1755`
+对比 **条目 13**：那条是**换源路**，同一口径 —— `cdn_switch_mixin.dart:1755`
 `final wasPlaying = plPlayerController.playerStatus.isPlaying;` → `:1760`
-`await playerInit(autoplay: wasPlaying);`。本条是**重建路**，还没按同一口径处理；
-修复方向就是让 `refreshPlayer()` 也读一次 `playerStatus.isPlaying` 再传给 `play:`。
+`await playerInit(autoplay: wasPlaying);`。两条路现在是一致的。
+
+⚠️ **本条现在验的是"修好了没有"，不是"缺口长什么样"** —— 代码已修，但**真机还没验过**
+（欠账记在 S1/N4），所以下面两边仍要照跑。
 
 通过：
 1. 那条重建行**照出**（说明暂停态没有被判据挡住，会话作废照样认得）：
    `CDN 看门狗: 硬解会话失效（3s 内 6 条），本机解码器被系统作废 —— 重建解码器`
-   （逐字，`controller.dart:1733-1736`；判定它的原始 mpv 行是
+   （逐字，`controller.dart:2131-2134`；判定它的原始 mpv 行是
    `av1: Failed to decode frame (invalid session, -12903)` 与
    `av1: vt decoder cb: output image buffer is null: -12909, reconfig 1`，
-   签名表见 `lib/utils/decode_error.dart:87` 的 `kDecoderSessionFailureSignatures`，
-   `:90` `'invalid session'`、`:93` `'output image buffer is null'`）。
+   签名表见 `lib/utils/decode_error.dart:94` 的 `kDecoderSessionFailureSignatures`，
+   `:97` `'invalid session'`、`:100` `'output image buffer is null'`）。
 2. 重建之后**播放仍是暂停** —— 心跳行里 `播放中 false` 不变、`位置 Ns` 停在暂停那一刻
    不往前走；画面回到暂停的那一帧，不自己动。
 
-失败（**这个缺口没堵上时，现状必然是这一边**）：回前台后画面**自己动起来**，心跳行从
-`播放中 false` 翻成 `播放中 true` —— 成因就是上面 `:1218` 那个写死的 `play: true`。
-注意 30s 冷却（`_kSessionFailCooldown`，`controller.dart:333`）只压"动手"的频率，
+失败（**说明 `play ?? playerStatus.isPlaying` 没兜住**）：回前台后画面**自己动起来**，
+心跳行从 `播放中 false` 翻成 `播放中 true` —— 那就要查 `refreshPlayer()` 的调用点上
+`playerStatus` 当时到底是什么（`:1353`）。
+注意 30s 冷却（`_kSessionFailCooldown`，`controller.dart:386`）只压"动手"的频率，
 不影响这一次的播放意图。
 
 ⚠️ 真机上要看清的**第一件事**是"签名到底响没响"：暂停时 mpv 不一定在解码，那两条会话
@@ -567,8 +574,8 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 一轮换源的 `now` 是在**轮次开头**取的（`lib/pages/video/cdn_switch_mixin.dart:1243`
 `final now = DateTime.now();`），而它要到探完对象大小（`:1318` 的
 `await CdnSpeedTest.probeSize`，预算 `probeMicros`/`probeConnect`/`probeReceive` 各 3s，
-`lib/utils/cdn_speed_test.dart:19-21`）和并发测速（`:1407-1414` 的 await，`autoMicros`
-6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:31`/`:41`）**之后**才被拿去记账 ——
+`lib/utils/cdn_speed_test.dart:18-20`）和并发测速（`:1407-1414` 的 await，`autoMicros`
+6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:30`/`:40`）**之后**才被拿去记账 ——
 也就是相对"读数真正落地的时刻"偏早约几秒（最多探大小 3s + 测速 6s）。受影响的是它喂的
 那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1295`，窗口 `_kCdnRetryAfter`
 `:251` / `_kCdnDeadRetryAfter` `:261`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
@@ -708,7 +715,7 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
 1. **「详细播放日志」必须开** —— 设置 → 视频设置（入口副标题「画质、音质、解码、缓冲、
    音频输出等」）→「详细播放日志」。判据里那些 mpv 行（`Setting option 'start'`、
    `Set property: pause=`、`playback restart complete`、`NativeVideoController:
-   Texture ID`）**只有它开着才写**（`pl_player/controller.dart:1108`，logLevel 抬到 `.v`）。
+   Texture ID`）**只有它开着才写**（`pl_player/controller.dart:1207`，logLevel 抬到 `.v`）。
 2. **「卡顿自动切换 CDN」保持默认开**（同一页）。它关掉时 `_cdnAutoEligible` 为假，
    换源那半边一条都不跑 —— 这一局的**判据不靠它**，但开着才能拿到 `CDN 自动切换: …` 的旁证。
 3. **接上 iCloud 日志同步**：设置 →「其它设置」（副标题「震动、搜索、收藏、ai、评论、
@@ -726,24 +733,32 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
 > —— 测速一读就断流（`Connection closed while receiving data` → `无样本`）→
 > **预检档起播后很快就救走**（`CDN 自动切换: 基线无有效速度，直接切换`；
 > log 8：`14:43:53.540` 预检 → `14:43:59.400` 已切到 hw，**~6 秒**；README 记的起播到恢复 14 秒）。
-> 那比 P3 快：P3 要看门狗**连中几探**才认死锁（`_kNoVideoProbe` 2s 一拍：强指纹成立时
-> `_kNoVideoProbesFast` 2 探 ≈4s，否则 `_kNoVideoProbes` 4 探 = 8s），之后还要自愈两次。
+> 那比 P3 快：P3 要看门狗**攒满一个时间窗**才认死锁（1s 一拍、每拍都看；强指纹成立时
+> `_kNoVideoWindow` 3s ≈4 拍，否则 `_kNoVideoWindowWeak` 8s），定罪后**直接**就地重建。
 > 钉着它，永远轮不到重建。
 
-**探测节奏两档（2026-10-15 起）**：一探 2s，连中几探才认死锁 —— **强指纹**成立时
-**2 探（`_kNoVideoProbesFast`，≈4s）**，指纹不成立时仍要 **4 探（`_kNoVideoProbes`，8s）**。
-「强指纹」= `video-codec` 非空 **且** `hwdec-current` 非空，再加一条「音频位置比上一探在推进」
-（`position.value` 变大）做双保险。值钱的是 `hwdec-current`：**由空串变非空只有「解码器真的
-开了」这一种可能**（2026-10-15 同局核过 `02:40:16 hwdec 0x0` → `02:40:27 hwdec videotoolbox`），
-所以这三条齐了、画面还空着，就只可能是渲染/输出没接上，不必再等满 8 秒。上报行末尾会多一个
-` [强指纹]` 后缀（**基串一字不改**）。
+**判据 = 时间窗（2026-10-15 起，取代「数探」）**：ticker **1s 一拍、每拍都看**；七道门
+（`onlyPlayAudio` / `isLive` / `position <= 0` / `isSeeking` / `_processing` /
+`_rebuildingRenderContext` / `isBuffering`）全不成立、且画面为空（`_hasVideoTrack` 假）这段
+状态**连续攒满一个窗**才定罪（`_checkNoVideoTrack`）。**窗口档位由强指纹选**：强指纹成立走
+`_kNoVideoWindow` = **3s（≈4 拍：开窗 1 拍 + 3 拍）**，不成立走 `_kNoVideoWindowWeak` = **8s**。
+**强指纹是档位开关，不是只贴个后缀**：它成立才走 3s 档，且上报行末尾带 ` [强指纹]`（**后缀 =
+「这次走的是 3s 档」的标记，两者等价**）。「强指纹」= `video-codec` 非空 **且** `hwdec-current`
+非空 **且** 位置比上一拍大；值钱的是 `hwdec-current`：**由空串变非空只有「解码器真的开了」
+这一种可能**（2026-10-15 同局核过 `02:40:16 hwdec 0x0` → `02:40:27 hwdec videotoolbox`）。
+⚠️ 位置冻住（`position` 不比上一拍大）会让强指纹不成立 ⇒ 自动走 8s 档、上报行**不带**后缀 ——
+**8s 档是留给「视频轨饿死」那种误报风险的，它的正解是换源、不是重建**。**定罪后直接**调
+`_rebuildRenderContextOnNoVideo()`（「钉住输出尺寸」那一档已整个删掉）。**上报行后缀**（**基串
+一字不改**）顺序固定：` [本媒体已重建 N 次]`（仅当 N>0）在前，` [强指纹]`（走 3s 档的标记）在后；
+旧的 ` [本次媒体已自愈过]` 已删。
 
 **怎么摆**：
 
 1. 随便挑一个 **≥10 分钟**的长视频（和 log 11/13/14 那几条同类即可），**从头开播**。
-2. **先让它正常播一段**（至少 20~30 秒，位置越过起播）再谈坏 —— 无视频轨探针有硬前置：
-   `position.value <= 0` 时每拍直接 `_noVideoProbes = 0` 返回（`controller.dart:1637`），
-   所以**「从头开播立刻坏」这种局面永远探不到 P3**。这就是"必须播到中途才让它坏"的原因。
+2. **先让它正常播一段**（至少 20~30 秒，位置越过起播）再谈坏 —— 无视频轨判据有硬前置：
+   `position.value <= 0` 是该函数里的一道门，位置还在 0 时该拍直接返回、不计入窗口
+   （`_checkNoVideoTrack`），所以**「从头开播立刻坏」这种局面永远攒不满窗、探不到 P3**。
+   这就是"必须播到中途才让它坏"的原因。
 3. **耐心等**。这一局**靠撞**，没有可靠的触发按钮：
    - log 14 那局第一次 `无视频轨` 出现在**起播后 58 秒**（`20:27:37.940` 起播 →
      `20:28:35.986` 第一条无视频轨），随后 `20:29:57` / `20:31:49` 又各来一次 ——
@@ -815,30 +830,54 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
 
 ```
 无视频轨: 音频正常但画面始终为空 (audio … video … hwdec … 位置 Ns)
-无视频轨自愈 1/2: 钉住输出尺寸 1920x1080 (位置 Ns)
-无视频轨自愈 2/2: 钉住输出尺寸 1920x1080 (位置 Ns)
-无视频轨自愈失败: 钉住尺寸没能让视频输出起来，交给就地重建
 就地重建: 开始（第 1/2 次）
 ```
 
 （逐字见 log 11 的 `17:30:37.378` → `17:30:39.784`；log 14 的 `20:28:35.986` →
 `20:28:38.391`。`位置 Ns` 里的 N 必须 **> 0**。）
 
+⚠️ 上面那三行 `无视频轨自愈 1/2` / `2/2` / `无视频轨自愈失败` **2026-10-15 起不再出现**
+（「钉住输出尺寸」这一档已删，定罪后直接重建）；**早于该日期的归档日志（log 11 / 13 / 14 等）里
+仍有**。
+
 补三条（2026-10-15）：
 
-- **上报行可能带 ` [强指纹]` 后缀**：第一条 `无视频轨: 音频正常但画面始终为空 …` 末尾现在
-  是可选的 ` [强指纹]`（强指纹成立时的快路，见 C 节）。**基串一字不改**，
-  `docs/logs/verify-rebuild.sh` 按子串 `/无视频轨: 音频正常但画面始终为空/` 匹配它，
-  后缀加在后面不破坏匹配。档号仍是 `无视频轨自愈 1/2` / `2/2` / `自愈失败`，序列不变。
+- **上报行末尾的后缀（2026-10-15 起）**：第一条 `无视频轨: 音频正常但画面始终为空 …` 末尾
+  可能带两个可选后缀，**顺序固定** —— **` [本媒体已重建 N 次]` 在前**（**仅当 N>0**，即这个
+  媒体上已经烧过重建额度时才出现，用来区分"这是第一次"还是"重建过还是没起来"），**` [强指纹]`
+  在后**（**= 这次走的是 3s 档，等价于"强指纹成立"**，见 C 节）。旧的 ` [本次媒体已自愈过]`
+  后缀**已删除**。**基串一字不改**，`docs/logs/verify-rebuild.sh` 只用子串
+  `/无视频轨: 音频正常但画面始终为空/` 与 `位置 [0-9]+s` 匹配它，后缀加在后面不破坏匹配。
+  原「无视频轨自愈 1/2 / 2/2 / 自愈失败」那三档**已删**，**重建立刻跟在 `无视频轨` 之后**（中间无档）。
 - **判据订正 —— 这几条 mpv 行在健康装载里也照样出现，不能当画面正常的证据**：
   `mpv_render_context_render() not being called or stuck.`、
   `first video frame after restart shown`、`playback restart complete … video=playing`。
   **唯一**能判画面健康的是 `VO: [libmpv] …` **紧跟**约 200ms 后一条
   `libmpv_render: Window size: …` 这一对 —— 健康装载必有这一对，坏的那次两条都没有
   （2026-10-15 开 mpv verbose 复现时钉死）。
-- **钉尺寸这一档历史上成功过**：log 6 第 1 次（`23:51:07`）、log 13 第 2 次（`17:43:32`）
-  画面确实回来了（`无视频轨自愈成功: 钉住输出尺寸（第 1/2 次）`）。所以这一档不删 ——
-  它只是成功率低，且对「mpv 压根没回调」这一种无效。
+- **「钉住输出尺寸」这一档已删（2026-10-15）**：归档 10 局共 **20 次**钉尺寸里只真救回 **1 次**
+  （**≈5%**）；且第 2 次钉在 Dart 层因「尺寸没变」直接 `return`，**什么都没发出去、白等 1.2s**。
+  现在定罪后**直接**就地重建；原生那发强制渲染改到 fork 的探针那边（不再走这一档）。
+- **fork 探针取证（2026-10-15 起）：`VideoOutput.Probe`**。`pubspec.yaml` 的
+  `media_kit_video` 指向 fork 的 `4c7f4f36`（撤掉 `e88d8416` 的钉尺寸强制渲染，换成只出声的
+  探针）。**Dart 侧不用改** —— fork 的
+  `media_kit_video/lib/src/video_controller/native_video_controller/real.dart:161` 在 switch
+  **之前**就 `debugPrint(call.method)` + 参数表，所以日志里会看到**成对的两行**：
+  `VideoOutput.Probe` 和紧跟其后的参数表。**每个 VideoOutput 实例最多 7 条**。
+  - 参数：`src`（`cb` / `watchdog` / `poke`）、`n`＝ `_updateCallback()` 被调用的次数、
+    `rendered`＝ `texture.render(...)` 真正发出的次数、`configured`＝ mpv 是否已配视频输出
+    （读 `video-out-params` 的 dw/dh，**不是** `videoSize`）、`elapsedMs`、`size`、`handle`。
+  - **要回答的三个问题**：
+    1. **死锁局里 `src:"watchdog"` 那条的 `n` 是 0 还是 >0**。`n == 0` 就是「回调**压根没跑**」
+       的铁证（⇒ 原生侧可以自己补一帧撬开）；`n > 0` 却仍 `configured:false` ⇒ 回调跑过但
+       画不出来，得从别处下手。**这两种情况修法相反**，这就是探针存在的唯一理由。
+    2. **`poke` 那一发 `configured` 有没有翻 true** —— 就是「原生侧一次性补渲染到底能不能救」
+       的答案（只在**第一次** watchdog 报告且 `n==0` 时才发，300ms 后出结果行）。
+    3. **`size`** —— 黑屏时它应是 `[0.0,0.0]`（还没渲染过）或 1×1 / 上次兜底值。
+  - 健康装载**通常一条探针都不发**（`cb` 探只在"回调进来时还没配上"才发，看门狗一见配上就停），
+    偶尔可能有一两条 `cb`（回调刚到、属性还没落定的那一拍）—— **都不算异常**。
+    所以"整局一条 `VideoOutput.Probe` 都没有"是正常的，**别当成探针没插上**。
+  - ⚠️ `poke` 之后**可能紧跟一条 `src:"cb"`**（那一发渲染把 `n` 从 0 抬到 1）—— 正常，别觉得奇怪。
 
 **1. 重建确实换了渲染上下文**：紧随 `就地重建: 开始` 之后应出现一条**新的**
 `NativeVideoController: Texture ID: <id>`，且 `id` 比上一条**递增**
@@ -886,7 +925,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
 
 ### G. 明确**不算通过**的情况
 
-- **第 2/2 次重建丢点 → 不算失败**。同一次自愈里的第二次重建，读到的 `position.value` 已被
+- **第 2/2 次重建丢点 → 不算失败**。同一轮重建里的第二次重建，读到的 `position.value` 已被
   第一轮新装载开头那个 0 事件推翻，`resumeAt` 就是 0、按"没捕获到"回落 —— 这是**已知救不了的
   一次**（`lib/utils/resume_seek.dart:54-58`）。log 13 的 `17:43` 第 2/2 次**反而带上了**
   `286.000`，所以不是必然丢，别拿它判成败。
@@ -898,11 +937,12 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   - `跳过（没有页面认领重载）` / `跳过（有 N 个共用者没登记身份…）`（log 10 的
     `17:19:36` 那一串就是旧口径的 `跳过（播放器单例被 2 个页面共用）`）：说明这一局
     **多页/直播间并存**（要单页才验得干净），或者认领没发生 —— **换一局重摆**。
-  - `跳过（本媒体已重建 2 次）`：**额度用尽**后的尾部门**每一探都打一行**（探满门槛之后
-    `_noVideoProbes` 就不再拦住它了；门槛本身 2026-10-15 起是两档 —— 强指纹 2 探 / 否则
-    4 探，见 C 节），实测 **~2.9s/行**（log 17：`21:29:23`→`21:30:20`
-    共 20 行 / 57.1s），**会一直打到换媒体、不停** —— 正常上限行为，不是失败。
-    ⚠️ 别按"~8s 一行"去数行数（2026-10-12 订正过一处记账错误）。
+  - `跳过（本媒体已重建 2 次）`：**额度用尽**后的尾部门**每攒满一个窗口就再打一行**
+    （3s 窗 + 1s 一拍 ⇒ **≈3s 一行**；门槛见 C 节），**会一直打到换媒体、不停** ——
+    正常上限行为，不是失败。
+    ⚠️ 别按"~8s 一行"去数行数（2026-10-12 订正过一处记账错误）；log 17 记的 **~2.9s/行**
+    （`21:29:23`→`21:30:20` 共 20 行 / 57.1s）是**旧判据**下的读数、**别拿去对新包** ——
+    这两个旧读数（~8s、~2.9s）**一并作废**。
 - **"没坏" ≠ "没修好"**：整局一次 `无视频轨` 都没出现，说明这场戏没唱起来，
   **这局作废重摆**，不是判它不过。
 
@@ -969,7 +1009,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
    - **量法**：拿 `docs/logs/` 下带时间戳的档案，按 `decode_error.dart` 的签名表
      （`kDecoderCorruptionSignatures`）grep 出相关行，按 **6 秒滑动窗**取峰值，并复算 5ms
      去重（`_kDecodeLineDedupe`）。注意 `HW` 是大写、`Error while decoding frame` /
-     `HW accel end frame fail.` **不在**这份签名表里（刻意排除，见 `decode_error.dart:80-86`），
+     `HW accel end frame fail.` **不在**这份签名表里（刻意排除，见 `decode_error.dart:86-92`），
      `invalid session` / `output image buffer is null` 走的是**另一条**通道（会话失效）。
    - 逐份读数（`docs/logs/`，2026-10-12 实测）：
 
@@ -999,6 +1039,37 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
      那段，都换成"524 行 / 44 毫秒（log 4）、58 行横跨 2.4 秒、去重后 17 条（log 7）"这套实测
      数，并写明**不是固定的 3:1 去重比**；原来那句「横跨 100 多秒」**是错的** —— 那 100 多秒是
      **画面冻着的时长**，不是报错的跨度（log 4 的 524 行全在 44 毫秒里）。
+
+6. **`PlPlayerController._kNoVideoWindow` = 3s**（`lib/plugin/pl_player/controller.dart`）——
+   **强指纹成立**时「有声音黑屏」的定罪窗口（1s 一拍，≈4 拍）。
+   - ⚠️ **1s 粒度下窗口值在 (2s,3s] 区间内行为相同**（都攒成 4 拍）—— 调这个值别在这区间里找差。
+   - 太小：起播慢的大文件、或**视频轨饿死**（视频轨那条 URL 读到一半断）会被误判成渲染死锁 →
+     白重建。
+   - 太大：白对黑屏、晚动手。
+
+7. **`PlPlayerController._kNoVideoWindowWeak` = 8s**（`lib/plugin/pl_player/controller.dart`）——
+   **强指纹不成立**（含「位置冻住」）时的定罪窗口；比 3s 档长，是为了放过另一族病：**视频轨
+   饿死**（同上）—— 那一族的**正解是换源、不是重建**，所以宁可多等。
+   - 太小：饿死族被误判成渲染死锁 → 白重建。
+   - 太大：真渲染死锁也要多等 5 秒才救。
+
+8. **`force-window`（iOS 预防实验 —— ⛔ 2026-10-15 议过，本轮没上）**
+   （`lib/plugin/pl_player/controller.dart` 的 `_initPlayer`）—— 想法是 iOS 上加
+   `player.setProperty('force-window', 'yes')`（Android 那边本来就是 `force-window=no`，
+   注释写着"避免用 mpv 的 idle window 撑 surface"），期望让 mpv **装载时就建好视频输出**，
+   从根上不让这个竞态发生。**这是唯一可能做到「零额外黑屏」的路**，但它有一个比病更坏的
+   失败形态，所以**代码里故意没写这一行**（原处留了墓碑注释说明）：
+   - ⚠️ **会致盲判据**：`force-window` 一起，mpv 会拿**空窗口**去给纹理定尺寸
+     （Android 那句注释正是这个机制的证词），于是 `_hasVideoTrack`（读 `video-out-params`
+     的 w/dw）翻真 —— 画面照样是黑的，判据却不再定罪 ⇒ **就地重建这条唯一的救援路也不触发**
+     ⇒ 永久黑屏，只能杀进程。现在这个病是 11s **能自愈**的，换成救不回来的不划算。
+   - ⚠️ **会搅浑取证**：这一版同车上 fork 的 `VideoOutput.Probe`（要回答"死锁时
+     `_updateCallback()` 到底有没有被叫过"）。若 `force-window` 真把竞态压住了，这一局就
+     不复现死锁，探针存在的唯一理由也随之落空。
+   - **顺序**：先拿探针的证据，再单独出包试它。真试的时候，判读方法是：开 mpv verbose 取日志，
+     看那对 `VO: [libmpv] …` → 约 200ms 后 `libmpv_render: Window size: …` 是否**装载时
+     就出现**（健康装载必有一对，坏的那次两条都没有）；再**连跑 ~20 次装载**看是否一次都不缺。
+     **同时必须盯 `_hasVideoTrack` 会不会翻真** —— "翻真了但画面还是黑的"就是踩中了致盲那一条。
 
 ## 复查追加的四处（2026-10-11，对抗性复查 diff 之后修的）
 
@@ -1064,18 +1135,18 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
 
 - **换源重载本身拦不住（MEDIUM，既有；本轮确认在混入层无解）**：尾段那句 `_roundLive`
   只能掐掉重载**之后**的动作（补 seek、恢复判定、假"成功"），**掐不掉重载**。
-  因为页面侧的 `playerInit`（`lib/pages/video/controller.dart:743`）干的事就是
+  因为页面侧的 `playerInit`（`lib/pages/video/controller.dart:747`）干的事就是
   `await plPlayerController.setDataSource(NetworkSource(videoSource: videoUrl!, ...))`
-  （`:750`），而 `videoUrl` 是 `_switchTo` 在调用**前**几行写进去的（`cdn_switch_mixin.dart:1733`）
+  （`:766`），而 `videoUrl` 是 `_switchTo` 在调用**前**几行写进去的（`cdn_switch_mixin.dart:1733`）
   —— 也就是**重载发生在 `playerInit` 内部**。`setDataSource`
-  （`lib/plugin/pl_player/controller.dart:940`）里没有任何"你是不是现役页"的检查。
+  （`lib/plugin/pl_player/controller.dart:1031`）里没有任何"你是不是现役页"的检查。
   要紧的是：从 `:1091` 那道闸门一路走到 `_switchTo` 里那句 `await playerInit`（`:1760`），
   **中间一个 `await` 都没有** —— 新地址 `videoUrl = newVideo;`（`:1733`）也是在这段同步
   代码里写下去的。所以旧页决定重载的那一刻**它确实还是现役页** —— 用户还没来得及跳走。
   这不算"漏了一处"，是**站在那个点上无从拦起**。
   后果：重载在飞的时候跳相关视频，它仍可能落地（`setDataSource` 里 `await pause()` 之后的
   `_createVideoController` 一样可能在 `playerInit` 返回前跑完），把播放器换成**旧视频**的地址，
-  并按 `:1011` 重置共享的 `position`/`buffered`。
+  并按 `:1102` 重置共享的 `position`/`buffered`。
   与 `:1185` 那条**不是一回事**：兜底 `refreshPlayer()` 经两个独立分析确认够不着
   （`!switched` 成立 ⟹ 循环每次都从 `:1092`/`:1103`/`:1107`/`:1114` 那几处 `break` 出去，
   而那几处都在 `:1091` 那道闸门之后的**同一段同步代码**里 —— 中间没有 `await`，所以执行到
@@ -1085,7 +1156,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   **真机观察项**：跳相关视频后偶发"画面跳回上一个视频 / 缓冲被清空"即命中 —— 这条只能真机看。
 - **补落点的那一发 seek 会悬在重载里，醒来时落到新页的片上（MEDIUM，本轮已修 —— 但只是收窄）**：
   `_restoreResumePosition` 补 seek 时调的是 `player.seekTo(target)`，走 `seekTo` 的默认档
-  `isSeek = true`；而 `lib/plugin/pl_player/controller.dart:2004-2007` 里
+  `isSeek = true`；而 `lib/plugin/pl_player/controller.dart:2442-2444` 里
   `seek()` 第一件事是 `await _videoPlayerController?.stream.buffer.first`。
   换源重载期间那条流要几秒才吐第一个 buffer（新文件还没 demux 出来），于是这一发 seek
   **整段悬在那里**；悬着的这几秒里用户跳相关视频，它醒来时 `_videoPlayerController` 已经
@@ -1098,28 +1169,28 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   **修法**：`await player.seekTo(target, isSeek: false)`（`cdn_switch_mixin.dart:1800` 一带）。
   `isSeek: false` 跳过那道等待，seek 在 `_roundLive` 复查之后**当场**发出去 —— 窗口从
   「整个重载期」压到「一条 mpv 命令往返」。仓里程序化 seek 本来就多用这一档
-  （`bottom_control.dart:44`、`view.dart:980`、`pip_helper.dart:60` 等 10 处）。
+  （`bottom_control.dart:44`、`view.dart:979`、`pip_helper.dart:60` 等 10 处）。
   **这只是收窄，不是根治**：根治要在播放器里给"发起者身份"（与上面第一条同源），
   动核心，单独一轮做。**离线测不出来**：测试宿主的 `videoPlayerController` 是 null，
   `await null` 一个微任务就过，那几秒的悬停在假件上根本不存在 —— 所以这条**没有红灯**，
   证据只有上面那份真机日志。
   **复查更正**：我原先记的是「`duration.value == 0` 时 `seekTo` 把 seek 寄存到
   `duration.listen` 上」—— 那个分支**几乎够不着**（`setDataSource` 在
-  `pl_player/controller.dart:1010` 就用 `duration ?? state.duration` 把 `duration.value`
+  `pl_player/controller.dart:1101` 就用 `duration ?? state.duration` 把 `duration.value`
   写成非零，之后也没有东西把它归零），真悬住的是 `stream.buffer.first`。两条都读过才改的口。
 - **被顶掉那一页重新露面后的那几秒，还会接着动播放器（MEDIUM，本轮已修）**：
   相关视频跳转 push 新页，既不 `onClose` 旧页、也不换代。旧页在途的那一轮在
   `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`:1332`、`:1424`），
   **没有 `_cdnIsAttached`** —— 所以被顶掉多久它都活着。用户 pop 回来 → `didPopNext` 调
-  旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:432`），它把 `onStall` 等回调**同步**
+  旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:495`），它把 `onStall` 等回调**同步**
   装回去，`_cdnIsAttached` **立刻又为真**，而 `_cdnGeneration` 从头到尾没动过 ——
   `_roundLive` 于是重新为真。从这一刻到旧页自己的 `playerInit`
-  （`view.dart:457`，**没有 await**）把 `setDataSource` 跑完之间（亚秒~几秒），播放器上
+  （`view.dart:522`，**没有 await**）把 `setDataSource` 跑完之间（亚秒~几秒），播放器上
   还挂着新页那份媒体。（pop 新页时 `PlPlayerController.dispose()` 在 `_playerCount > 1`
   时只把计数 2→1、**不卸载媒体**，所以那几秒确实还是新页的片。）
   **修法**：`attachCdnSwitch` 在幂等闸之后 `_cdnGeneration++;`，**并且同时**
   `_cdnAutoBusy = false;`。后半句不是配套美容，是必须的 —— 一轮收尾那句
-  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`:769-773`）
+  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`:766-771`）
   只在代际相同时清 busy，光换代不清就把 busy **永久钉死在真**，此后所有卡顿/探测都被
   `busy=true` 忽略，而 `attachCdnSwitch` 幂等、再也不会进来救它 —— 这一页的自动换源就死透了。
   **不复用** `resetCdnForNewObject()`：它还会清 `_cdnObjectSize` / `_cdnBadHosts` /

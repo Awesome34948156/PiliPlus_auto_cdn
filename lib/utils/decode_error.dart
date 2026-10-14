@@ -86,8 +86,9 @@ bool isDecoderCorruptionLog(String text) {
 /// **刻意只收"会话 / 渲染缓冲"这一层。** 同一场风暴里的
 /// `vd: Error while decoding frame (hardware decoding)!` 与
 /// `av1: HW accel end frame fail.` **不收**：它们是**通用症状** —— 坏字节时也刷，
-/// 而 `PLPlayerController` 里那段 `video-reload` 的事故记录（见 `_healNoVideoTrack`
-/// 上方的注释）正是我们自己的重载弄出来的 92 行同类报错。收进来会在**真正的坏
+/// 而 `PLPlayerController` 里那段 `video-reload` 的事故记录（见
+/// `_rebuildRenderContextOnNoVideo` 上方的墓碑注释）正是我们自己的重载弄出来的
+/// 92 行同类报错。收进来会在**真正的坏
 /// 字节风暴**里（那一族本该命中几百行并换源）把动作从"换源"改成"重建解码器"，
 /// 等于治错了病。
 const List<String> kDecoderSessionFailureSignatures = [

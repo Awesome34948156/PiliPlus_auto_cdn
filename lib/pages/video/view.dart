@@ -195,7 +195,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   ///
   /// 拆开逐个写就会漏：P3 第一版只把 [_onRenderContextLost] 挂在 `handlePlay`（手点
   /// 播放那条路）上，于是**开着"进入详情页自动播放"的用户永远不认领重载** ——
-  /// `_renderRebuildBlocker` 一直判"没有页面认领重载"，自愈失败后照旧黑屏。四条路
+  /// `_renderRebuildBlocker` 一直判"没有页面认领重载"，定罪后照旧黑屏。四条路
   /// 上挂什么、卸什么，从此只有这一处说了算。
   void _attachPlayerListeners() {
     plPlayerController
@@ -358,7 +358,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     }
   }
 
-  /// 播放器把渲染上下文拆掉了（"无视频轨"自愈失败后的就地重建），用**当前
+  /// 播放器把渲染上下文拆掉了（"无视频轨"定罪后的就地重建），用**当前
   /// URL** 重走一次装载把它建回来。
   ///
   /// 与 [didPopNext] 里那句 `playerInit(autoplay: playerStatus.isPlaying)` 同一招：

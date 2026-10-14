@@ -1142,52 +1142,31 @@ void main() {
     });
   });
 
-  // 「无视频轨」自愈失败后的就地重建（P3）。这里能测的只有**判据**：真正拆
+  // 「无视频轨」时间窗定罪后的就地重建（P3）。这里能测的只有**判据**：真正拆
   // `Player`、重建渲染上下文、请页面重载那一段全都要真 libmpv（测试进程里
-  // `_videoPlayerController` 恒为 null，`_kNoVideoProbes` 探满之后
-  // `_healNoVideoTrack` 第一句就 return false），所以断言落在"闸门说了什么"和
-  // "失败之后有没有去叩那道门"上。两者都是这次新增的代码路径，去掉修复即红。
+  // `_videoPlayerController` 恒为 null，定罪之后 `_rebuildRenderContextOnNoVideo`
+  // 只会走到"跳过（没有页面认领重载）"），所以断言落在"闸门说了什么"和
+  // "定罪之后有没有去叩那道门"上。两者都是这次新增的代码路径，去掉修复即红。
   //
-  // 已知覆盖不到的一处：`_renderRebuildBlocker` 里"换源/换集在途"（`_processing`）
-  // 那道闸门 —— 它排在"播放器不存在"**之后**，而测试进程里 player 恒为 null，
-  // 所以永远停在前一条。别给 `_processing` 加测试缝去凑：缝有了也走不到。
-  group('无视频轨自愈失败 → 就地重建渲染上下文', () {
+  // 判据从"连空 N 探"改成了**时间窗**：门全开、画面空就开窗计时，强指纹（解码器
+  // 真起来了 + 位置在推进）攒满 3s、弱指纹攒满 8s 才定罪。每一拍由 ticker 传进
+  // `now`，测试里用一个假时钟 `clock` 自己推（见 [beat]）。
+  //
+  // 已知覆盖不到的几处 —— 都是**刻意留白**，别硬加测试缝去凑：
+  //   - `_renderRebuildBlocker` 里"换源/换集在途"（`_processing`）那道闸门：它排在
+  //     "播放器不存在"**之后**，而测试进程里 player 恒为 null，所以永远停在前一条。
+  //     缝有了也走不到。
+  //   - `_hasVideoTrack` 翻真时关窗那一下：它读的是真播放器的宽/视频参数，测试进程
+  //     里没有原生 Player，摆不成"画面真起来了"。
+  //   - `_createVideoController` 里那几个复位点（时间窗、重建额度）：换媒体才走到，
+  //     测试里够不到 —— 窗口只能靠"闸门关一拍"这道侧门复位，见 [closeNoVideoWindow]。
+  group('无视频轨：时间窗定罪 → 就地重建渲染上下文', () {
     late PlPlayerController pc;
+    // 假时钟：判据现在按 `now - 窗口起点` 计时，不推它就永远走不出时间窗。
+    late DateTime clock;
 
-    setUp(() {
-      pc = PlPlayerController.getInstance()
-        // setUp 每次都 `getInstance()`，`_playerCount` 跨用例只增不减，摆不成
-        // "恰好一个页面持有单例"这个前提。
-        ..debugPlayerCount = 1
-        ..debugNoVideoRebuilds = 0
-        // 下面这几样在测试进程里**没有别的复位点**（生产里的复位分别在
-        // `_createVideoController` 与页面 `dispose()`，测试都够不到），不在这里
-        // 摆干净就会把后面的用例污染成另一种初始状态。
-        ..debugNoVideoHealed = false
-        ..debugRebuildingRenderContext = false
-        ..debugClearRenderReloadListeners();
-    });
-
-    tearDown(() {
-      pc
-        ..debugRebuildingRenderContext = false
-        ..debugNoVideoHealed = false
-        ..debugNoVideoRebuilds = 0
-        ..debugPlayerCount = 1
-        ..debugClearRenderReloadListeners()
-        // 强指纹注入缝也还回默认值（null ⇒ 走真实判据）。不还的话，后面用例会
-        // 在别人摆出的强指纹下悄悄走快路。
-        ..debugNoVideoStrongOverride = null
-        // `isBuffering` 的初值就是 true（`controller.dart:222`），还回原样。
-        ..isBuffering.value = true
-        // openNoVideoGates 摆过、又不属于本 group 的字段，同样还回去。
-        ..isSeeking.value = false
-        ..onlyPlayAudio.value = false
-        ..isLive = false
-        ..position.value = 0;
-    });
-
-    /// 把 [_checkNoVideoTrack] 的六道门全部放开。
+    /// 把 [_checkNoVideoTrack] 的七道门全部放开（`_processing` 那道摆不了，见 group
+    /// 顶注释）。
     ///
     /// 必须显式摆一遍，不能靠默认值：单例跨用例存活，而这些标志位上一批用例
     /// 早就动过了 —— 尤其 `isBuffering` **初值就是 true**，光看代码会以为它默认
@@ -1202,17 +1181,66 @@ void main() {
         ..debugPlayerCount = 1;
     }
 
-    /// 把"连空几探"的计数与位置记忆一起归零。
+    /// 借 `position.value <= 0` 那道门把时间窗关干净（顺带把这道门本身也测了）。
     ///
-    /// 生产里每个 `_noVideoProbes = 0` 的返回点都会顺手清掉位置记忆，测试进程里
-    /// 没有那个复位口 —— 这两样又都是单例字段、跨用例只增不减。用一记"闸门关着"
-    /// 的探针复刻那一步即可：`position.value <= 0` 恰好落在关着的那一侧。不归零
-    /// 的话，前一个用例探过的拍数会记到这一个头上。
-    void resetNoVideoProbe() {
+    /// 窗口是单例字段、跨用例只增不减：上一条用例攒到半截的窗口不清掉，这一条
+    /// 的第一拍就会被算成它的续命。生产里窗口的复位点只剩"门开着时开窗"和
+    /// `_createVideoController`（换媒体），测试里只有这道侧门够得到。
+    ///
+    /// 声明在 [setUp] 之前 —— Dart 的局部函数不像 JS 那样先提升，写在后面的话
+    /// setUp/tearDown 里就引用不到（analyzer 的 `referenced_before_declaration`）。
+    void closeNoVideoWindow() {
       pc
         ..position.value = 0
-        ..debugCheckNoVideoTrack();
+        ..debugCheckNoVideoTrack(clock);
     }
+
+    /// 拍一次：推进假时钟 [by]、可选把位置推到 [pos]，再让判据看一眼。
+    ///
+    /// [pos] 不传就保持原值 —— "位置冻住"那条用例正是靠这一点：位置不动，强指纹
+    /// 里"位置在推进"那一半就不成立。
+    void beat(Duration by, {int? pos}) {
+      clock = clock.add(by);
+      if (pos != null) pc.position.value = pos;
+      pc.debugCheckNoVideoTrack(clock);
+    }
+
+    setUp(() {
+      pc = PlPlayerController.getInstance()
+        // setUp 每次都 `getInstance()`，`_playerCount` 跨用例只增不减，摆不成
+        // "恰好一个页面持有单例"这个前提。
+        ..debugPlayerCount = 1
+        ..debugNoVideoRebuilds = 0
+        // 下面这几样在测试进程里**没有别的复位点**（生产里的复位分别在
+        // `_createVideoController` 与页面 `dispose()`，测试都够不到），不在这里
+        // 摆干净就会把后面的用例污染成另一种初始状态。
+        ..debugRebuildingRenderContext = false
+        ..debugClearRenderReloadListeners();
+      clock = DateTime.now();
+      // 时间窗是单例字段、跨用例只增不减：进来先借"位置归零"那道门关一次窗，
+      // 免得上一条用例攒到半截的窗口把这一拍算成它的续命。见 [closeNoVideoWindow]。
+      closeNoVideoWindow();
+    });
+
+    tearDown(() {
+      pc
+        ..debugRebuildingRenderContext = false
+        ..debugNoVideoRebuilds = 0
+        ..debugPlayerCount = 1
+        ..debugClearRenderReloadListeners()
+        // 强指纹注入缝也还回默认值（null ⇒ 走真实判据）。不还的话，后面用例会
+        // 在别人摆出的强指纹下悄悄走快路。
+        ..debugNoVideoStrongOverride = null
+        // `isBuffering` 的初值就是 true（`controller.dart:222`），还回原样。
+        ..isBuffering.value = true
+        // openNoVideoGates 摆过、又不属于本 group 的字段，同样还回去。
+        ..isSeeking.value = false
+        ..onlyPlayAudio.value = false
+        ..isLive = false
+        ..position.value = 0;
+      // 收尾再关一次窗：别把这个用例攒的时间留给下一个用例。
+      closeNoVideoWindow();
+    });
 
     test('没有页面认领重载就不许重建：拆了没人把它建回来', () {
       expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
@@ -1375,35 +1403,66 @@ void main() {
       expect(pc.debugRenderRebuildBlocker(), '本媒体已重建 2 次');
     });
 
-    test('探满死锁 → 自愈失败（没有 Player）→ 升级去叩重建那道门', () async {
+    test('强指纹 + 位置在推进：攒满 $_kNoVideoWindowExpect 才定罪，上报行带 [强指纹]', () {
+      // 测试进程里没有原生 Player（`_safeProp` 恒空），强指纹永远为假，只能靠注入缝摆。
       openNoVideoGates();
+      pc.debugNoVideoStrongOverride = () => true;
       expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
 
-      for (var i = 0; i < _kNoVideoProbesExpect; i++) {
-        pc.debugCheckNoVideoTrack();
-      }
-      // `_healNoVideoTrack().then(...)` 是一次微任务，让它落地。
-      await Future<void>.delayed(Duration.zero);
+      // 开窗那一拍：门全开、画面空，只记起点，不定罪。
+      beat(Duration.zero, pos: 100);
+      expect(
+        pc.debugNoVideoWindowStart,
+        isNotNull,
+        reason: '门全开、画面空，这一拍该开窗：\n${log.text}',
+      );
+      expect(log.has('无视频轨:'), isFalse, reason: '开窗那一拍不该定罪：\n${log.text}');
 
+      // 攒到 1s、2s：还在强指纹的 3s 窗口里，一拍都不许报。
+      beat(const Duration(seconds: 1), pos: 101);
+      expect(log.has('无视频轨:'), isFalse, reason: '第 1 拍（1s）不该报：\n${log.text}');
+      beat(const Duration(seconds: 1), pos: 102);
+      expect(log.has('无视频轨:'), isFalse, reason: '第 2 拍（2s）不该报：\n${log.text}');
+      expect(
+        pc.debugNoVideoWindowStart,
+        isNotNull,
+        reason: '3s 没到，窗口该一直开着：\n${log.text}',
+      );
+
+      // 第 3 拍（3.0s）：强指纹 + 位置推进 ⟹ 窗口刚好走满，定罪并去叩重建那道门。
+      beat(const Duration(seconds: 1), pos: 103);
       expect(
         log.has('无视频轨: 音频正常但画面始终为空'),
         isTrue,
-        reason: '探满 $_kNoVideoProbesExpect 次就该报现场：\n${log.text}',
+        reason: '强指纹攒满 $_kNoVideoWindowExpect 就该报现场：\n${log.text}',
+      );
+      expect(
+        log.has(' [强指纹]'),
+        isTrue,
+        reason: '强指纹那条上报行该带 [强指纹] 后缀（基串不变，只加尾巴）：\n${log.text}',
       );
       expect(
         log.has('就地重建: 跳过（没有页面认领重载）'),
         isTrue,
-        reason: '自愈失败之后没有去叩重建那道门：\n${log.text}',
+        reason: '定罪之后没有去叩重建那道门：\n${log.text}',
       );
     });
 
-    test('重建窗口里不许把自己刚做的动作当成新的死锁再探（红测）', () {
-      // 上一条是这条的对照组：同样的门、同样的探数，唯一的差别是窗口标志。
-      // 没有那一句开门的辅助，这条会**假绿** —— 门本来就关着，什么都不设也过。
+    test('重建窗口里不许把自己刚做的动作当成新的死锁计时（红测）', () {
+      // 上一条是这条的对照组：同样的门、同样的拍数，唯一的差别是
+      // `_rebuildingRenderContext` 那道门。没有它，下面这几拍早跨过 3s 窗口报出来了
+      // —— 这条要证的正是那道门把窗口关住；门漏了这条会红。
+      //
+      // 用强指纹 + 位置推进把窗口压到最短的 3s：五拍足够定罪。换成弱指纹要 8s，五拍
+      // 根本走不到门槛，这条就成了假绿。
+      closeNoVideoWindow();
       openNoVideoGates();
-      pc.debugRebuildingRenderContext = true;
-      for (var i = 0; i < _kNoVideoProbesExpect + 2; i++) {
-        pc.debugCheckNoVideoTrack();
+      pc
+        ..debugNoVideoStrongOverride = (() => true)
+        ..debugRebuildingRenderContext = true;
+      beat(Duration.zero, pos: 100);
+      for (var i = 0; i < 4; i++) {
+        beat(const Duration(seconds: 1), pos: 101 + i);
       }
       expect(
         log.has('无视频轨:'),
@@ -1412,69 +1471,32 @@ void main() {
       );
     });
 
-    // ---- 强指纹快路：解码器真起来了就 2 探动手（2026-10-15）----
+    // ---- 强弱指纹两档窗口：强指纹 3s 定罪（见上），弱指纹 8s（2026-10-15）----
 
-    test('强指纹 + 位置在推进 → 2 探即认死锁，上报行带 [强指纹]', () async {
-      // 测试进程里没有原生 Player（`_safeProp` 恒空），强指纹永远为假，只能靠注入缝摆。
-      resetNoVideoProbe();
-      openNoVideoGates();
-      pc
-        ..debugNoVideoStrongOverride = (() => true)
-        ..position.value = 100
-        ..debugCheckNoVideoTrack();
-      expect(
-        log.has('无视频轨:'),
-        isFalse,
-        reason: '强指纹也走满 $_kNoVideoProbesFastExpect 探才动手，第 1 探不该报：\n${log.text}',
-      );
-
-      // 第 2 探：位置比上一探大（100 → 101），强指纹成立 → 计数够 $_kNoVideoProbesFastExpect。
-      pc
-        ..position.value = 101
-        ..debugCheckNoVideoTrack();
-      await Future<void>.delayed(Duration.zero);
-
-      expect(
-        log.has('无视频轨: 音频正常但画面始终为空'),
-        isTrue,
-        reason: '强指纹下 $_kNoVideoProbesFastExpect 探就该报现场：\n${log.text}',
-      );
-      expect(
-        log.has('[强指纹]'),
-        isTrue,
-        reason: '强指纹那条上报行该带 [强指纹] 后缀（基串不变，只加尾巴）：\n${log.text}',
-      );
-    });
-
-    test('弱指纹仍要探满 $_kNoVideoProbesExpect 探：没有证据就不抢跑', () async {
-      resetNoVideoProbe();
+    test('弱指纹仍要攒满 $_kNoVideoWindowWeakExpect 才定罪：没有证据就不抢跑', () {
+      closeNoVideoWindow();
       openNoVideoGates();
       pc.debugNoVideoStrongOverride = () => false;
 
-      // 前 $_kNoVideoProbesFastExpect 探：位置照常推进，但指纹是弱的 —— 不许报。
-      for (var i = 0; i < _kNoVideoProbesFastExpect; i++) {
-        pc
-          ..position.value = 100 + i
-          ..debugCheckNoVideoTrack();
+      beat(Duration.zero, pos: 100);
+      // 强指纹在 3.0s（第 3 拍）就该动手；弱指纹走 8s 窗口，第 3 拍不许报。
+      for (var i = 1; i <= 3; i++) {
+        beat(const Duration(seconds: 1), pos: 100 + i);
       }
       expect(
         log.has('无视频轨:'),
         isFalse,
-        reason: '弱指纹下第 $_kNoVideoProbesFastExpect 探还不该动手：\n${log.text}',
+        reason: '弱指纹第 3 拍（3s）还不该动手 —— 那是强指纹的门槛：\n${log.text}',
       );
 
-      // 补满到第 $_kNoVideoProbesExpect 探才该报。
-      for (var i = _kNoVideoProbesFastExpect; i < _kNoVideoProbesExpect; i++) {
-        pc
-          ..position.value = 100 + i
-          ..debugCheckNoVideoTrack();
+      // 补满到第 8 拍（8.0s）才该报。
+      for (var i = 4; i <= _kNoVideoWindowWeakExpect.inSeconds; i++) {
+        beat(const Duration(seconds: 1), pos: 100 + i);
       }
-      await Future<void>.delayed(Duration.zero);
-
       expect(
         log.has('无视频轨: 音频正常但画面始终为空'),
         isTrue,
-        reason: '弱指纹下要探满 $_kNoVideoProbesExpect 探才报：\n${log.text}',
+        reason: '弱指纹要攒满 $_kNoVideoWindowWeakExpect 才报：\n${log.text}',
       );
       expect(
         log.has('[强指纹]'),
@@ -1483,34 +1505,96 @@ void main() {
       );
     });
 
-    test('闸门一关就把计数清掉：旧的那一探不记到新一轮头上', () async {
-      resetNoVideoProbe();
-      openNoVideoGates();
-      // 强指纹先走一探（计数到 1，差 1 探就该动手）。
-      pc
-        ..debugNoVideoStrongOverride = (() => true)
-        ..position.value = 100
-        ..debugCheckNoVideoTrack();
-      expect(log.has('无视频轨:'), isFalse, reason: '第 1 探不该报：\n${log.text}');
+    test('强指纹但位置冻住：退回 $_kNoVideoWindowWeakExpect 窗口，上报不带 [强指纹]', () {
+      // 位置不动 ⇒ `position.value > 上一拍位置` 不成立 ⇒ 强指纹不成立 ⇒ 落到 8s 档。
+      // 这条钉住"位置推进"是强指纹的一半、不是摆设：没有它，第 3 拍就会报出来。
+      closeNoVideoWindow();
+      openNoVideoGates(); // position 停在 100
+      pc.debugNoVideoStrongOverride = () => true;
 
-      // 位置归零 = 走 `position.value <= 0` 那道门 → 计数与位置记忆一起归零。
-      pc
-        ..position.value = 0
-        ..debugCheckNoVideoTrack();
-
-      // 重开闸门，只再探一探。位置取一个必然大于任何旧记忆的值，于是"报不报"
-      // 只由计数决定：计数真被清过 → 停在 1，不报；没清 → 凑满 2 探、误报。
-      openNoVideoGates();
-      pc
-        ..position.value = 200
-        ..debugCheckNoVideoTrack();
-      await Future<void>.delayed(Duration.zero);
-
+      // 开窗那拍把位置记忆也记成 100，之后 100 > 100 恒假 —— 每拍都不传 pos。
+      beat(Duration.zero);
+      for (var i = 1; i <= 3; i++) {
+        beat(const Duration(seconds: 1));
+      }
       expect(
         log.has('无视频轨:'),
         isFalse,
-        reason: '闸门重置后上一探的账不该接着算（这里会凑满快路 2 探而误报）：\n${log.text}',
+        reason: '位置冻住时强指纹不成立，第 3 拍不该报（那会说明"位置推进"没算进去）：'
+            '\n${log.text}',
       );
+
+      for (var i = 4; i <= _kNoVideoWindowWeakExpect.inSeconds; i++) {
+        beat(const Duration(seconds: 1));
+      }
+      expect(
+        log.has('无视频轨: 音频正常但画面始终为空'),
+        isTrue,
+        reason: '位置冻住要攒满 $_kNoVideoWindowWeakExpect 才报：\n${log.text}',
+      );
+      expect(
+        log.has('[强指纹]'),
+        isFalse,
+        reason: '位置没推进，上报行不该带 [强指纹]：\n${log.text}',
+      );
+    });
+
+    test('七道门逐道关窗：旧窗口攒的时间不算到新一轮头上', () {
+      // 每道门单独摆一次，验证两件事：(1) 摆上就把窗口关掉；(2) 关掉之后重新攒，
+      // 上一轮的时间不进新窗口。判别力在第二段：重开门时若旧窗口没被关掉，累计
+      // 已够 3s，这一拍就会报出来。
+      closeNoVideoWindow();
+      pc.debugNoVideoStrongOverride = () => true;
+
+      // `_processing` 那道门没有测试缝（排在"播放器不存在"之后，见 group 顶注释），
+      // 这里刻意跳过 —— 摆不了，见也见不着。
+      final gates = <String, void Function()>{
+        'onlyPlayAudio': () => pc.onlyPlayAudio.value = true,
+        'isLive': () => pc.isLive = true,
+        'position<=0': () => pc.position.value = 0,
+        'isSeeking': () => pc.isSeeking.value = true,
+        'rebuilding': () => pc.debugRebuildingRenderContext = true,
+        'isBuffering': () => pc.isBuffering.value = true,
+      };
+
+      for (final entry in gates.entries) {
+        // 干净起点：先把窗关死（借上一段剩下的门也行），再全开，攒到 2s。
+        closeNoVideoWindow();
+        openNoVideoGates();
+        beat(Duration.zero, pos: 100);
+        beat(const Duration(seconds: 1), pos: 101);
+        beat(const Duration(seconds: 1), pos: 102);
+        expect(
+          pc.debugNoVideoWindowStart,
+          isNotNull,
+          reason: '${entry.key}：摆门前窗口该是开的：\n${log.text}',
+        );
+
+        // 摆上这道门 → 窗口该被关掉。
+        entry.value();
+        beat(Duration.zero);
+        expect(
+          pc.debugNoVideoWindowStart,
+          isNull,
+          reason: '${entry.key} 这道门没把窗口关掉：\n${log.text}',
+        );
+
+        // 重开门再来一拍。窗口真关过 ⇒ 这是新的开窗拍，不报；没关掉 ⇒ 累计 3s → 报
+        // （这正是这条用例要抓的）。
+        pc
+          ..debugRebuildingRenderContext = false
+          ..onlyPlayAudio.value = false
+          ..isLive = false
+          ..isSeeking.value = false;
+        openNoVideoGates();
+        beat(const Duration(seconds: 1), pos: 200);
+        expect(
+          log.has('无视频轨:'),
+          isFalse,
+          reason: '${entry.key}：旧窗口攒的时间被算进新一轮了（重开门那一拍就报）：'
+              '\n${log.text}',
+        );
+      }
     });
   });
 
@@ -1594,11 +1678,11 @@ void main() {
 /// 别跟着生产常量一起改。
 const _kStarveSecondsExpect = 4;
 
-/// 「无视频轨」连空几探才动手（`controller.dart:_kNoVideoProbes` / 强指纹快路
-/// `controller.dart:_kNoVideoProbesFast`）与重建上限（`controller.dart:_kNoVideoRebuildMax`）。
-/// 同上：只用在断言里。
-const _kNoVideoProbesExpect = 4;
-const _kNoVideoProbesFastExpect = 2;
+/// 「无视频轨」定罪要攒够的时间窗（`controller.dart:_kNoVideoWindow` 强指纹档 /
+/// `controller.dart:_kNoVideoWindowWeak` 弱指纹档）与重建上限
+/// （`controller.dart:_kNoVideoRebuildMax`）。同上：只用在断言里。
+const _kNoVideoWindowExpect = Duration(seconds: 3);
+const _kNoVideoWindowWeakExpect = Duration(seconds: 8);
 const _kNoVideoRebuildMaxExpect = 2;
 
 /// 把触发打进播放器上报口 —— 这就是真实的机制（页面不直接调 mixin 的私有方法）。

@@ -358,8 +358,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 换集 / seek 边界上的单个损坏 GOP 只有 1~2 行，差一个数量级。
   ///
   /// **只加给坏字节这一族。** 会话失效那一族不能加：我们自己的 `video-reload`
-  /// 事故（见 [_healNoVideoTrack] 上方）刷的 92 行里就有 `invalid session`，
-  /// 加进来会把"镜像给的字节"和"本机解码器"两个相反的结论搅在一起。
+  /// 事故（见 [_rebuildRenderContextOnNoVideo] 上方那段墓碑注释）刷的 92 行里
+  /// 就有 `invalid session`，加进来会把"镜像给的字节"和"本机解码器"两个相反的
+  /// 结论搅在一起。
   static const int _kDecodeErrorDenseBurst = 20;
 
   /// 上面那 20 行的窗口。要的是"挤在一起"而不是"跨得够久"：比稀疏档数不满的
@@ -422,34 +423,37 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// "一切正常"和"看门狗根本没跑"——两者留下的日志一模一样。
   static const int _kHeartbeatSeconds = 10;
 
-  /// 「无视频轨」自己的采样节奏。心跳是 10s，等它两拍要 20s —— 而黑屏是死锁，
-  /// 每多等一秒用户就多对着黑屏一秒。改成 2s 一探，[_kNoVideoProbes] 拍就动手。
-  static const Duration _kNoVideoProbe = Duration(seconds: 2);
-
-  /// 连续几探"音频在推进、画面仍是空"才认定是死锁。
+  /// 「闸门全开 + 画面为空」要**连续**攒满这么久，才认定是死锁。
   ///
-  /// 取 4 探（~8s）是放过起播慢的大文件：视频参数本来就比音频晚到，只是不会
-  /// 晚到 8 秒。2026-10-11 那次 iOS 黑屏从起播到被探到也远不到 8s。
-  static const int _kNoVideoProbes = 4;
-
-  /// 强指纹成立时连空几探就动手（≈4s，[_kNoVideoProbe] × 2）。
+  /// 判据从"数几探"换成了"时间窗"：ticker 1s 一拍、每拍都来看一眼，这段状态只要
+  /// 没被打断（某道门成立、或 [_hasVideoTrack] 翻真）窗口就一直开着。
+  /// 旧判据的死穴是采样节奏与装载时刻相位随机 —— 真机实测"2 探"花了 7.16s、
+  /// "4 探"10.9s（2026-10-15），而"播放已经跑起来之后画面还空着"这件事与探了几拍
+  /// 无关。
   ///
-  /// 指纹不成立时仍走 [_kNoVideoProbes]：没有"解码器真的开了"这条证据，
-  /// 就没道理拿黑屏时间赌提前动手。见 [_noVideoStrongFingerprint]。
-  static const int _kNoVideoProbesFast = 2;
+  /// **为什么是 3s 而不是更短**：它必须**严格超过健康装载的最晚值**。两局共 32 次
+  /// 装载实测「选流 → mpv 配上视频输出」= 0.54~2.22s，而窗口是从"闸门开"起算的，
+  /// 闸门开必然晚于选流 ⇒ 3s 的窗对任何健康装载都不可能误报（余量 ≥0.78s）。
+  /// 这一条同时管住了"重建之后立刻再定罪"：重载一次 = 一次新选流，同样落在 2.22s 内。
+  /// 所以本文件**不需要**再加"两次重建之间至少隔多久"的冷却 —— 窗口长度本身就是
+  /// 那个冷却。若把窗降到 1.5s（≈2 拍），就**必须**另加冷却，否则第一次重建刚落地
+  /// 就会烧掉第二次额度。
+  static const Duration _kNoVideoWindow = Duration(seconds: 3);
 
-  /// 钉住尺寸后等 mpv 走一次 render 往返再看结果。
-  static const Duration _kHealWait = Duration(milliseconds: 1200);
-
-  /// 自愈最多钉几次尺寸。第一次 render 可能正好落在 mpv 拆完旧输出、新输出
-  /// 还没建好的缝里，再推一次几乎不要钱（不 seek、不重载、不动位置）。
-  static const int _kHealAttempts = 2;
+  /// 没有"解码器真的开了"这条证据时（[_noVideoStrongFingerprint] 不成立）的窗口。
+  ///
+  /// 比 [_kNoVideoWindow] 长，是为了放过另一族病：**视频轨饿死**（视频轨那条 URL
+  /// 坏了、压根没有帧）。它的形状与输出死锁一模一样（音频在走、画面恒空），但正解是
+  /// 换源，不是拆播放器 —— 而它的指纹通常就是弱的（解码器起不来 ⇒ `hwdec-current`
+  /// 空）。这一档取 8s ≈ 旧弱指纹路的量级（4 探 × 真机 2.86s/探），等于"没有证据就
+  /// 不抢跑"。
+  static const Duration _kNoVideoWindowWeak = Duration(seconds: 8);
 
   /// 一种媒体最多就地重建几次渲染上下文。
   ///
-  /// 与 [_kHealAttempts] 同源：第一次可能正好撞上 mpv 拆旧/建新的缝，第二次几乎
-  /// 不要钱；再多就是拿黑屏时间换递减的收益（每次重建 ≈ 旧 player dispose 2s +
-  /// 重载 1~3s）。用完之后回到老出路：用户手动退出视频页再进来。
+  /// 第一次可能正好撞上 mpv 拆旧/建新的缝，第二次几乎不要钱；再多就是拿黑屏时间换
+  /// 递减的收益（每次重建 ≈ 旧 player dispose 2s + 重载 1~3s）。用完之后回到老出路：
+  /// 用户手动退出视频页再进来。
   static const int _kNoVideoRebuildMax = 2;
 
   /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
@@ -1227,6 +1231,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // Avoid sizing the surface using mpv's idle window between media loads.
       player.setProperty('force-window', 'no');
     }
+    // iOS 侧**故意不设** `force-window`（2026-10-15 议过，暂缓）：
+    //
+    // 它看着是那场竞态的正解 —— 语义正是"没有视频也把视频输出建起来"，若能让 mpv 在
+    // 装载时就建好 VO，竞态就没有发生的窗口。但它有一个**比病更坏**的失败形态：
+    // 上面 Android 那句注释就是机制的证词（mpv 的 idle window 会去撑 surface），
+    // 一旦 mpv 拿空窗口把尺寸定出来，[_hasVideoTrack]（读 `video-out-params` 的
+    // w/dw）就会翻真 —— 画面照样是黑的，判据却瞎了，[_checkNoVideoTrack] 永远不定罪、
+    // 就地重建这条**唯一的救援路**也不会触发 ⇒ 永久黑屏，只能杀进程。
+    // 现在这个病是 11s 能自愈的，换成一个救不回来的，不划算。
+    //
+    // 附带一条：这一版同时上了 fork 的黑屏探针（要回答"死锁时 `_updateCallback()`
+    // 到底有没有被叫过"）。若 `force-window` 真把竞态压住了，这一局就不复现死锁，
+    // 探针存在的唯一理由也随之落空 —— 两个改动同车，答案会被搅在一起。
+    //
+    // 顺序：先拿探针的证据，再单独出包试它。
 
     player.setMediaHeader(userAgent: BrowserUa.pc, referer: HttpString.baseUrl);
 
@@ -1247,13 +1266,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
-    // 换了媒体，「音频在、画面不在」的计数与自愈额度都重新来过。
-    _noVideoProbes = 0;
-    _lastNoVideoProbePosition = 0;
-    _noVideoHealed = false;
+    // 换了媒体，「音频在、画面不在」的窗口与重建额度都重新来过。
+    _resetNoVideoWindow();
     // 重建渲染上下文自己也要走这条路（见 [_runRenderContextRebuild]），别把自己
-    // 的额度一起清掉 —— 清了就是"探满 4 → 自愈失败 → 重建 → 探满 4 → …"的无限
-    // 重建。只有用户发起的装载（换集 / 换画质 / CDN 换源）才重新给额度。
+    // 的额度一起清掉 —— 清了就是"攒满窗 → 重建 → 攒满窗 → …"的无限重建。只有
+    // 用户发起的装载（换集 / 换画质 / CDN 换源）才重新给额度。
     //
     // 判据是 _ownReload 而不是 _rebuildingRenderContext：用户**恰好在重建窗口里**
     // 换集时后者也是 true，会把用户这次装载的额度白白吃掉（新媒体一上来就背着
@@ -1642,25 +1659,27 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _startStallTicker();
   }
 
-  /// 连续多少探"音频在、画面不在"。见 [_checkNoVideoTrack]。
-  int _noVideoProbes = 0;
+  /// 「闸门全开 + 画面为空」这段状态的起点；null = 没有正在累积的窗口。
+  ///
+  /// 它是旧的 `_noVideoProbes` 计数器的替身：每一个旧代码把计数清零的返回点，现在
+  /// 都改成把它置空（见 [_resetNoVideoWindow] 与各处复位点）。**一处都不能漏** ——
+  /// 漏了窗口就会跨装载存活，新装载第一拍就定罪。
+  DateTime? _noVideoWindowStart;
 
-  /// 上一探时的播放位置，给"强指纹"加一条"位置真的在推进"的保险
+  /// 上一拍时的播放位置，给"强指纹"加一条"位置真的在推进"的保险
   /// （见 [_noVideoStrongFingerprint]）。
   ///
-  /// 与 [_noVideoProbes] 同生共死：每一个把 [_noVideoProbes] 清零的返回点都
-  /// 连着清零这里，`_lastNoVideoProbePosition` 才不会把上一轮的旧账算到新一轮头上。
-  int _lastNoVideoProbePosition = 0;
+  /// 位置冻住**不关窗**（旧弱指纹路本来也不看位置），只是让强指纹不成立 ⇒ 这次定罪
+  /// 自动落到 [_kNoVideoWindowWeak] 那档、上报行也不带 ` [强指纹]` 后缀。别改成
+  /// "冻住就关窗"：位置冻住 + 不在缓冲正是卡顿看门狗抓不到的盲区（它的判据要
+  /// `isBuffering && bufferedAhead == 0`），那样会静默地收窄这张网。
+  int _noVideoLastPosition = 0;
 
-  /// 上一次采样时刻。自带 [_kNoVideoProbe] 的节奏，不等 10s 心跳。
-  DateTime _lastNoVideoProbe = DateTime.fromMillisecondsSinceEpoch(0);
-
-  /// 本次媒体是否已经跑过一轮自愈。每换一次媒体在 [_createVideoController]
-  /// 里重置 —— 一轮就够，别跟用户的手动操作抢。
-  bool _noVideoHealed = false;
-
-  /// 自愈是否正在跑（里面有 await，采样回调可能重入）。
-  bool _healingNoVideo = false;
+  /// 关掉正在累积的窗口。任何一道门成立、或画面起来了，都必须调它。
+  void _resetNoVideoWindow() {
+    _noVideoWindowStart = null;
+    _noVideoLastPosition = 0;
+  }
 
   /// 本媒体已经就地重建过几次渲染上下文。每换一次媒体在 [_createVideoController]
   /// 里重置（但**绕开**自己那次重建，理由见那里）。见 [_kNoVideoRebuildMax]。
@@ -1708,16 +1727,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 两个都是非空串即成立：`video-codec` 报的是选中的视频编码，`hwdec-current`
   /// 由空变非空**只有"解码器真的开了"这一种可能**（2026-10-15 真机同局核过：
   /// 02:40:16 `hwdec 0x0` → 02:40:27 `hwdec videotoolbox`，后者正是死锁现场）。
-  /// 有它垫底，敢用更短的探数（[_kNoVideoProbesFast]）。
+  /// 有它垫底，才敢用短窗那一档（[_kNoVideoWindow]）。
   ///
-  /// **每探重算、不跨探记忆**：第 1 探抽风读到空、第 2 探还能补回来；用粘性累积
+  /// **每拍重算、不跨拍记忆**：第 1 拍抽风读到空、第 2 拍还能补回来；用粘性累积
   /// 标志会把一次偶然的非空当成永久结论。
   bool get _noVideoStrongFingerprint =>
       debugNoVideoStrongOverride?.call() ??
       (_safeProp('video-codec').isNotEmpty &&
           _safeProp('hwdec-current').isNotEmpty);
 
-  /// 「只有声音没画面」的现场判据。
+  /// 「只有声音没画面」的现场判据：闸门全开 + 画面为空，连续攒满一个窗口即定罪。
   ///
   /// 音频参数正常、视频轨却始终为空 —— 这正是 2026-10-11 那次 iOS 黑屏的形态
   /// （当时拍到的「播放信息」里 Resolution 0x0、VideoParams 全空），而 CDN 与
@@ -1726,13 +1745,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// `VO: [libmpv]` / `vo/libmpv: reconfig` / `libmpv_render: Window size` 这三行。
   /// （别拿 `mpv_render_context_render() not being called or stuck.` 当判据：
   /// 正常播放的每一段里都有它，只是排队晚了一点点。）
-  /// 以前这个状态一行日志都不留，只能靠用户手动抄「播放信息」；现在它自己会
-  /// 连着 [_kNoVideoProbes] 探报到日志里，并触发一次 [_healNoVideoTrack]。
   ///
-  /// 连空几探才算：视频参数本来就比音频晚到，起播那一两探看到空属于正常。
-  /// 采样从 10s 心跳提到 2s 之后，seek / 换源 / 重新缓冲这三个"参数本来就该
-  /// 是空的"窗口必须显式放过，否则会把自己的动作当成死锁。
-  void _checkNoVideoTrack() {
+  /// 判据是**时间窗**（见 [_kNoVideoWindow]），不再数探数：视频参数本来就比音频
+  /// 晚到，所以 seek / 换源 / 重新缓冲这三个"参数本来就该是空的"窗口必须显式放过，
+  /// 否则会把自己的动作当成死锁。定罪之后**直接**走 [_rebuildRenderContextOnNoVideo]
+  /// —— 中间那一档「钉住输出尺寸」2026-10-15 已删（见 [_rebuildRenderContextOnNoVideo]
+  /// 上方的墓碑注释）。
+  void _checkNoVideoTrack(DateTime now) {
     if (onlyPlayAudio.value ||
         isLive ||
         position.value <= 0 ||
@@ -1742,47 +1761,42 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 起来 —— 不放过的话会把自己刚做完的动作当成新的死锁再探一轮。
         _rebuildingRenderContext ||
         isBuffering.value) {
-      _noVideoProbes = 0;
-      _lastNoVideoProbePosition = 0;
+      _resetNoVideoWindow();
       return;
     }
     if (_hasVideoTrack) {
-      _noVideoProbes = 0;
-      _lastNoVideoProbePosition = 0;
+      _resetNoVideoWindow();
       return;
     }
-    // 强指纹每探重算（不跨探记忆），再叠一条"位置真的比上一探大"做双保险
+    final start = _noVideoWindowStart;
+    if (start == null) {
+      // 开窗那一拍不定罪：这一拍之前画面空了多久是无从知道的（最多一拍），
+      // 拿它当账去凑窗口就是白送。
+      _noVideoWindowStart = now;
+      _noVideoLastPosition = position.value;
+      return;
+    }
+    // 强指纹每拍重算（不跨拍记忆），再叠一条"位置真的比上一拍大"做双保险
     // —— 音频在推进本来已由上面 `position.value <= 0` 那道门保证，这里只是
-    // 把"推进"这件事钉在第一手证据上。
-    final strong = _noVideoStrongFingerprint &&
-        position.value > _lastNoVideoProbePosition;
-    _lastNoVideoProbePosition = position.value;
-    if (++_noVideoProbes < (strong ? _kNoVideoProbesFast : _kNoVideoProbes)) {
+    // 把"推进"这件事钉在第一手证据上。指纹不成立（含位置冻住）就走长窗那一档。
+    final strong =
+        _noVideoStrongFingerprint && position.value > _noVideoLastPosition;
+    _noVideoLastPosition = position.value;
+    if (now.difference(start) <
+        (strong ? _kNoVideoWindow : _kNoVideoWindowWeak)) {
       return;
     }
+    // 重新开窗：下一次定罪要再攒满一个窗口。额度用尽之后就靠这个节奏在日志里
+    // 留痕（每窗一行）。**这里不需要"距上次重建至少隔多久"的冷却** —— 窗口长度
+    // 本身就是那个冷却，理由见 [_kNoVideoWindow]。
+    _noVideoWindowStart = now;
     debugPrint(
       '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
       'video ${_safeProp('video-codec')} hwdec ${_safeProp('hwdec-current')} '
-      '位置 ${position.value}s)${_noVideoHealed ? ' [本次媒体已自愈过]' : ''}'
+      '位置 ${position.value}s)'
+      '${_noVideoRebuilds > 0 ? ' [本媒体已重建 $_noVideoRebuilds 次]' : ''}'
       '${strong ? ' [强指纹]' : ''}',
     );
-    if (!_noVideoHealed) {
-      _noVideoHealed = true;
-      // 链在 Future **之后**升级，不能写进 [_healNoVideoTrack] 的失败分支里：
-      // 那里仍在 try 内，finally 的 unpin() 会 setSize 打在已经拆掉的
-      // controller 上。链在这里，成功的自愈路径就**不会**升级重建。
-      unawaited(_healNoVideoTrack().then((ok) {
-        if (!ok) _rebuildRenderContextOnNoVideo();
-      }));
-      return;
-    }
-    // 本媒体已经钉过尺寸、画面还是没起来 —— 升级到重建渲染上下文（受额度限制）。
-    //
-    // 这条路**故意不设 [_healingNoVideo] 闸**：自愈卡在 setSize 上永不返回时
-    // （正是这个死锁最坏的形态），上面那条 `.then` 永远不触发，只有这里能救 ——
-    // 所以"升级一定发生在自愈收尾之后"这句只在成功路径上成立，别把它当不变量。
-    // 自愈那边醒来时 unpin() 是 `videoController?.setSize` 且整体 try/catch，
-    // 打到已经拆掉的 controller 上不会抛。
     _rebuildRenderContextOnNoVideo();
   }
 
@@ -1862,20 +1876,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   set debugRebuildingRenderContext(bool value) => _rebuildingRenderContext = value;
 
-  /// [`_healNoVideoTrack`] 只探一次（[_noVideoHealed]），而这个标志位在测试进程里
-  /// **没有复位点** —— 它唯一的复位在 [_createVideoController] 里，测试够不到。
-  /// 不复位就会污染后面的用例：那条"升级链"用例之所以能把删掉 `.then` 的变异抓红，
-  /// 全靠它自己恰好是第一个探满的用例，一旦有人先探过就变成假绿。
+  /// 「闸门一成立就关窗」这条断言要有个能直接看的对象，不然只能靠"报没报"间接推。
+  ///
+  /// 它也是跨用例的脏状态：单例字段只增不减，而复位点要么在 [_createVideoController]
+  /// 里（测试够不到）、要么靠用例自己走一遍判据去关。用例 setUp / tearDown 里都要
+  /// 主动关一次窗（借 `position.value <= 0` 那道门）。
   @visibleForTesting
-  set debugNoVideoHealed(bool value) => _noVideoHealed = value;
+  DateTime? get debugNoVideoWindowStart => _noVideoWindowStart;
 
   /// 强指纹注入缝。
   ///
   /// 测试进程里没有原生 Player ⇒ [_safeProp] 恒返回空串 ⇒ [_noVideoStrongFingerprint]
-  /// 永远为假，快路（[_kNoVideoProbesFast]）根本走不到，也就无从验证。这个缝让
-  /// 用例直接摆强 / 弱指纹。
+  /// 永远为假，短窗（[_kNoVideoWindow]）根本走不到，也就无从验证。这个缝让用例
+  /// 直接摆强 / 弱指纹。
   ///
-  /// 默认 `null` ⇒ 走**真实判据**（测试里即弱指纹 4 探），所以现有断言不受影响。
+  /// 默认 `null` ⇒ 走**真实判据**（测试里即弱指纹 ⇒ 长窗 [_kNoVideoWindowWeak]）。
   @visibleForTesting
   bool Function()? debugNoVideoStrongOverride;
 
@@ -1896,8 +1911,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   Set<Object> get debugDormantRenderClaimants => _dormantRenderClaimants;
 
+  /// [now] 由调用方给：ticker 那边就是它自己那一拍的 `now`，测试里给假时钟 ——
+  /// 本 group 一律手工重放时序，不真等秒（真 ticker 在测试进程里也没被挂上）。
+  /// 照 [debugSampleStarve] 的参数式写法，不引入可变的时钟覆写字段，于是没有
+  /// 需要 tearDown 收拾的跨用例状态。
   @visibleForTesting
-  void debugCheckNoVideoTrack() => _checkNoVideoTrack();
+  void debugCheckNoVideoTrack(DateTime now) => _checkNoVideoTrack(now);
 
   /// 就地重建渲染上下文 —— "退出视频页再进来"的页内等价物。
   ///
@@ -1934,8 +1953,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (identical(_playerTeardown, teardown)) {
         _playerTeardown = null;
       }
-      _noVideoProbes = 0;
-      _lastNoVideoProbePosition = 0;
+      _noVideoWindowStart = null;
       if (_playerCount == 0) {
         return;
       }
@@ -1951,8 +1969,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     } finally {
       _ownReload = false;
       _rebuildingRenderContext = false;
-      _noVideoProbes = 0;
-      _lastNoVideoProbePosition = 0;
+      _noVideoWindowStart = null;
       _resetStallWatchdog();
     }
   }
@@ -1963,85 +1980,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return (state?.width ?? 0) > 0 || (state?.videoParams.w ?? 0) > 0;
   }
 
-  /// 「只有声音没画面」的自愈。
-  ///
-  /// 病根在 media_kit 的 iOS 视频输出一侧，不在流、不在解码器：
-  /// `VideoOutput._updateCallback` 只在 mpv 的 `video-out-params` 报出非零 dw/dh
-  /// 时才去 `texture.render()` —— 也就是只有在视频输出**已经配好之后**它才会去
-  /// 驱动 `mpv_render_context_render`。于是只要某次加载停在"输出还没配、参数还
-  /// 是空"的状态上，两边就互等成死锁：mpv 一直抱怨没人调 render，画面永远不出
-  /// 来；而音频走的是独立的 AO，所以听得到声音、看不到画面。
-  ///
-  /// 只有一个动作：**钉住输出尺寸**。这直接绕过上面那个判断 —— 尺寸由我们从
-  /// demuxer 那边取来（见 [_nudgeSize]），mpv 报不报都不影响 —— 一次 render
-  /// 就能让 mpv 把视频输出配上，随后立刻把尺寸交还 mpv 自己算。
-  ///
-  /// 5484 那次线上验证把另外两级砍掉了，它们不修病、只伤身（详情见下面）。
-  /// 返回值 = 画面是否真的起来了。false —— 包括"压根没有 player 可钉" —— 由
-  /// [_checkNoVideoTrack] 接着升级到 [_runRenderContextRebuild] 就地重建渲染
-  /// 上下文（"用户手动退出视频页再进来"的页内等价物）。两级都用完才真的放弃。
-  Future<bool> _healNoVideoTrack() async {
-    if (_videoPlayerController == null || _healingNoVideo) {
-      return false;
-    }
-    _healingNoVideo = true;
-    final (w, h) = _nudgeSize;
-
-    /// 把尺寸交还 mpv：钉住只是为了松开死锁，一直挂着会让竖屏这类非 16:9
-    /// 的视频按错的尺寸渲染。
-    Future<void> unpin() async {
-      try {
-        await videoController?.setSize(width: null, height: null);
-      } catch (e) {
-        debugPrint('无视频轨自愈收尾抛错: $e');
-      }
-    }
-
-    try {
-      for (var attempt = 1; attempt <= _kHealAttempts; attempt++) {
-        debugPrint(
-          '无视频轨自愈 $attempt/$_kHealAttempts: 钉住输出尺寸 ${w}x$h '
-          '(位置 ${position.value}s)',
-        );
-        try {
-          await videoController?.setSize(width: w, height: h);
-        } catch (e) {
-          debugPrint('无视频轨自愈 $attempt/$_kHealAttempts 抛错: $e');
-        }
-        await Future.delayed(_kHealWait);
-        if (_hasVideoTrack) {
-          debugPrint('无视频轨自愈成功: 钉住输出尺寸（第 $attempt 次）');
-          return true;
-        }
-        // 先交还再重来：第一次 render 可能正好落在 mpv 拆完旧输出、新输出
-        // 还没建好的缝里。重来一次不 seek、不重载、不动位置，几乎不要钱。
-        // 只在"还要再来一次"时交还 —— 最后一趟的收尾由下面 finally 负责，
-        // 否则同一个 setSize(null) 会白发两遍，多一次 render 往返。
-        if (attempt < _kHealAttempts) await unpin();
-      }
-      debugPrint('无视频轨自愈失败: 钉住尺寸没能让视频输出起来，交给就地重建');
-    } finally {
-      await unpin();
-      _healingNoVideo = false;
-    }
-    return false;
-  }
-
-  /// 钉尺寸用的尺寸。
-  ///
-  /// 优先取 demuxer 报的轨道尺寸：`track-list/<n>/demux-w` 不依赖视频输出就有效
-  /// （竖屏视频也报得对），而 `video-params` 此刻正是空的 —— 那正是病根。
-  /// 全都读不到就退回 16:9：这一步只求非零，够把死锁松开就行。
-  (int, int) get _nudgeSize {
-    for (var i = 0; i < 4; i++) {
-      final w = int.tryParse(_safeProp('track-list/$i/demux-w')) ?? 0;
-      final h = int.tryParse(_safeProp('track-list/$i/demux-h')) ?? 0;
-      if (w > 0 && h > 0) return (w, h);
-    }
-    return (1920, 1080);
-  }
-
-  // 5484 上线前这里还有两级，线上日志把它们的账算清楚了，别再捡回来：
+  // 5484 上线前这里还有两级（`vid=no` → `auto`、`video-reload`），线上日志把
+  // 它们的账算清楚了，别再捡回来：
   //
   //   1. `vid=no` → `auto`（重挂视频轨）：**不修病，还有声音代价**。它强制
   //      视频轨重挂 → `timeline: refresh seek` → 缓冲从 100% 掉到 0% →
@@ -2054,17 +1994,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   //      videotoolbox-copy。这个 EDL 流 mpv 自己都说了 `Stream is not
   //      seekable`，中途重载视频流就是会丢参考帧。
   //
-  // 而第 3 级（钉尺寸）在那一刻干净地修好了：`VO: [libmpv]` / `reconfig` /
-  // `libmpv_render: Window size` 三行是在它触发时才第一次出现的。
+  // **第 3 级「钉住输出尺寸」也在 2026-10-15 删掉了。** 归档 10 局里 20 次钉尺寸
+  // 只有 1 次真把画面救回来（≈5%），而且第 2 次钉在 Dart 层就被判"尺寸没变"
+  // （`NativeVideoController.setSize` 见值相同直接 `return null`），什么都没发到
+  // 原生、白等 1.2s。它的病因诊断倒是对的 —— 原生 `VideoOutput.setSize` 只把宽高
+  // 存下来、不渲染，渲染只发生在 `_updateCallback` 里，而那次 mpv 压根没回调
+  // （同局健康装载必有 `VO: [libmpv]` + 约 200ms 后 `libmpv_render: Window size:`
+  // 这一对，坏的那次 15.7s 里一条都没有）—— 但"补一发强制渲染"这件事 2026-10-15
+  // 的 fork 补丁（`e88d8416`）实测也没打中：真机上画面最后是**就地重建**救回来的，
+  // 钉尺寸那 2 秒纯属浪费。所以现在定罪之后**直接** [_rebuildRenderContextOnNoVideo]，
+  // 中间不再有任何一档。
   //
-  // 2026-10-15（build 5538）又把机制看清一层：钉尺寸失败**不是因为尺寸不对**，
-  // 而是那一次 mpv **压根没有回调** —— 原生 `VideoOutput.setSize` 只把宽高存下来、
-  // 不渲染；渲染只发生在 `_updateCallback` 里，而那次它一次都没被叫到（同局健康
-  // 装载里 `VO: [libmpv]` + 约 200ms 后的 `libmpv_render: Window size:` 这一对，
-  // 坏的那次 15.7s 里一条都没有；`video-out-params` 一直是空的，app 因此读到
-  // `state.width == 0`）。所以补的**不是再加一个 Dart 侧动作**，而是原生那一发
-  // **强制渲染** —— 补在 fork 那边（`VideoOutput.setSize` 落完尺寸后立刻补一次
-  // `_updateCallback()`）。Dart 侧的分工一个字不变：只管钉尺寸，渲染交给原生。
+  // 原生侧到底能不能救，要靠 fork 的探针回答：它会报出"死锁时那个更新回调有没有
+  // 被叫过"。回调没被叫 ⇒ 原生可以自己主动画一帧撬开；被叫了却还配不上 ⇒ 得从
+  // 别处下手。**在拿到那个答案之前，别再把任何一档加回 Dart 侧。**
 
   /// 解码错误的采样：攒够 [_kDecodeErrorBurst]（**或** [_kDecodeErrorDenseBurst]）
   /// 条就上报一次 [onDecodeError]。
@@ -2230,12 +2173,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           '${_videoPlayerController?.state.height}',
         );
       }
-      // 「无视频轨」自己一档 2s 的节奏。挂在 10s 心跳上要等两拍才敢动手，
-      // 而黑屏是死锁 —— 那 20s 纯粹是对着黑屏干等。
-      if (now.difference(_lastNoVideoProbe) >= _kNoVideoProbe) {
-        _lastNoVideoProbe = now;
-        _checkNoVideoTrack();
-      }
+      // 「无视频轨」是**时间窗**判据（见 [_kNoVideoWindow]），所以 1s 一拍都得看 ——
+      // 少看一拍就是窗口判据白多出来的相位误差。旧的 2s 采样节流因此取消。
+      _checkNoVideoTrack(now);
       if (isLive ||
           dataSource is FileSource ||
           !playerStatus.isPlaying ||
