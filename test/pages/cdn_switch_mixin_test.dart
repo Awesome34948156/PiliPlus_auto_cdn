@@ -1175,6 +1175,9 @@ void main() {
         ..debugNoVideoRebuilds = 0
         ..debugPlayerCount = 1
         ..debugClearRenderReloadListeners()
+        // 强指纹注入缝也还回默认值（null ⇒ 走真实判据）。不还的话，后面用例会
+        // 在别人摆出的强指纹下悄悄走快路。
+        ..debugNoVideoStrongOverride = null
         // `isBuffering` 的初值就是 true（`controller.dart:222`），还回原样。
         ..isBuffering.value = true
         // openNoVideoGates 摆过、又不属于本 group 的字段，同样还回去。
@@ -1197,6 +1200,18 @@ void main() {
         ..onlyPlayAudio.value = false
         ..isLive = false
         ..debugPlayerCount = 1;
+    }
+
+    /// 把"连空几探"的计数与位置记忆一起归零。
+    ///
+    /// 生产里每个 `_noVideoProbes = 0` 的返回点都会顺手清掉位置记忆，测试进程里
+    /// 没有那个复位口 —— 这两样又都是单例字段、跨用例只增不减。用一记"闸门关着"
+    /// 的探针复刻那一步即可：`position.value <= 0` 恰好落在关着的那一侧。不归零
+    /// 的话，前一个用例探过的拍数会记到这一个头上。
+    void resetNoVideoProbe() {
+      pc
+        ..position.value = 0
+        ..debugCheckNoVideoTrack();
     }
 
     test('没有页面认领重载就不许重建：拆了没人把它建回来', () {
@@ -1396,6 +1411,107 @@ void main() {
         reason: '重建期间画面本来就还没起来，不该把这个当成新的死锁：\n${log.text}',
       );
     });
+
+    // ---- 强指纹快路：解码器真起来了就 2 探动手（2026-10-15）----
+
+    test('强指纹 + 位置在推进 → 2 探即认死锁，上报行带 [强指纹]', () async {
+      // 测试进程里没有原生 Player（`_safeProp` 恒空），强指纹永远为假，只能靠注入缝摆。
+      resetNoVideoProbe();
+      openNoVideoGates();
+      pc
+        ..debugNoVideoStrongOverride = (() => true)
+        ..position.value = 100
+        ..debugCheckNoVideoTrack();
+      expect(
+        log.has('无视频轨:'),
+        isFalse,
+        reason: '强指纹也走满 $_kNoVideoProbesFastExpect 探才动手，第 1 探不该报：\n${log.text}',
+      );
+
+      // 第 2 探：位置比上一探大（100 → 101），强指纹成立 → 计数够 $_kNoVideoProbesFastExpect。
+      pc
+        ..position.value = 101
+        ..debugCheckNoVideoTrack();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+        log.has('无视频轨: 音频正常但画面始终为空'),
+        isTrue,
+        reason: '强指纹下 $_kNoVideoProbesFastExpect 探就该报现场：\n${log.text}',
+      );
+      expect(
+        log.has('[强指纹]'),
+        isTrue,
+        reason: '强指纹那条上报行该带 [强指纹] 后缀（基串不变，只加尾巴）：\n${log.text}',
+      );
+    });
+
+    test('弱指纹仍要探满 $_kNoVideoProbesExpect 探：没有证据就不抢跑', () async {
+      resetNoVideoProbe();
+      openNoVideoGates();
+      pc.debugNoVideoStrongOverride = () => false;
+
+      // 前 $_kNoVideoProbesFastExpect 探：位置照常推进，但指纹是弱的 —— 不许报。
+      for (var i = 0; i < _kNoVideoProbesFastExpect; i++) {
+        pc
+          ..position.value = 100 + i
+          ..debugCheckNoVideoTrack();
+      }
+      expect(
+        log.has('无视频轨:'),
+        isFalse,
+        reason: '弱指纹下第 $_kNoVideoProbesFastExpect 探还不该动手：\n${log.text}',
+      );
+
+      // 补满到第 $_kNoVideoProbesExpect 探才该报。
+      for (var i = _kNoVideoProbesFastExpect; i < _kNoVideoProbesExpect; i++) {
+        pc
+          ..position.value = 100 + i
+          ..debugCheckNoVideoTrack();
+      }
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+        log.has('无视频轨: 音频正常但画面始终为空'),
+        isTrue,
+        reason: '弱指纹下要探满 $_kNoVideoProbesExpect 探才报：\n${log.text}',
+      );
+      expect(
+        log.has('[强指纹]'),
+        isFalse,
+        reason: '弱指纹的上报行不带后缀：\n${log.text}',
+      );
+    });
+
+    test('闸门一关就把计数清掉：旧的那一探不记到新一轮头上', () async {
+      resetNoVideoProbe();
+      openNoVideoGates();
+      // 强指纹先走一探（计数到 1，差 1 探就该动手）。
+      pc
+        ..debugNoVideoStrongOverride = (() => true)
+        ..position.value = 100
+        ..debugCheckNoVideoTrack();
+      expect(log.has('无视频轨:'), isFalse, reason: '第 1 探不该报：\n${log.text}');
+
+      // 位置归零 = 走 `position.value <= 0` 那道门 → 计数与位置记忆一起归零。
+      pc
+        ..position.value = 0
+        ..debugCheckNoVideoTrack();
+
+      // 重开闸门，只再探一探。位置取一个必然大于任何旧记忆的值，于是"报不报"
+      // 只由计数决定：计数真被清过 → 停在 1，不报；没清 → 凑满 2 探、误报。
+      openNoVideoGates();
+      pc
+        ..position.value = 200
+        ..debugCheckNoVideoTrack();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+        log.has('无视频轨:'),
+        isFalse,
+        reason: '闸门重置后上一探的账不该接着算（这里会凑满快路 2 探而误报）：\n${log.text}',
+      );
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -1478,9 +1594,11 @@ void main() {
 /// 别跟着生产常量一起改。
 const _kStarveSecondsExpect = 4;
 
-/// 「无视频轨」连空几探才动手（`controller.dart:_kNoVideoProbes`）与重建上限
-/// （`controller.dart:_kNoVideoRebuildMax`）。同上：只用在断言里。
+/// 「无视频轨」连空几探才动手（`controller.dart:_kNoVideoProbes` / 强指纹快路
+/// `controller.dart:_kNoVideoProbesFast`）与重建上限（`controller.dart:_kNoVideoRebuildMax`）。
+/// 同上：只用在断言里。
 const _kNoVideoProbesExpect = 4;
+const _kNoVideoProbesFastExpect = 2;
 const _kNoVideoRebuildMaxExpect = 2;
 
 /// 把触发打进播放器上报口 —— 这就是真实的机制（页面不直接调 mixin 的私有方法）。

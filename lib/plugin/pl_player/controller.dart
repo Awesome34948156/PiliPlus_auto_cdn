@@ -432,6 +432,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 晚到 8 秒。2026-10-11 那次 iOS 黑屏从起播到被探到也远不到 8s。
   static const int _kNoVideoProbes = 4;
 
+  /// 强指纹成立时连空几探就动手（≈4s，[_kNoVideoProbe] × 2）。
+  ///
+  /// 指纹不成立时仍走 [_kNoVideoProbes]：没有"解码器真的开了"这条证据，
+  /// 就没道理拿黑屏时间赌提前动手。见 [_noVideoStrongFingerprint]。
+  static const int _kNoVideoProbesFast = 2;
+
   /// 钉住尺寸后等 mpv 走一次 render 往返再看结果。
   static const Duration _kHealWait = Duration(milliseconds: 1200);
 
@@ -1243,6 +1249,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     danmakuController?.clear();
     // 换了媒体，「音频在、画面不在」的计数与自愈额度都重新来过。
     _noVideoProbes = 0;
+    _lastNoVideoProbePosition = 0;
     _noVideoHealed = false;
     // 重建渲染上下文自己也要走这条路（见 [_runRenderContextRebuild]），别把自己
     // 的额度一起清掉 —— 清了就是"探满 4 → 自愈失败 → 重建 → 探满 4 → …"的无限
@@ -1638,6 +1645,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 连续多少探"音频在、画面不在"。见 [_checkNoVideoTrack]。
   int _noVideoProbes = 0;
 
+  /// 上一探时的播放位置，给"强指纹"加一条"位置真的在推进"的保险
+  /// （见 [_noVideoStrongFingerprint]）。
+  ///
+  /// 与 [_noVideoProbes] 同生共死：每一个把 [_noVideoProbes] 清零的返回点都
+  /// 连着清零这里，`_lastNoVideoProbePosition` 才不会把上一轮的旧账算到新一轮头上。
+  int _lastNoVideoProbePosition = 0;
+
   /// 上一次采样时刻。自带 [_kNoVideoProbe] 的节奏，不等 10s 心跳。
   DateTime _lastNoVideoProbe = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -1689,6 +1703,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 「强指纹」：有把握说"解码器真的起来了"。
+  ///
+  /// 两个都是非空串即成立：`video-codec` 报的是选中的视频编码，`hwdec-current`
+  /// 由空变非空**只有"解码器真的开了"这一种可能**（2026-10-15 真机同局核过：
+  /// 02:40:16 `hwdec 0x0` → 02:40:27 `hwdec videotoolbox`，后者正是死锁现场）。
+  /// 有它垫底，敢用更短的探数（[_kNoVideoProbesFast]）。
+  ///
+  /// **每探重算、不跨探记忆**：第 1 探抽风读到空、第 2 探还能补回来；用粘性累积
+  /// 标志会把一次偶然的非空当成永久结论。
+  bool get _noVideoStrongFingerprint =>
+      debugNoVideoStrongOverride?.call() ??
+      (_safeProp('video-codec').isNotEmpty &&
+          _safeProp('hwdec-current').isNotEmpty);
+
   /// 「只有声音没画面」的现场判据。
   ///
   /// 音频参数正常、视频轨却始终为空 —— 这正是 2026-10-11 那次 iOS 黑屏的形态
@@ -1715,17 +1743,28 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _rebuildingRenderContext ||
         isBuffering.value) {
       _noVideoProbes = 0;
+      _lastNoVideoProbePosition = 0;
       return;
     }
     if (_hasVideoTrack) {
       _noVideoProbes = 0;
+      _lastNoVideoProbePosition = 0;
       return;
     }
-    if (++_noVideoProbes < _kNoVideoProbes) return;
+    // 强指纹每探重算（不跨探记忆），再叠一条"位置真的比上一探大"做双保险
+    // —— 音频在推进本来已由上面 `position.value <= 0` 那道门保证，这里只是
+    // 把"推进"这件事钉在第一手证据上。
+    final strong = _noVideoStrongFingerprint &&
+        position.value > _lastNoVideoProbePosition;
+    _lastNoVideoProbePosition = position.value;
+    if (++_noVideoProbes < (strong ? _kNoVideoProbesFast : _kNoVideoProbes)) {
+      return;
+    }
     debugPrint(
       '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
       'video ${_safeProp('video-codec')} hwdec ${_safeProp('hwdec-current')} '
-      '位置 ${position.value}s)${_noVideoHealed ? ' [本次媒体已自愈过]' : ''}',
+      '位置 ${position.value}s)${_noVideoHealed ? ' [本次媒体已自愈过]' : ''}'
+      '${strong ? ' [强指纹]' : ''}',
     );
     if (!_noVideoHealed) {
       _noVideoHealed = true;
@@ -1830,6 +1869,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   set debugNoVideoHealed(bool value) => _noVideoHealed = value;
 
+  /// 强指纹注入缝。
+  ///
+  /// 测试进程里没有原生 Player ⇒ [_safeProp] 恒返回空串 ⇒ [_noVideoStrongFingerprint]
+  /// 永远为假，快路（[_kNoVideoProbesFast]）根本走不到，也就无从验证。这个缝让
+  /// 用例直接摆强 / 弱指纹。
+  ///
+  /// 默认 `null` ⇒ 走**真实判据**（测试里即弱指纹 4 探），所以现有断言不受影响。
+  @visibleForTesting
+  bool Function()? debugNoVideoStrongOverride;
+
   /// 同上：认领名册只在页面 `dispose()` 里清，测试里没有页面，
   /// 用例里那条 `remove` 又写在断言之后 —— 断言一抛就漏，后面的用例看到非空集合，
   /// 会被连带弄红（看起来像它自己的问题）。
@@ -1886,6 +1935,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _playerTeardown = null;
       }
       _noVideoProbes = 0;
+      _lastNoVideoProbePosition = 0;
       if (_playerCount == 0) {
         return;
       }
@@ -1902,6 +1952,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _ownReload = false;
       _rebuildingRenderContext = false;
       _noVideoProbes = 0;
+      _lastNoVideoProbePosition = 0;
       _resetStallWatchdog();
     }
   }
@@ -2005,6 +2056,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   //
   // 而第 3 级（钉尺寸）在那一刻干净地修好了：`VO: [libmpv]` / `reconfig` /
   // `libmpv_render: Window size` 三行是在它触发时才第一次出现的。
+  //
+  // 2026-10-15（build 5538）又把机制看清一层：钉尺寸失败**不是因为尺寸不对**，
+  // 而是那一次 mpv **压根没有回调** —— 原生 `VideoOutput.setSize` 只把宽高存下来、
+  // 不渲染；渲染只发生在 `_updateCallback` 里，而那次它一次都没被叫到（同局健康
+  // 装载里 `VO: [libmpv]` + 约 200ms 后的 `libmpv_render: Window size:` 这一对，
+  // 坏的那次 15.7s 里一条都没有；`video-out-params` 一直是空的，app 因此读到
+  // `state.width == 0`）。所以补的**不是再加一个 Dart 侧动作**，而是原生那一发
+  // **强制渲染** —— 补在 fork 那边（`VideoOutput.setSize` 落完尺寸后立刻补一次
+  // `_updateCallback()`）。Dart 侧的分工一个字不变：只管钉尺寸，渲染交给原生。
 
   /// 解码错误的采样：攒够 [_kDecodeErrorBurst]（**或** [_kDecodeErrorDenseBurst]）
   /// 条就上报一次 [onDecodeError]。
