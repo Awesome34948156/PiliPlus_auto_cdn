@@ -857,27 +857,41 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
   （2026-10-15 开 mpv verbose 复现时钉死）。
 - **「钉住输出尺寸」这一档已删（2026-10-15）**：归档 10 局共 **20 次**钉尺寸里只真救回 **1 次**
   （**≈5%**）；且第 2 次钉在 Dart 层因「尺寸没变」直接 `return`，**什么都没发出去、白等 1.2s**。
-  现在定罪后**直接**就地重建；原生那发强制渲染改到 fork 的探针那边（不再走这一档）。
-- **fork 探针取证（2026-10-15 起）：`VideoOutput.Probe`**。`pubspec.yaml` 的
-  `media_kit_video` 指向 fork 的 `4c7f4f36`（撤掉 `e88d8416` 的钉尺寸强制渲染，换成只出声的
-  探针）。**Dart 侧不用改** —— fork 的
+  现在定罪后**直接**就地重建，中间无档。（原生那发强制渲染在 `e88d8416` 上试过、**没打中**，
+  `7db339df` 已随探针改常驻一起撤掉 —— 探针现在只观察、绝不改病程。）
+- **fork 常驻探针（2026-10-15 起）：`VideoOutput.Probe`**。`pubspec.yaml` 的
+  `media_kit_video` 指向 fork 的 `7db339df`（上一版 `4c7f4f36`）。**Dart 侧不用改** —— fork 的
   `media_kit_video/lib/src/video_controller/native_video_controller/real.dart:161` 在 switch
   **之前**就 `debugPrint(call.method)` + 参数表，所以日志里会看到**成对的两行**：
-  `VideoOutput.Probe` 和紧跟其后的参数表。**每个 VideoOutput 实例最多 7 条**。
-  - 参数：`src`（`cb` / `watchdog` / `poke`）、`n`＝ `_updateCallback()` 被调用的次数、
-    `rendered`＝ `texture.render(...)` 真正发出的次数、`configured`＝ mpv 是否已配视频输出
-    （读 `video-out-params` 的 dw/dh，**不是** `videoSize`）、`elapsedMs`、`size`、`handle`。
+  `VideoOutput.Probe` 和紧跟其后的参数表。
+  - **`src` 现在是病程阶段**，取值 `start` / `ongoing` / `recover` / `read-blocked` /
+    `read-recovered`（旧的 `cb` / `watchdog` / `poke` 已随看门狗改常驻一起删掉；`poke` 那一发
+    试探渲染**撤了** —— 探针只观察，绝不改变病程）。
+  - 参数：`n`＝ `_updateCallback()` 被调用的次数、`rendered`＝ `texture.render(...)` 真正
+    发出的次数、`configured`＝ mpv 是否已配视频输出（读 `video-out-params` 的 dw/dh，
+    **不是** `videoSize`）、`elapsedMs`（相对实例创建时刻）、`size`、`handle`；另加
+    `mainLagMs`（这条报告从入队到真跑隔了多久）、`quietMs` / `quietSamples`（`start` /
+    `ongoing` / `recover` 带）、`timeoutMs` / `blockedMs`（`read-blocked` / `read-recovered` 带）。
+  - **健康播放整局 0 条，这是设计而非运气**：定罪要同时满足「输出没配上 + 有视频轨在解码
+    + 没暂停 + `n`/`rendered` 连着两拍（≈5s）不涨」四个条件；健康播放 `rendered` 约 9 次/秒，
+    第二拍之前早就翻篇了。**所以"整局一条 `VideoOutput.Probe` 都没有"就是健康的样子**，
+    别当成探针没插上。
   - **要回答的三个问题**：
-    1. **死锁局里 `src:"watchdog"` 那条的 `n` 是 0 还是 >0**。`n == 0` 就是「回调**压根没跑**」
-       的铁证（⇒ 原生侧可以自己补一帧撬开）；`n > 0` 却仍 `configured:false` ⇒ 回调跑过但
-       画不出来，得从别处下手。**这两种情况修法相反**，这就是探针存在的唯一理由。
-    2. **`poke` 那一发 `configured` 有没有翻 true** —— 就是「原生侧一次性补渲染到底能不能救」
-       的答案（只在**第一次** watchdog 报告且 `n==0` 时才发，300ms 后出结果行）。
+    1. **死锁局里 `start` / `ongoing` 那几条的 `n` 是 0 还是 >0**。`n == 0` 就是「回调
+       **压根没跑**」的铁证（⇒ 原生侧可以自己补一帧撬开）；`n > 0` 却仍 `configured:false`
+       ⇒ 回调跑过但画不出来，得从别处下手。**这两种情况修法相反**，这就是探针存在的唯一理由。
+       ⚠️ **但先看 `mainLagMs`**：iOS 侧 mpv 的 update callback 是先 `DispatchQueue.main.async`
+       再进 `VideoOutput.updateCallback()` 的（`TextureHW.swift`），所以 `n` 数的是**那一跳 main**，
+       main 一卡 `n` 就冻结 —— 那种时候的 `n == 0` 是**假结论**。`mainLagMs` 明显偏大就说明是
+       main 卡住，不是 mpv 没回调。
+    2. **有没有 `read-blocked`**：读 mpv 属性要拿核锁，核锁被长持时探针自己也读不动 ——
+       那与「回调没跑」是两回事，单独一行说清楚（超时阈值 1.0s，正常读是微秒级）。
+       `read-recovered` 带回 `blockedMs`，告诉那次卡了多久。
     3. **`size`** —— 黑屏时它应是 `[0.0,0.0]`（还没渲染过）或 1×1 / 上次兜底值。
-  - 健康装载**通常一条探针都不发**（`cb` 探只在"回调进来时还没配上"才发，看门狗一见配上就停），
-    偶尔可能有一两条 `cb`（回调刚到、属性还没落定的那一拍）—— **都不算异常**。
-    所以"整局一条 `VideoOutput.Probe` 都没有"是正常的，**别当成探针没插上**。
-  - ⚠️ `poke` 之后**可能紧跟一条 `src:"cb"`**（那一发渲染把 `n` 从 0 抬到 1）—— 正常，别觉得奇怪。
+  - **一次黑屏的形态**：`start`（连两拍没动静，≈5s）→ `ongoing` 每 5s 一条、**封顶 6 条
+    （≈30s）**，之后静默到 `recover` —— 中后段不缺氧，app 侧 `无视频轨` 本身每 ~2.9s 一行。
+    定罪后采样从 2.5s/拍切到 **0.5s/拍**（`quietSamples` 涨得快就是切了），黑屏前 30 秒的
+    形态看得更清。`recover` 带 `quietMs`＝这次安静了多久。
 
 **1. 重建确实换了渲染上下文**：紧随 `就地重建: 开始` 之后应出现一条**新的**
 `NativeVideoController: Texture ID: <id>`，且 `id` 比上一条**递增**
@@ -1063,9 +1077,10 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
      （Android 那句注释正是这个机制的证词），于是 `_hasVideoTrack`（读 `video-out-params`
      的 w/dw）翻真 —— 画面照样是黑的，判据却不再定罪 ⇒ **就地重建这条唯一的救援路也不触发**
      ⇒ 永久黑屏，只能杀进程。现在这个病是 11s **能自愈**的，换成救不回来的不划算。
-   - ⚠️ **会搅浑取证**：这一版同车上 fork 的 `VideoOutput.Probe`（要回答"死锁时
-     `_updateCallback()` 到底有没有被叫过"）。若 `force-window` 真把竞态压住了，这一局就
-     不复现死锁，探针存在的唯一理由也随之落空。
+   - ⚠️ **会搅浑取证**：这一版同车上 fork 的常驻 `VideoOutput.Probe`（要回答"死锁时
+     `_updateCallback()` 到底有没有被叫过"，见上文那条）。若 `force-window` 真把竞态压住了，
+     这一局就**不复现死锁** ⇒ 探针按设计整局 0 行，**"压住了"和"探针没插上"在日志里长得一样**，
+     探针存在的唯一理由也随之落空。
    - **顺序**：先拿探针的证据，再单独出包试它。真试的时候，判读方法是：开 mpv verbose 取日志，
      看那对 `VO: [libmpv] …` → 约 200ms 后 `libmpv_render: Window size: …` 是否**装载时
      就出现**（健康装载必有一对，坏的那次两条都没有）；再**连跑 ~20 次装载**看是否一次都不缺。
