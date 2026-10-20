@@ -30,7 +30,7 @@ enum CDNService {
   ///
   ///   - `upos-sz-mirrorakam.akamaized.net` —— 注意兄弟条目 `akamai` 的
   ///     `upos-hz-mirrorakam.akamaized.net` 是**正常解析**的（它的问题是换
-  ///     host 之后 403，那另外有 `_kCdnDeadRetryAfter` 管）；
+  ///     host 之后 403，那另外有 `CdnTuning.deadRetryAfter` 管）；
   ///   - `upos-sz-mirrorhwov.bilivideo.com` —— CNAME 指向
   ///     `…0979c69f.cdnhwcgqa21.com`，而那个目标没有 A 记录。
   ///

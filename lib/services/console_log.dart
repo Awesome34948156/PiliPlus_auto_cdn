@@ -109,15 +109,15 @@ File? get consoleLogFile => _consoleLogFile;
 /// 给一行日志盖上 `HH:mm:ss.SSS`。
 ///
 /// 这个模块存在的理由是**事后**查故障，而自动换源的一半判据是时间窗判据 ——
-/// 「6 秒内 12 条算风暴」（`_kDecodeErrorBurst` / `_kDecodeErrorWindow`）、
-/// 「5ms 内算同一个坏包」（`_kDecodeLineDedupe`）、「换源后 ≥8s 没新报错才算
-/// 恢复」（`_kCdnDecodeRecoverGrace` + `_kCdnDecodeCleanWindow`）。没有逐行时刻，
+/// 「6 秒内 12 条算风暴」（`PlayerTuning.decodeErrorBurst` / `PlayerTuning.decodeErrorWindow`）、
+/// 「5ms 内算同一个坏包」（`PlayerTuning.decodeLineDedupe`）、「换源后 ≥8s 没新报错才算
+/// 恢复」（`CdnTuning.decodeRecoverGrace` + `CdnTuning.decodeCleanWindow`）。没有逐行时刻，
 /// 日志只回答得了「发生过没有」，回答不了「够不够密」；而 mpv 落在日志里的原文
 /// **一个时刻都不带**（`mpv [error] ffmpeg/video: av1: obu_forbidden_bit out of
 /// range: 1, ...`），`awk '{print $2}'` 取到的是 `[error]` 而不是秒。2026-10-11
 /// 加：真机上要判「12 条 / 6s 这道门槛到底够不够得着」，只能靠它。
 ///
-/// 毫秒必须留着 —— `_kDecodeLineDedupe` 是 5ms。多行消息**逐行**盖戳，保证
+/// 毫秒必须留着 —— `PlayerTuning.decodeLineDedupe` 是 5ms。多行消息**逐行**盖戳，保证
 /// 文件里每条物理行都带戳，事后拿 grep/awk 处理时不用先猜哪行有哪行没有。
 String _stamp(String message) {
   final t = DateTime.now();

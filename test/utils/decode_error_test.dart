@@ -260,7 +260,7 @@ void main() {
 
     test('会话失效那一档用的是 6 条 / 3 秒，不是 12 条 / 6 秒', () {
       // 两个采样器共用这个纯函数，只是传进来的窗口和门槛不同（会话失效那一档见
-      // PlPlayerController._kSessionFailBurst / _kSessionFailWindow）。实测那一场
+      // PlPlayerController.PlayerTuning.sessionFailBurst / PlayerTuning.sessionFailWindow）。实测那一场
       // 是 0.881 秒 26 条，6 条 / 3 秒有 4 倍余量 —— 而单条 `invalid session`
       // 在 seek / 拆链的缝隙里也会冒出来，所以门槛不能低到一条就动手。
       final hits = <DateTime>[];
@@ -299,9 +299,9 @@ void main() {
   });
 
   group('密集档：不去重，抓稀疏档数不到的短促爆发', () {
-    // 稀疏档的三个数（PlPlayerController._kDecodeErrorBurst / _kDecodeErrorWindow
-    // / _kDecodeLineDedupe）与密集档的两个数（_kDecodeErrorDenseBurst /
-    // _kDecodeErrorDenseWindow）。两档喂的是同一个纯函数，只是参数不同。
+    // 稀疏档的三个数（PlPlayerController.PlayerTuning.decodeErrorBurst / PlayerTuning.decodeErrorWindow
+    // / PlayerTuning.decodeLineDedupe）与密集档的两个数（PlayerTuning.decodeErrorDenseBurst /
+    // PlayerTuning.decodeErrorDenseWindow）。两档喂的是同一个纯函数，只是参数不同。
     const sparseWindow = Duration(seconds: 6);
     const sparseBurst = 12;
     const dedupe = Duration(milliseconds: 5);

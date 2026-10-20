@@ -27,6 +27,7 @@ import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
+import 'package:PiliPlus/plugin/pl_player/player_tuning.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/danmaku_options.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/services/console_log.dart';
@@ -113,7 +114,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 遥测是否已经失真：前方余量离谱地大于 mpv 的缓存上限。
   ///
-  /// 判据见 [_kDivergedFactor]。这是"只有声音、画面冻住"唯一可靠的信号 ——
+  /// 判据见 [PlayerTuning.divergedFactor]。这是"只有声音、画面冻住"唯一可靠的信号 ——
   /// 那时位置由音频时钟推着走、[buffered] 被音频轨抬到上千秒、[isBuffering]
   /// 是假，判据 1、2 都看不见，判据 3 的"趴在低位"也只防了反的一侧。
   bool get telemetryDiverged {
@@ -225,7 +226,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 这一事实，如何恢复由页面决定。每段冻结只触发一次。
   ValueChanged<Duration>? onStall;
 
-  /// 缓冲饥饿回调：播放中前向缓冲 [buffered] 连续 [_kStarveSeconds] 秒低于
+  /// 缓冲饥饿回调：播放中前向缓冲 [buffered] 连续 [PlayerTuning.starveSeconds] 秒低于
   /// 饥饿阈值时上报一次。与 [onStall] 互补——"画面冻住但音频在走"这种换源型
   /// 故障不会让 buffered 归零（mpv 有 cache-secs 打底），位置又一直在推进，
   /// 两种卡顿判据都看不到，只有缓冲余量在悄悄变少。
@@ -236,7 +237,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 但页面侧的处置完全不同，见那个字段。
   ValueChanged<Duration>? onBufferStarve;
 
-  /// 遥测失真回调：前方余量**离谱地大**（见 [_kDivergedFactor]），音视频两轨的
+  /// 遥测失真回调：前方余量**离谱地大**（见 [PlayerTuning.divergedFactor]），音视频两轨的
   /// 时间轴已经分家——"只有声音、画面冻住"最可靠的那条信号。只防低的一侧会让
   /// 画面冻着而判据 1、2 同时失明，实测就是这样。
   ///
@@ -247,13 +248,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// [onBufferStarve] 不该拿：2026-10-12 真机上，一次跟它无关的尝试留下 60s
   /// 放弃冷却，把三次失真上报吞掉两次，画面多冻了 61 秒。
   ///
-  /// 去重与补报跟 [onBufferStarve] **共用**一套状态（见 [_kStarveRepeat]）：两支
+  /// 去重与补报跟 [onBufferStarve] **共用**一套状态（见 [PlayerTuning.starveRepeat]）：两支
   /// 说的是同一段"没在正常播放"，分开计时只会让复位点翻倍。
   ValueChanged<Duration>? onTelemetryDiverged;
 
   /// 最敏感的一条：前向余量**一归零**就上报一次（每次归零只报一次，补回来
   /// 才重新武装）。前三条判据都要等 —— [onStall] 等 8 秒冻结、[_sampleRebuffer]
-  /// 攒够 [_kRebufferTrigger] 次、[onBufferStarve] 连续 [_kStarveSeconds] 秒低于
+  /// 攒够 [PlayerTuning.rebufferTrigger] 次、[onBufferStarve] 连续 [PlayerTuning.starveSeconds] 秒低于
   /// 阈值 —— 而"卡一下又接着播"这种小卡顿一条都凑不满，等凑满时用户已经看了
   /// 半分钟转圈。这里只报事实，节流与"要不要真去测速"由页面决定（测速会跟
   /// 播放器抢带宽，不能由播放器自己决定）。
@@ -267,7 +268,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 前四条判据看的全是"供得上供不上"（位置、缓冲、余量），而镜像把坏字节送
   /// 进来时这四样**全是健康的** —— 吞吐 3MB/s、余量 27s、位置在推进、hwdec
   /// 正常，画面却冻在最后一帧。2026-10-11 手机上那一局就是这样，而 mpv 同时
-  /// 刷了 **524 行**解码报错（全挤在 44 毫秒里，档案 log 4）。判据见 [_kDecodeErrorBurst]。
+  /// 刷了 **524 行**解码报错（全挤在 44 毫秒里，档案 log 4）。判据见 [PlayerTuning.decodeErrorBurst]。
   ///
   /// 与其他回调一样只上报事实：怎么恢复（换源、要不要绕过那套"必须明显更快
   /// 才值得重载"的门槛）由页面决定。
@@ -283,191 +284,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// `onTelemetryDiverged`/`onRebuffer`）仍是 [ValueChanged]。
   bool Function(Duration)? onDecodeError;
 
-  /// 位置连续冻结多少秒才算卡顿。普通重新缓冲一般 1~3 秒。
-  static const int _kStallSeconds = 8;
-
-  /// 短卡顿计数：窗口内"缓冲归零"的上升沿达到阈值同样判定为卡顿。
-  /// 长冻结看门狗看不到"播放 3 秒卡 5 秒"这种反复小卡顿——它只累计连续冻结
-  /// 秒数，位置一恢复就清零，永远到不了 [_kStallSeconds]。
-  static const int _kRebufferTrigger = 3;
-  static const Duration _kRebufferWindow = Duration(seconds: 60);
-
-  /// 加载/换源后的静默期。刚开始缓冲时 `buffered` 本来就是 0，
-  /// 不静默的话每次开播都会白记一次。
-  static const Duration _kRebufferSuppress = Duration(seconds: 8);
-
-  /// 解码错误风暴：这么短的时间内攒够这么多条解码报错，就认定这段流已经解不
-  /// 出画面了。
-  ///
-  /// 数的是**去重后**的条数（同包在 `av1:` / `libdav1d:` / `NULL:` 层的重复行，
-  /// 以及 `mpv [error] ffmpeg:` 与 `mpv error:` 两条路径的重复行，都按
-  /// [_kDecodeLineDedupe] 合并），不是原始行数 —— 换算比由爆发有多密决定，
-  /// **不是固定的 3:1**。实测依据（档案 log 4 / log 7，2026-10-12 复核）：
-  /// log 4 的 524 行全挤在 44 毫秒里、去重后**只剩 9 条**（够不到 12）；
-  /// log 7 的 58 行横跨 2.4 秒、去重后 6 秒窗内峰值 **17 条**（够得到，余量
-  /// 1.42×，首次达标 13:56:11.600）。所以这一档**不是够不到的死代码**。
-  ///
-  /// 12 条 / 6 秒是照着实测的两组数字卡在中间的：正常播放里解码器是**哑的**
-  /// （那局日志里 8 个视频、二十多分钟，一条解码报错都没有），换集/seek 边界上
-  /// 会冒 1~2 条（`Invalid NAL unit size` 那种，单个损坏的 GOP，几秒后自己就过
-  /// 去了），而坏镜像的指纹是**成百行不停地刷**。两者差一个数量级，门槛落在中间
-  /// 既不会漏报也不会被边界噪音打穿。
-  ///
-  /// ⚠️ 这一档管的是**横跨数秒**的风暴。挤在百毫秒里那种（log 4 就是）它够不到
-  /// ——44 毫秒里只数得出 9 条，且放宽窗口也无用（整段就 44ms）—— 那一段由
-  /// [_kDecodeErrorDenseBurst]（20 行 / 100ms、不去重）兜。两档任一成立即上报。
-  static const int _kDecodeErrorBurst = 12;
-
-  /// 上面那 12 条的统计窗口。风暴是"持续"的，用固定窗口而不是累计计数：累计
-  /// 计数会让一次长时间的偶发报错（每个视频一两条）早晚凑够阈值，而窗口只在
-  /// "短时间内密集发生"时才成立。
-  static const Duration _kDecodeErrorWindow = Duration(seconds: 6);
-
-  /// 报过一次之后隔多久才允许**再报**（计数不受它影响，见 [_sampleDecodeError]）。
-  ///
-  /// 一轮换源要重载播放器，重载期间旧流的日志还在往外吐（解码器在把已经读进
-  /// 来的字节消化完），不压住的话一次故障会连触发好几轮换源。取 30s：比
-  /// 一轮换源（实测 5~10s）长得多，又比 CDN 那边放弃后的冷却（60s）短，于是
-  /// 换到坏镜像上时还能再挣扎一次。
-  static const Duration _kDecodeErrorCooldown = Duration(seconds: 30);
-
-  /// 页面在途轮次收不下解码风暴时的**退避**：这一发记成"稍后重报"，而不是等满
-  /// [_kDecodeErrorCooldown]（30s）。缩短是有意的 —— 在途轮次通常几秒到几十秒就收尾。
-  /// 但也不立即解锁：拒收期间坏字节可能每秒几十条，不给下限就会刷屏（见
-  /// [_sampleDecodeError] 的回执分支）。
-  static const _kDecodeErrorRetryBackoff = Duration(seconds: 2);
-
-  /// 同一个坏包在 ffmpeg 的不同层会各记一行（`av1:` / `libdav1d:` / `NULL:`），
-  /// 三行的时刻几乎相同。不合并的话 [_kDecodeErrorBurst] 的 12 条门槛实际只等于
-  /// 4 个坏包。记下一条之后，这么短时间内再来的都算同一个包，不再计入。
-  /// 取 5ms：三层会跨毫秒边界，同毫秒太紧。
-  static const Duration _kDecodeLineDedupe = Duration(milliseconds: 5);
-
-  /// 密集突发档：这么短的窗口里攒够这么多**原始行**就上报 —— **不做同包去重**，
-  /// 这正是它存在的理由。
-  ///
-  /// 为什么需要第二个档：上面那条去重把命中率封在 1/[`_kDecodeLineDedupe`]，
-  /// 于是 [_kDecodeErrorBurst] 的 12 条需要**至少 55ms 的跨度**。比这更密的爆发
-  /// 反而数不满 —— 2026-10-11 实测那一场（日志 4，`22:53:59.334` → `.378`）
-  /// **260 条坏字节挤在 44 毫秒里**，去重后只攒到 9 条，`解码错误风暴` 一条都
-  /// 没出，而 44ms 之后风暴就结束了、窗口空着等 6 秒过期。**越密越看不见**，
-  /// 是纯结构性盲区（条目 17）。
-  ///
-  /// 20 行 / 100ms 是照着"一个坏包在 ffmpeg 各层报 2~3 行"折算的：约等于
-  /// 7~10 个坏包挤在 100ms 里。那场实测是 260 条，13 倍余量；反例侧同样宽 ——
-  /// 换集 / seek 边界上的单个损坏 GOP 只有 1~2 行，差一个数量级。
-  ///
-  /// **只加给坏字节这一族。** 会话失效那一族不能加：我们自己的 `video-reload`
-  /// 事故（见 [_rebuildRenderContextOnNoVideo] 上方那段墓碑注释）刷的 92 行里
-  /// 就有 `invalid session`，加进来会把"镜像给的字节"和"本机解码器"两个相反的
-  /// 结论搅在一起。
-  static const int _kDecodeErrorDenseBurst = 20;
-
-  /// 上面那 20 行的窗口。要的是"挤在一起"而不是"跨得够久"：比稀疏档数不满的
-  /// 最短跨度（55ms）宽近一倍，又短到不会把"慢慢刷"算进来。
-  static const Duration _kDecodeErrorDenseWindow = Duration(milliseconds: 100);
-
-  /// 硬解会话失效：这么短的时间内攒够这么多条「本机解码会话废了」的报错，就重建
-  /// 解码器。判据见 [isDecoderSessionFailureLog]。
-  ///
-  /// 6 条 / 3 秒是照着实测那一场卡的：0.881 秒里 26 条（会话层那两条，
-  /// `invalid session` ×1 + `output image buffer is null` ×25）—— 4 倍余量。
-  /// 不能只认单条：单条 `invalid session` 在 seek / 拆链的缝隙里也可能冒出来，
-  /// 那时候重建是白扔一整个缓冲。
-  static const int _kSessionFailBurst = 6;
-
-  /// 上面那 6 条的统计窗口。同 [_kDecodeErrorWindow]：要的是"短时间内密集"，
-  /// 不是"累计"。
-  static const Duration _kSessionFailWindow = Duration(seconds: 3);
-
-  /// 重建过一次之后隔多久才允许再重建。一轮重建要重开播放器、缓冲从头攒
-  /// （1~3 秒卡顿），不压住的话一次会话失效会连着重建好几轮。取 30s，与
-  /// [_kDecodeErrorCooldown] 同量级。
-  static const Duration _kSessionFailCooldown = Duration(seconds: 30);
-
-  /// 让位窗：距最近一条**坏字节**报错（[lastDecoderCorruptionAt]）不到这么久，
-  /// 就不把会话失效当回事 —— 那说明真正发生的是"镜像喂了坏字节"，该走换源。
-  ///
-  /// 两族在同一场故障里可能交错出现（坏字节同样会让硬解拿不到输出缓冲），少了
-  /// 这一条就会一边换源一边重建解码器，两个动作互相拆台。取 2s：坏字节是**成百行
-  /// 不停地刷**的（实测档案 log 7：58 行横跨 2.4 秒；log 4：524 行挤在 44 毫秒里），
-  /// 风暴期内 2 秒内必有新的一条续上。
-  static const Duration _kSessionFailDeferBadBytes = Duration(seconds: 2);
-
-  /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
-  /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
-  /// 后停读，等掉回水位才续读，所以健康播放的锯齿在
-  /// `[cache-secs, demuxer-hysteresis-secs]` 之间摆动、从来不会接近 0。
-  /// 取 0.6 即 `cache-secs * 0.4`，比锯齿下沿还低 40%，健康播放碰不到。
-  static const double _kStarveFloorFraction = 0.6;
-
-  /// 连续多少个 1s 采样低于阈值才算饥饿。健康锯齿只在谷底停留一两拍。
-  static const int _kStarveSeconds = 4;
-
-  /// 一段饥饿**持续**期间，每隔多久补报一次 [onBufferStarve]（以及 [onTelemetryDiverged]，
-  /// 两支共用这一份节奏和去重状态）。
-  ///
-  /// 判据 3 原来是"一段饥饿只报一次"，而"这段饥饿结束"的判据是余量涨回 mpv
-  /// 自己的水位（见 [_sampleStarve] 末尾）—— 镜像持续供不上（或像 2026-10-12
-  /// 那次一样持续喂坏字节）时余量一直趴在低位，那段饥饿**永远不会结束**，
-  /// 于是那一次上报就是最后一次：那次唯一的 `缓冲饥饿` 上报被页面侧的放弃冷却
-  /// 吞掉之后，后面 52 秒再没有任何信号，只能等 2 分钟定期档兜底。
-  ///
-  /// 补报没有改"这段饥饿报过没有"的语义，只是把它变成"每 [_kStarveRepeat]
-  /// 报一次"。页面侧那几道冷却（20s 无法测出 / 30s 小卡顿 / 60s 放弃）本来就是
-  /// "现在别动"的判决，两边节奏相当，重复的上报会被它们照旧吃掉 —— 这本该如此：
-  /// 播放器只管让"还在饿"这件事**持续可见**，切不切由页面判。
-  static const Duration _kStarveRepeat = Duration(seconds: 20);
-
-  /// 看门狗心跳间隔。三条判据都只在出事时才出声，没有心跳就无法区分
-  /// "一切正常"和"看门狗根本没跑"——两者留下的日志一模一样。
-  static const int _kHeartbeatSeconds = 10;
-
-  /// 「闸门全开 + 画面为空」要**连续**攒满这么久，才认定是死锁。
-  ///
-  /// 判据从"数几探"换成了"时间窗"：ticker 1s 一拍、每拍都来看一眼，这段状态只要
-  /// 没被打断（某道门成立、或 [_hasVideoTrack] 翻真）窗口就一直开着。
-  /// 旧判据的死穴是采样节奏与装载时刻相位随机 —— 真机实测"2 探"花了 7.16s、
-  /// "4 探"10.9s（2026-10-15），而"播放已经跑起来之后画面还空着"这件事与探了几拍
-  /// 无关。
-  ///
-  /// **为什么是 3s 而不是更短**：它必须**严格超过健康装载的最晚值**。两局共 32 次
-  /// 装载实测「选流 → mpv 配上视频输出」= 0.54~2.22s，而窗口是从"闸门开"起算的，
-  /// 闸门开必然晚于选流 ⇒ 3s 的窗对任何健康装载都不可能误报（余量 ≥0.78s）。
-  /// 这一条同时管住了"重建之后立刻再定罪"：重载一次 = 一次新选流，同样落在 2.22s 内。
-  /// 所以本文件**不需要**再加"两次重建之间至少隔多久"的冷却 —— 窗口长度本身就是
-  /// 那个冷却。若把窗降到 1.5s（≈2 拍），就**必须**另加冷却，否则第一次重建刚落地
-  /// 就会烧掉第二次额度。
-  static const Duration _kNoVideoWindow = Duration(seconds: 3);
-
-  /// 没有"解码器真的开了"这条证据时（[_noVideoStrongFingerprint] 不成立）的窗口。
-  ///
-  /// 比 [_kNoVideoWindow] 长，是为了放过另一族病：**视频轨饿死**（视频轨那条 URL
-  /// 坏了、压根没有帧）。它的形状与输出死锁一模一样（音频在走、画面恒空），但正解是
-  /// 换源，不是拆播放器 —— 而它的指纹通常就是弱的（解码器起不来 ⇒ `hwdec-current`
-  /// 空）。这一档取 8s ≈ 旧弱指纹路的量级（4 探 × 真机 2.86s/探），等于"没有证据就
-  /// 不抢跑"。
-  static const Duration _kNoVideoWindowWeak = Duration(seconds: 8);
-
-  /// 一种媒体最多就地重建几次渲染上下文。
-  ///
-  /// 第一次可能正好撞上 mpv 拆旧/建新的缝，第二次几乎不要钱；再多就是拿黑屏时间换
-  /// 递减的收益（每次重建 ≈ 旧 player dispose 2s + 重载 1~3s）。用完之后回到老出路：
-  /// 用户手动退出视频页再进来。
-  static const int _kNoVideoRebuildMax = 2;
-
-  /// 阈值低于这个秒数就不再启用：回填水位太浅，没有可观测的余量。
-  static const double _kStarveMinSeconds = 4.0;
-
-  /// 余量超过 mpv 缓存上限 `cache-secs` 的这么多倍，就认为遥测已经失真。
-  ///
-  /// 健康播放的锯齿在 `[demuxer-hysteresis-secs, cache-secs]` 之间摆动，永远
-  /// 到不了 2 倍。而"只有声音、画面冻住"时音频轨的读指针还在推进，
-  /// `demuxer-cache-time` 被音频一路抬到上千秒，于是余量涨成上限的几十倍 ——
-  /// **离谱地大**本身就是故障指纹，跟判据 3 的"趴在低位"是同一个故障的两副
-  /// 面孔 —— 但页面侧的处置完全不同（一个换源就够，一个只有重开连接才治），
-  /// 所以走 [onTelemetryDiverged]，不跟"趴在低位"共用 [onBufferStarve]。
-  static const double _kDivergedFactor = 3.0;
 
   Timer? _stallTicker;
   int _stallLastSecond = 0;
@@ -482,18 +298,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 当前这段饥饿的最后一次上报时刻；null = 没有正在上报的饥饿段。
   ///
   /// 兼作去重状态：非空即"这段已经报过"，只有余量真的涨回水位才清空（见
-  /// [_sampleStarve]）。存时刻而不是 bool 是为了补报 —— 见 [_kStarveRepeat]。
+  /// [_sampleStarve]）。存时刻而不是 bool 是为了补报 —— 见 [PlayerTuning.starveRepeat]。
   DateTime? _starveLastReportAt;
   DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// 落在 [_kDecodeErrorWindow] 里的解码报错时刻，窗口自己滑动淘汰。
+  /// 落在 [PlayerTuning.decodeErrorWindow] 里的解码报错时刻，窗口自己滑动淘汰。
   ///
   /// 刻意**不随每次装载清零**：换源重载期间旧流还在往外吐报错，那些报错说明的
   /// 正是刚才那段字节是坏的，必须继续记账（见 [_sampleDecodeError]）。只在
   /// 播放器创建（[_startListeners]）和换集/换画质（[resetDecodeErrorAccounting]）时清。
   final List<DateTime> _decodeErrors = [];
 
-  /// 落在 [_kDecodeErrorDenseWindow] 里的坏字节**原始行**时刻（不去重）。
+  /// 落在 [PlayerTuning.decodeErrorDenseWindow] 里的坏字节**原始行**时刻（不去重）。
   ///
   /// 和 [_decodeErrors] 同一族、同一个病，只是数法不同：那个去重、这个不去重。
   /// 窗口只有 100ms，所以它常年只装十几条 —— 为它单开一个 list 换来的好处是
@@ -501,21 +317,21 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 清零时机与 [_decodeErrors] 完全相同。
   final List<DateTime> _decodeErrorDense = [];
 
-  /// 解码错误风暴的静默期截止时刻。见 [_kDecodeErrorCooldown]。
+  /// 解码错误风暴的静默期截止时刻。见 [PlayerTuning.decodeErrorCooldown]。
   DateTime _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// 最近一条解码器坏字节报错的时刻，**不受 [_kDecodeErrorCooldown] 限制**。
+  /// 最近一条解码器坏字节报错的时刻，**不受 [PlayerTuning.decodeErrorCooldown] 限制**。
   ///
   /// [CdnSwitchMixin] 换源后用它判断"这条镜像已经干净了"：坏镜像的特征恰恰是
   /// 缓冲填得满、位置还在被音频时钟推着走，所以位置和余量都判不出恢复，只有
   /// "不再吐坏字节"才是真话。
   DateTime? lastDecoderCorruptionAt;
 
-  /// 落在 [_kSessionFailWindow] 里的「本机解码会话废了」的报错时刻，窗口自己滑动
+  /// 落在 [PlayerTuning.sessionFailWindow] 里的「本机解码会话废了」的报错时刻，窗口自己滑动
   /// 淘汰。与 [_decodeErrors] 分开记账：两族的窗口、门槛、以及**该做的事**都不同。
   final List<DateTime> _sessionFailures = [];
 
-  /// 重建解码器的冷却截止时刻。见 [_kSessionFailCooldown]。
+  /// 重建解码器的冷却截止时刻。见 [PlayerTuning.sessionFailCooldown]。
   DateTime _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 换集 / 换画质：换成了**另一个对象**，旧的解码账作废重计。
@@ -1694,7 +1510,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// （见 [_noVideoStrongFingerprint]）。
   ///
   /// 位置冻住**不关窗**（旧弱指纹路本来也不看位置），只是让强指纹不成立 ⇒ 这次定罪
-  /// 自动落到 [_kNoVideoWindowWeak] 那档、上报行也不带 ` [强指纹]` 后缀。别改成
+  /// 自动落到 [PlayerTuning.noVideoWindowWeak] 那档、上报行也不带 ` [强指纹]` 后缀。别改成
   /// "冻住就关窗"：位置冻住 + 不在缓冲正是卡顿看门狗抓不到的盲区（它的判据要
   /// `isBuffering && bufferedAhead == 0`），那样会静默地收窄这张网。
   int _noVideoLastPosition = 0;
@@ -1706,7 +1522,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   /// 本媒体已经就地重建过几次渲染上下文。每换一次媒体在 [_createVideoController]
-  /// 里重置（但**绕开**自己那次重建，理由见那里）。见 [_kNoVideoRebuildMax]。
+  /// 里重置（但**绕开**自己那次重建，理由见那里）。见 [PlayerTuning.noVideoRebuildMax]。
   int _noVideoRebuilds = 0;
 
   /// 渲染上下文正在拆旧重建（里面有 await，采样回调可能重入）。
@@ -1751,7 +1567,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 两个都是非空串即成立：`video-codec` 报的是选中的视频编码，`hwdec-current`
   /// 由空变非空**只有"解码器真的开了"这一种可能**（2026-10-15 真机同局核过：
   /// 02:40:16 `hwdec 0x0` → 02:40:27 `hwdec videotoolbox`，后者正是死锁现场）。
-  /// 有它垫底，才敢用短窗那一档（[_kNoVideoWindow]）。
+  /// 有它垫底，才敢用短窗那一档（[PlayerTuning.noVideoWindow]）。
   ///
   /// **每拍重算、不跨拍记忆**：第 1 拍抽风读到空、第 2 拍还能补回来；用粘性累积
   /// 标志会把一次偶然的非空当成永久结论。
@@ -1770,7 +1586,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// （别拿 `mpv_render_context_render() not being called or stuck.` 当判据：
   /// 正常播放的每一段里都有它，只是排队晚了一点点。）
   ///
-  /// 判据是**时间窗**（见 [_kNoVideoWindow]），不再数探数：视频参数本来就比音频
+  /// 判据是**时间窗**（见 [PlayerTuning.noVideoWindow]），不再数探数：视频参数本来就比音频
   /// 晚到，所以 seek / 换源 / 重新缓冲这三个"参数本来就该是空的"窗口必须显式放过，
   /// 否则会把自己的动作当成死锁。定罪之后**直接**走 [_rebuildRenderContextOnNoVideo]
   /// —— 中间那一档「钉住输出尺寸」2026-10-15 已删（见 [_rebuildRenderContextOnNoVideo]
@@ -1807,12 +1623,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _noVideoStrongFingerprint && position.value > _noVideoLastPosition;
     _noVideoLastPosition = position.value;
     if (now.difference(start) <
-        (strong ? _kNoVideoWindow : _kNoVideoWindowWeak)) {
+        (strong ? PlayerTuning.noVideoWindow : PlayerTuning.noVideoWindowWeak)) {
       return;
     }
     // 重新开窗：下一次定罪要再攒满一个窗口。额度用尽之后就靠这个节奏在日志里
     // 留痕（每窗一行）。**这里不需要"距上次重建至少隔多久"的冷却** —— 窗口长度
-    // 本身就是那个冷却，理由见 [_kNoVideoWindow]。
+    // 本身就是那个冷却，理由见 [PlayerTuning.noVideoWindow]。
     _noVideoWindowStart = now;
     debugPrint(
       '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
@@ -1845,7 +1661,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_rebuildingRenderContext) {
       return '已在重建';
     }
-    if (_noVideoRebuilds >= _kNoVideoRebuildMax) {
+    if (_noVideoRebuilds >= PlayerTuning.noVideoRebuildMax) {
       return '本媒体已重建 $_noVideoRebuilds 次';
     }
     // 「没有认领者」排在"共用者"之前：否则 `_playerCount == 1` 而没有认领者时，下面那条
@@ -1911,10 +1727,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 强指纹注入缝。
   ///
   /// 测试进程里没有原生 Player ⇒ [_safeProp] 恒返回空串 ⇒ [_noVideoStrongFingerprint]
-  /// 永远为假，短窗（[_kNoVideoWindow]）根本走不到，也就无从验证。这个缝让用例
+  /// 永远为假，短窗（[PlayerTuning.noVideoWindow]）根本走不到，也就无从验证。这个缝让用例
   /// 直接摆强 / 弱指纹。
   ///
-  /// 默认 `null` ⇒ 走**真实判据**（测试里即弱指纹 ⇒ 长窗 [_kNoVideoWindowWeak]）。
+  /// 默认 `null` ⇒ 走**真实判据**（测试里即弱指纹 ⇒ 长窗 [PlayerTuning.noVideoWindowWeak]）。
   @visibleForTesting
   bool Function()? debugNoVideoStrongOverride;
 
@@ -1953,7 +1769,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> _runRenderContextRebuild() async {
     _rebuildingRenderContext = true;
     _noVideoRebuilds++;
-    debugPrint('就地重建: 开始（第 $_noVideoRebuilds/$_kNoVideoRebuildMax 次）');
+    debugPrint('就地重建: 开始（第 $_noVideoRebuilds/${PlayerTuning.noVideoRebuildMax} 次）');
     try {
       // 次序不可换：_removeListeners 先跑（取消 ticker + 把 _subscriptions 置
       // null，否则 _startListeners 的 assert 会炸、旧订阅也会泄漏），两个字段
@@ -2033,7 +1849,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   // 被叫过"。回调没被叫 ⇒ 原生可以自己主动画一帧撬开；被叫了却还配不上 ⇒ 得从
   // 别处下手。**在拿到那个答案之前，别再把任何一档加回 Dart 侧。**
 
-  /// 解码错误的采样：攒够 [_kDecodeErrorBurst]（**或** [_kDecodeErrorDenseBurst]）
+  /// 解码错误的采样：攒够 [PlayerTuning.decodeErrorBurst]（**或** [PlayerTuning.decodeErrorDenseBurst]）
   /// 条就上报一次 [onDecodeError]。
   ///
   /// 和另外三条采样不同，它不由 [_startStallTicker] 的心跳驱动，而是被
@@ -2042,11 +1858,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///
   /// **两个档，任一满足即上报**：量的是同一个病、走的也是同一个动作。
   ///
-  /// - 稀疏档：[_kDecodeErrorBurst] 条 / [_kDecodeErrorWindow]，含同包去重 ——
+  /// - 稀疏档：[PlayerTuning.decodeErrorBurst] 条 / [PlayerTuning.decodeErrorWindow]，含同包去重 ——
   ///   抓"成百条不停地刷"那种持续风暴。
-  /// - 密集档：[_kDecodeErrorDenseBurst] 行 / [_kDecodeErrorDenseWindow]，
+  /// - 密集档：[PlayerTuning.decodeErrorDenseBurst] 行 / [PlayerTuning.decodeErrorDenseWindow]，
   ///   **不去重** —— 抓"几十毫秒里挤了几百条"那种短促爆发，也就是去重会把它们
-  ///   整段数没的那一档（来由见 [_kDecodeErrorDenseBurst]）。
+  ///   整段数没的那一档（来由见 [PlayerTuning.decodeErrorDenseBurst]）。
   void _sampleDecodeError(String text, {DateTime? at}) {
     if (!isDecoderCorruptionLog(text)) return;
     final now = at ?? DateTime.now();
@@ -2056,17 +1872,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final sparseReached = recordDecodeErrorHit(
       _decodeErrors,
       now,
-      window: _kDecodeErrorWindow,
-      burst: _kDecodeErrorBurst,
-      lineDedupe: _kDecodeLineDedupe,
+      window: PlayerTuning.decodeErrorWindow,
+      burst: PlayerTuning.decodeErrorBurst,
+      lineDedupe: PlayerTuning.decodeLineDedupe,
     );
     // 密集档把去重窗设成 0：`now.difference(last) < Duration.zero` 恒为假，
     // 于是**每一条原始行都算数** —— 正是这一档要的语义，不必另写一个函数。
     final denseReached = recordDecodeErrorHit(
       _decodeErrorDense,
       now,
-      window: _kDecodeErrorDenseWindow,
-      burst: _kDecodeErrorDenseBurst,
+      window: PlayerTuning.decodeErrorDenseWindow,
+      burst: PlayerTuning.decodeErrorDenseBurst,
       lineDedupe: Duration.zero,
     );
     if (!sparseReached && !denseReached) return;
@@ -2077,7 +1893,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (now.isBefore(_decodeErrorUntil)) return;
     _decodeErrors.clear();
     _decodeErrorDense.clear();
-    _decodeErrorUntil = now.add(_kDecodeErrorCooldown);
+    _decodeErrorUntil = now.add(PlayerTuning.decodeErrorCooldown);
     // 报的是哪一档要写清楚：这两档在日志里长得像，而"44 毫秒 260 条"和
     // "6 秒 12 条"对不上账时，就靠这一行分辨盲区有没有回来。
     //
@@ -2086,23 +1902,23 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 一条都不用改。
     debugPrint(
       'CDN 看门狗: 解码错误风暴（'
-      '${sparseReached ? '${_kDecodeErrorWindow.inSeconds}s 内 '
-              '$_kDecodeErrorBurst 条' : '${_kDecodeErrorDenseWindow.inMilliseconds}ms'
-              ' 内 $_kDecodeErrorDenseBurst 行'}'
+      '${sparseReached ? '${PlayerTuning.decodeErrorWindow.inSeconds}s 内 '
+              '${PlayerTuning.decodeErrorBurst} 条' : '${PlayerTuning.decodeErrorDenseWindow.inMilliseconds}ms'
+              ' 内 ${PlayerTuning.decodeErrorDenseBurst} 行'}'
       '），当前镜像给的字节解不出画面 —— 上报换源',
     );
-    // 回执：页面在途轮次收不下这一发（返回 false）时把静默期缩到 [_kDecodeErrorRetryBackoff]
+    // 回执：页面在途轮次收不下这一发（返回 false）时把静默期缩到 [PlayerTuning.decodeErrorRetryBackoff]
     // —— 两个窗口已经在上面清过，再攒够门槛就重报，风暴不会因为"页面正忙"永久丢失。
     // 用同一个 now（别重新取时钟：语义上应与这一次采样同一时刻）。没有页面挂上来
     // （null）时行为与旧版完全一致。
     final listener = onDecodeError;
     if (listener != null &&
         !listener(videoPlayerController?.state.position ?? Duration.zero)) {
-      _decodeErrorUntil = now.add(_kDecodeErrorRetryBackoff);
+      _decodeErrorUntil = now.add(PlayerTuning.decodeErrorRetryBackoff);
     }
   }
 
-  /// 硬解会话失效的采样：攒够 [_kSessionFailBurst] 条就**重建本机解码器**。
+  /// 硬解会话失效的采样：攒够 [PlayerTuning.sessionFailBurst] 条就**重建本机解码器**。
   ///
   /// 与 [_sampleDecodeError] 是两个相反的结论，见 [isDecoderSessionFailureLog]：
   /// 那条路是"镜像给的字节解不出来" → 换源；这条路是"本机硬解会话被系统作废了"
@@ -2118,7 +1934,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 让位于坏字节：两族的动作相反，同时开火会互相拆台（见那个常量的注释）。
     final lastBadBytes = lastDecoderCorruptionAt;
     if (lastBadBytes != null &&
-        now.difference(lastBadBytes) < _kSessionFailDeferBadBytes) {
+        now.difference(lastBadBytes) < PlayerTuning.sessionFailDeferBadBytes) {
       return;
     }
     // 闸门：拆链 / 重载的缝隙里，会话报错是**正常**产物，不该拿去重建。本故障
@@ -2141,9 +1957,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (!recordDecodeErrorHit(
       _sessionFailures,
       now,
-      window: _kSessionFailWindow,
-      burst: _kSessionFailBurst,
-      lineDedupe: _kDecodeLineDedupe,
+      window: PlayerTuning.sessionFailWindow,
+      burst: PlayerTuning.sessionFailBurst,
+      lineDedupe: PlayerTuning.decodeLineDedupe,
     )) {
       return;
     }
@@ -2151,10 +1967,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 这里不用清 [_sessionFailures] —— 冷却（30s）比窗口（3s）长得多，到那时
     // 旧记录早就自己出窗了，清是句死代码。
     if (now.isBefore(_sessionHealUntil)) return;
-    _sessionHealUntil = now.add(_kSessionFailCooldown);
+    _sessionHealUntil = now.add(PlayerTuning.sessionFailCooldown);
     debugPrint(
-      'CDN 看门狗: 硬解会话失效（${_kSessionFailWindow.inSeconds}s 内 '
-      '$_kSessionFailBurst 条），本机解码器被系统作废 —— 重建解码器',
+      'CDN 看门狗: 硬解会话失效（${PlayerTuning.sessionFailWindow.inSeconds}s 内 '
+      '${PlayerTuning.sessionFailBurst} 条），本机解码器被系统作废 —— 重建解码器',
     );
     // 重开同一个 Media：位置保留（见 [refreshPlayer] 里的 `start: state.position`），
     // 解码器和视频输出都是全新的。代价是缓冲从头攒、1~3 秒卡顿 —— 比永久黑屏值。
@@ -2164,9 +1980,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 卡顿看门狗：前两条判据共用一个 [onStall] 回调，第三条的两副面孔分别走
   /// [onBufferStarve]（余量趴在低位）和 [onTelemetryDiverged]（余量失真）。
   ///
-  /// 1. 位置连续 [_kStallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
+  /// 1. 位置连续 [PlayerTuning.stallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
   ///    不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
-  /// 2. [_sampleRebuffer]：窗口内缓冲归零的上升沿达到 [_kRebufferTrigger] 次。
+  /// 2. [_sampleRebuffer]：窗口内缓冲归零的上升沿达到 [PlayerTuning.rebufferTrigger] 次。
   ///    判据 1 看不到反复小卡顿（位置一恢复就清零），由判据 2 补上。
   /// 3. [_sampleStarve]：前向缓冲长期趴在低位。判据 1、2 都要求 buffered 归零，
   ///    而 mpv 有 cache-secs 打底、换源型卡顿时位置又由音频时钟推着走，
@@ -2180,7 +1996,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 心跳放在闸门之前：闸门本身也可能是"什么都不发生"的原因之一，
       // 必须先看到它当时的取值。
       final now = DateTime.now();
-      if (now.difference(_lastHeartbeat).inSeconds >= _kHeartbeatSeconds) {
+      if (now.difference(_lastHeartbeat).inSeconds >= PlayerTuning.heartbeatSeconds) {
         _lastHeartbeat = now;
         debugPrint(
           'CDN 看门狗: 余量 ${bufferedAhead}s 阈值 '
@@ -2197,7 +2013,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           '${_videoPlayerController?.state.height}',
         );
       }
-      // 「无视频轨」是**时间窗**判据（见 [_kNoVideoWindow]），所以 1s 一拍都得看 ——
+      // 「无视频轨」是**时间窗**判据（见 [PlayerTuning.noVideoWindow]），所以 1s 一拍都得看 ——
       // 少看一拍就是窗口判据白多出来的相位误差。旧的 2s 采样节流因此取消。
       _checkNoVideoTrack(now);
       if (isLive ||
@@ -2227,7 +2043,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _stallFrozen = 0;
         return;
       }
-      if (++_stallFrozen >= _kStallSeconds &&
+      if (++_stallFrozen >= PlayerTuning.stallSeconds &&
           isBuffering.value &&
           bufferedAhead == 0) {
         _stallFrozen = 0;
@@ -2263,12 +2079,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 都会让缓冲归零，必须先把这段时间静音掉，否则等长冻结判据会把自己的动作
   /// 读成卡顿。
   void _armRebufferSuppress() {
-    _rebufferSuppressUntil = DateTime.now().add(_kRebufferSuppress);
+    _rebufferSuppressUntil = DateTime.now().add(PlayerTuning.rebufferSuppress);
     _disarmTriggers();
   }
 
   /// 饥饿阈值：mpv 回填水位（`demuxer-hysteresis-secs`）的
-  /// [_kStarveFloorFraction]。低于 [_kStarveMinSeconds] 视为没有观测余量，
+  /// [PlayerTuning.starveFloorFraction]。低于 [PlayerTuning.starveMinSeconds] 视为没有观测余量，
   /// 返回 0 表示不启用。
   ///
   /// 取值要从 mpv 真正拿到的 [buffer] 里读，而不是用当前倍速重算：`buffer` 是
@@ -2276,8 +2092,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// （例如按 1x 装载后改成 2x，水位仍是按 1x 算的，而缓冲消耗速度已翻倍）。
   double get _starveThresholdSec {
     final floor = double.tryParse(buffer['demuxer-hysteresis-secs'] ?? '') ?? 0;
-    final threshold = floor * _kStarveFloorFraction;
-    return threshold < _kStarveMinSeconds ? 0 : threshold;
+    final threshold = floor * PlayerTuning.starveFloorFraction;
+    return threshold < PlayerTuning.starveMinSeconds ? 0 : threshold;
   }
 
   /// 是否已进入片尾 —— 剩余时长不足 [_starveThresholdSec]。
@@ -2301,13 +2117,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return duration.value - position.value < threshold;
   }
 
-  /// 失真阈值：mpv 缓存上限 `cache-secs` 的 [_kDivergedFactor] 倍。读不到就
+  /// 失真阈值：mpv 缓存上限 `cache-secs` 的 [PlayerTuning.divergedFactor] 倍。读不到就
   /// 不启用（返回 0）—— 直播走的是 [liveBuffer]，压根没有这个键，本地点播
   /// 文件更是 `cache: no`，两者的 `demuxer-cache-time` 语义本来也不同，不该
   /// 套这条判据。跟 [_starveThresholdSec] 用"返回 0 表示不启用"是同一套约定。
   double get _divergedAheadSec {
     final cache = double.tryParse(buffer['cache-secs'] ?? '') ?? 0;
-    return cache > 0 ? cache * _kDivergedFactor : 0;
+    return cache > 0 ? cache * PlayerTuning.divergedFactor : 0;
   }
 
   /// 判据 3：只盯 [bufferedAhead]，不看位置也不要求 [isBuffering]——换源型卡顿
@@ -2316,8 +2132,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 拖走了"，后者正是"只有声音、画面冻住"。
   ///
   /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束；**但那一段
-  /// 还没结束时每 [_kStarveRepeat] 补报一次**（理由是坏镜像让"结束"永不发生，
-  /// 见 [_kStarveRepeat]）。
+  /// 还没结束时每 [PlayerTuning.starveRepeat] 补报一次**（理由是坏镜像让"结束"永不发生，
+  /// 见 [PlayerTuning.starveRepeat]）。
   ///
   /// **片尾必须放行**：`bufferedAhead` 的上界就是剩余时长，所以视频最后
   /// `threshold` 秒里这条判据*必然*成立，跟网速多快无关（推导见 [_atFileTail]）。
@@ -2333,7 +2149,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return;
     }
     if (bufferedAhead < threshold) {
-      if (++_starveSeconds < _kStarveSeconds) return;
+      if (++_starveSeconds < PlayerTuning.starveSeconds) return;
       if (!_starveReportDue(now)) return;
       final repeat = _starveLastReportAt != null;
       _starveLastReportAt = now;
@@ -2342,7 +2158,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
             ? 'CDN 缓冲饥饿: 仍在饥饿，再次上报（余量 ${bufferedAhead}s < '
                   '${threshold.toStringAsFixed(1)}s）@${position.value}s'
             : 'CDN 缓冲饥饿: 前方余量 ${bufferedAhead}s < '
-                  '${threshold.toStringAsFixed(1)}s (连续 $_kStarveSeconds s) '
+                  '${threshold.toStringAsFixed(1)}s (连续 ${PlayerTuning.starveSeconds} s) '
                   '@${position.value}s',
       );
       onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
@@ -2352,7 +2168,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 余量涨到失真：音频在走、画面冻着。`demuxer-cache-time` 被音频轨抬离了
     // 播放位置，余量因此超过缓存上限好几倍 —— 位置还在推进、[isBuffering]
     // 也是假，判据 1、2 都看不见，只有这里能拦住。同样每段只报一次（可按
-    // [_kStarveRepeat] 补报，跟上面那条共用一个去重状态）。
+    // [PlayerTuning.starveRepeat] 补报，跟上面那条共用一个去重状态）。
     //
     // 出口是 [onTelemetryDiverged]，**不是**上面那条低水位支走的 [onBufferStarve]：
     // 两副面孔的恢复手段不同，理由见那个字段。
@@ -2366,7 +2182,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                   '@${position.value}s'
             : 'CDN 遥测失真: 余量 ${bufferedAhead}s 超过缓存上限 '
                   '${_divergedAheadSec.toStringAsFixed(1)}s 的 '
-                  '${_kDivergedFactor}x (音频在走，画面已冻) @${position.value}s',
+                  '${PlayerTuning.divergedFactor}x (音频在走，画面已冻) @${position.value}s',
       );
       onTelemetryDiverged?.call(
         videoPlayerController?.state.position ?? Duration.zero,
@@ -2374,7 +2190,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return;
     }
     // 只有补回 mpv 自己的水位才算这段饥饿真的结束了。
-    if (bufferedAhead >= threshold / _kStarveFloorFraction) {
+    if (bufferedAhead >= threshold / PlayerTuning.starveFloorFraction) {
       if (_starveLastReportAt != null) {
         debugPrint('CDN 缓冲饥饿: 已恢复 (${bufferedAhead}s)');
       }
@@ -2382,10 +2198,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
-  /// 该不该就"还在挨饿"这件事再出声一次：没报过，或者距上次已过 [_kStarveRepeat]。
+  /// 该不该就"还在挨饿"这件事再出声一次：没报过，或者距上次已过 [PlayerTuning.starveRepeat]。
   bool _starveReportDue(DateTime now) {
     final last = _starveLastReportAt;
-    return last == null || now.difference(last) >= _kStarveRepeat;
+    return last == null || now.difference(last) >= PlayerTuning.starveRepeat;
   }
 
   /// 测试缝：判据 3 的一拍。
@@ -2428,12 +2244,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final stalled = isBuffering.value && bufferedAhead == 0;
     if (stalled && !_wasStalled) {
       _rebufferEvents.add(now);
-      _rebufferEvents.removeWhere((t) => now.difference(t) > _kRebufferWindow);
+      _rebufferEvents.removeWhere((t) => now.difference(t) > PlayerTuning.rebufferWindow);
       debugPrint(
-        'CDN 卡顿计数: ${_rebufferEvents.length}/$_kRebufferTrigger '
-        '(窗口 ${_kRebufferWindow.inSeconds}s)',
+        'CDN 卡顿计数: ${_rebufferEvents.length}/${PlayerTuning.rebufferTrigger} '
+        '(窗口 ${PlayerTuning.rebufferWindow.inSeconds}s)',
       );
-      if (_rebufferEvents.length >= _kRebufferTrigger) {
+      if (_rebufferEvents.length >= PlayerTuning.rebufferTrigger) {
         _rebufferEvents.clear();
         onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
       }

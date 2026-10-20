@@ -204,7 +204,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 （不出现 `没有可测的候选镜像`）。416 那条 return 在 `_cdnNoSample` 记账**之前**，
 所以没有镜像被锁 30 分钟。
 失败：整集每轮都以 `越界(416)，放弃本轮` 收尾，随后 `没有可测的候选镜像`
-（死镜像冷却 `_kCdnDeadRetryAfter` = 30 分钟被毒化了）。
+（死镜像冷却 `CdnTuning.deadRetryAfter` = 30 分钟被毒化了）。
 
 ### 3 — 作废的那一轮不许清忙闸（MEDIUM）
 
@@ -260,11 +260,11 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 **合计 ≥8s**；日志里那个 Ns 是"观察到的安静时长"，所以它在成功时应 ≥4）。
 仍然坏的镜像被禁：`CDN 自动切换: <host> 换过去仍解不出画面，本集不再作为候选`；
 换到好源以 `CDN 自动切换: 成功，已切到 <svc>` 结束。对全坏的源，收敛到
-`第N次 -> …` 最多 `_kCdnMaxAttempts`（3）次，然后放弃：
+`第N次 -> …` 最多 `CdnTuning.maxAttempts`（3）次，然后放弃：
 `CDN 自动切换: 放弃，Ns 内不再尝试（换了几处镜像，画面仍然解不出来，已暂停尝试）`。
 失败：快但坏的镜像在 ~0.5s 内被判"已恢复"（走的是余量/位置那条），画面还冻着；
 循环在同样几个 host 之间来回弹，而不是逐个禁掉再放弃。
-注意强制档的总上限是 `_kCdnDecodeRecoverWindow`（18s），不是 12s 的 `_kCdnRecoverWindow`。
+注意强制档的总上限是 `CdnTuning.decodeRecoverWindow`（18s），不是 12s 的 `CdnTuning.recoverWindow`。
 
 ### 8 — 跳相关视频后，旧页面的探测定时器要静音（MEDIUM）
 
@@ -289,7 +289,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 > 调用点（`controller.dart:1327` 的 `onReset`，只有换 P/换集走得到；
 > `cdn_switch_mixin.dart:884` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
 > 而它在返回路径上的调用点只有 `view.dart:495`（`didPopNext`）。时间也对：
-> 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `_kCdnPreflightPoll`
+> 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `CdnTuning.preflightPoll`
 > 的 2 s 加上等缓冲那一拍。
 >
 > ⚠️ **负那一半（"旧页面静默"）不构成证据，别拿它当通过的依据。** 旧页面的周期
@@ -311,7 +311,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 **其他**候选的样本保留、本轮继续。`offsetRejected` 只在 `isBaseline` 为真时置位。
 若**基线**回 416，整轮正确作废：`目标偏移 <off> 越界(416)，放弃本轮`。
 失败：单个候选的 416 就产生 `越界(416)，放弃本轮`，把好候选的样本一起丢掉，
-还白搭 20s 的 `_kCdnUnmeasuredCooldown`。
+还白搭 20s 的 `CdnTuning.unmeasuredCooldown`。
 
 ### 11 — 零字节镜像不该被重新排进候选（LOW）
 
@@ -321,12 +321,12 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 只在第 1、2 遍都填不满窗口时才走第 3 遍「全都不管」。有可用候选时不该出现
 `CDN 自动切换: 没有可测的候选镜像`。
 失败：零字节镜像每轮都被重新排进去，每次白搭两个 3s 超时
-（`_kCdnDeadRetryAfter` = 30 分钟就是为了防这个）。
+（`CdnTuning.deadRetryAfter` = 30 分钟就是为了防这个）。
 
 ### 12 — 换集时 `_cdnQuickProbeAt` 要归零（LOW）
 
 前置：触发一次小卡顿探测，让 `_cdnQuickProbeAt` 打上时间戳（出现 `小卡顿 @Ns…`）。
-步骤：30s 内（`_kCdnRebufferCooldown`）换到下一集，再制造一次余量归零。
+步骤：30s 内（`CdnTuning.rebufferCooldown`）换到下一集，再制造一次余量归零。
 通过：新一集的小卡顿打印
 `CDN 自动切换: 小卡顿 @Ns，余量刚归零，后台快速测一轮（快速档 NNNkB × 3，不看缓冲水位）`
 —— 节流被 `resetCdnAutoSwitch` 清了（`_cdnQuickProbeAt = null`）。
@@ -350,7 +350,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 通过：`CDN 自动切换: 解码错误，但没有候选能满足 <needBps>MB/s 的码率，放弃本轮`
 —— 因为 `needBps > 0 && bestBps < needBps`，宁可拒绝也不落到不可播的镜像上。
 size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来一致
-（强制档绕过 `_kCdnStarveRatio` 仍然成立）。
+（强制档绕过 `CdnTuning.starveRatio` 仍然成立）。
 失败：循环换到那个 ~43 KB/s 的镜像上（`第N次 ->` 之后接着饿），而不是拒绝。
 
 ### 15 — 大小写不同的解码报错仍要认得（LOW）
@@ -375,7 +375,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 
 前置：坏源；一个坏包会被 ffmpeg 的各层（`av1:` / `libdav1d:` / `NULL:`）发 2~3 行。
 步骤：真机上看 `CDN 看门狗: 解码错误风暴…` 是相对多少个**坏包**触发的；
-去重窗是 `_kDecodeLineDedupe = 5ms`（距上一条 5ms 内的算同一个包，不计入）。
+去重窗是 `PlayerTuning.decodeLineDedupe = 5ms`（距上一条 5ms 内的算同一个包，不计入）。
 通过：需要约 12 个**不同**的坏包（每个包 5ms 内的多层重复只算一条），而不是约 4 个。
 要精确确认看纯函数单测 `recordDecodeErrorHit`（`test/utils/decode_error_test.dart`）。
 失败：只攒到约 4 个坏包就触发（修复前的有效门槛），即三层的重复被各记了一条。
@@ -396,7 +396,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 > 去重后窗口内最多只攒到: 9 条   (门槛 12)
 > ```
 >
-> 不是巧合，是算术：一条命中要求距上一条 **> `_kDecodeLineDedupe`（5ms）**，等于把
+> 不是巧合，是算术：一条命中要求距上一条 **> `PlayerTuning.decodeLineDedupe`（5ms）**，等于把
 > 命中率钉死在 200/s。要凑够 12 条，风暴跨度**至少 11×5 = 55 毫秒** ——
 > 于是**任何短于 ~55 毫秒的坏字节爆发，无论刷多少行，都到不了门槛**。
 >
@@ -406,7 +406,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 > （`controller.dart` 的注释记的就是"实测那一局 6 秒里就有几十条"），
 > 而这一局是**密集而短** —— 另一种形状，判据从来没见过。
 >
-> **修法（`_kDecodeErrorDenseBurst`）：不动那条已调好的稳态判据，另加一档
+> **修法（`PlayerTuning.decodeErrorDenseBurst`）：不动那条已调好的稳态判据，另加一档
 > "100 毫秒内 20 行、不去重"。** 两档任一满足即上报，走同一个动作。
 > 「同一个包被三层各记一行」和「两个不同的包相隔 3ms」在时间上分不开，所以这一档
 > 干脆不靠时间去重，改靠**体积**把三层重复挡在外面：单个包最多记 3 行，
@@ -501,7 +501,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 > 3. **没抢走坏字节那路的动作** —— 那一段没有任何坏字节签名命中，两族没打架。
 >
 > ⚠️ 同一份日志里 `23:03:45.697` 有一轮 `预检 @353s`，**它不是重建带起来的**
-> （早 0.64 s）。机制见条目 8 的 ⚠️ 之外另有一条：`_kCdnPreflightDeadline`（10s）
+> （早 0.64 s）。机制见条目 8 的 ⚠️ 之外另有一条：`CdnTuning.preflightDeadline`（10s）
 > 到期前你退了后台，iOS 冻住定时器，`_cdnPreflightSince` 就悬着 —— 584 秒后回前台
 > 第一拍 `now - since` 早就过线，于是**补做**了那一次预检。它值钱的前提是"位置还在
 > 起点、换源看不出闪"（`cdn_switch_mixin.dart:975`），在 **353 秒**处开火时这个前提
@@ -517,7 +517,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 `CDN 看门狗: 余量 … hwdec videotoolbox …` 能看到它）。差别只在**播放状态**：
 **手动按暂停**，画面停在最后一帧、控制条是暂停态；确认心跳行里 `播放中 false`
 （那句取自 `controller.dart:2164` 的 `播放中 ${playerStatus.isPlaying}`，
-`_kHeartbeatSeconds = 10`（`controller.dart:424`），所以 10 秒内必有一拍能对上）。
+`PlayerTuning.heartbeatSeconds = 10`（`controller.dart:424`），所以 10 秒内必有一拍能对上）。
 
 步骤：**保持暂停**退到后台 **≥5 分钟**（锁屏或切走都行），然后回到 app。
 
@@ -535,7 +535,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
   `:2107-2116`，只挡 `isSeeking` / `_processing` / `onlyPlayAudio` / `isBuffering` /
   `bufferedAhead <= 0` / `!_hasVideoTrack` —— **不读 `playerStatus`**，暂停态照样进得来。
   这是**有意**的：会话作废该修就修，只是修完得把播放意图还原回去。命中 6 条 / 3 秒
-  （`_kSessionFailBurst` `:377`、`_kSessionFailWindow` `:381`）后 `:2131` 打日志、
+  （`PlayerTuning.sessionFailBurst` `:377`、`PlayerTuning.sessionFailWindow` `:381`）后 `:2131` 打日志、
   `:2137` 调 `refreshPlayer()`（返回值忽略）。
 - 缺口没修时为什么会丢：重开之后 mpv 一上报 playing，播放器就把 `playerStatus` 置成
   `.playing`，而用户按的暂停**没有任何地方记着**（全仓没有 `userPause` 之类的标记）。
@@ -561,7 +561,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 失败（**说明 `play ?? playerStatus.isPlaying` 没兜住**）：回前台后画面**自己动起来**，
 心跳行从 `播放中 false` 翻成 `播放中 true` —— 那就要查 `refreshPlayer()` 的调用点上
 `playerStatus` 当时到底是什么（`:1353`）。
-注意 30s 冷却（`_kSessionFailCooldown`，`controller.dart:386`）只压"动手"的频率，
+注意 30s 冷却（`PlayerTuning.sessionFailCooldown`，`controller.dart:386`）只压"动手"的频率，
 不影响这一次的播放意图。
 
 ⚠️ 真机上要看清的**第一件事**是"签名到底响没响"：暂停时 mpv 不一定在解码，那两条会话
@@ -577,10 +577,10 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 `lib/utils/cdn_speed_test.dart:18-20`）和并发测速（`:1407-1414` 的 await，`autoMicros`
 6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:30`/`:40`）**之后**才被拿去记账 ——
 也就是相对"读数真正落地的时刻"偏早约几秒（最多探大小 3s + 测速 6s）。受影响的是它喂的
-那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1295`，窗口 `_kCdnRetryAfter`
-`:251` / `_kCdnDeadRetryAfter` `:261`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
-（`:1438`）、`_cdnChampion` 的 6 小时过期（`:1252`，窗口 `_kCdnRecordExpiry` `:316`）、
-`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`:1515`，`_kCdnRecordReset` `:312`）。
+那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1295`，窗口 `CdnTuning.retryAfter`
+`:251` / `CdnTuning.deadRetryAfter` `:261`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
+（`:1438`）、`_cdnChampion` 的 6 小时过期（`:1252`，窗口 `CdnTuning.recordExpiry` `:316`）、
+`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`:1515`，`CdnTuning.recordReset` `:312`）。
 **对着这几档窗口，偏早几秒不产生行为差异**（窗口比误差大两三个数量级），所以它是备注、
 不是 bug。**无需真机验证。**
 
@@ -636,7 +636,7 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
    `，放弃本轮` 都由它补齐）：
    `CDN 自动切换: 基线探测没拿到样本，但播放器没在挨饿（余量 32s、重新缓冲 false）—— 一次新连接没建起来不等于镜像坏了，放弃本轮`
    随后 `_autoSwitchLoop` 收尾（`:1190`）：`CDN 自动切换: 放弃，20s 内不再尝试（无法测出更快的 CDN，暂不切换）`
-   —— 这 20s 来自 `_kCdnUnmeasuredCooldown`（`cdn_switch_mixin.dart:243`）。
+   —— 这 20s 来自 `CdnTuning.unmeasuredCooldown`（`cdn_switch_mixin.dart:243`）。
 2. **没有**紧跟的 `CDN 自动切换: 基线无有效速度，直接切换 -> …`（`:1616`），**没有**
    `CDN 自动切换: 第1次 -> …`，**没有** `Setting option 'start' = …` 重载，**没有**
    `落点 … 补一次 seek`。
@@ -664,7 +664,7 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
   （`01:22:15.513` 放弃 `当前 CDN 只有 0.697MB/s，没找到更快的镜像`、`01:22:52.335` 放弃
   `CDN 都正常，可能是网络问题`），它们走的是比值/健康判定，跟本闸门无关。
 
-已知代价：拦下这一轮会走 `unmeasurable` → 留 **20s 冷却**（`_kCdnUnmeasuredCooldown`，
+已知代价：拦下这一轮会走 `unmeasurable` → 留 **20s 冷却**（`CdnTuning.unmeasuredCooldown`，
 `cdn_switch_mixin.dart:243`）：这 20 秒里**播放器侧触发也被这道放弃冷却挡着**，半死镜像最坏
 **晚约 20 秒**才被发现；不过 `解码错误` 与 `画面已冻`（`telemetryDiverged`）两档**不吃**这道冷却，
 真坏到那份上的镜像照旧立刻救。
@@ -734,14 +734,14 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
 > **预检档起播后很快就救走**（`CDN 自动切换: 基线无有效速度，直接切换`；
 > log 8：`14:43:53.540` 预检 → `14:43:59.400` 已切到 hw，**~6 秒**；README 记的起播到恢复 14 秒）。
 > 那比 P3 快：P3 要看门狗**攒满一个时间窗**才认死锁（1s 一拍、每拍都看；强指纹成立时
-> `_kNoVideoWindow` 3s ≈4 拍，否则 `_kNoVideoWindowWeak` 8s），定罪后**直接**就地重建。
+> `PlayerTuning.noVideoWindow` 3s ≈4 拍，否则 `PlayerTuning.noVideoWindowWeak` 8s），定罪后**直接**就地重建。
 > 钉着它，永远轮不到重建。
 
 **判据 = 时间窗（2026-10-15 起，取代「数探」）**：ticker **1s 一拍、每拍都看**；七道门
 （`onlyPlayAudio` / `isLive` / `position <= 0` / `isSeeking` / `_processing` /
 `_rebuildingRenderContext` / `isBuffering`）全不成立、且画面为空（`_hasVideoTrack` 假）这段
 状态**连续攒满一个窗**才定罪（`_checkNoVideoTrack`）。**窗口档位由强指纹选**：强指纹成立走
-`_kNoVideoWindow` = **3s（≈4 拍：开窗 1 拍 + 3 拍）**，不成立走 `_kNoVideoWindowWeak` = **8s**。
+`PlayerTuning.noVideoWindow` = **3s（≈4 拍：开窗 1 拍 + 3 拍）**，不成立走 `PlayerTuning.noVideoWindowWeak` = **8s**。
 **强指纹是档位开关，不是只贴个后缀**：它成立才走 3s 档，且上报行末尾带 ` [强指纹]`（**后缀 =
 「这次走的是 3s 档」的标记，两者等价**）。「强指纹」= `video-codec` 非空 **且** `hwdec-current`
 非空 **且** 位置比上一拍大；值钱的是 `hwdec-current`：**由空串变非空只有「解码器真的开了」
@@ -991,29 +991,29 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
    - 太大：取的字节超出播放头接下来要用的范围，量到的速度不代表即将播放的那段；
      对短对象还会被 `size − readWindowBytes` 夹到同一个偏移，所有镜像打平。
 
-2. **`_kCdnDecodeCleanWindow` = 4s**（`cdn_switch_mixin.dart`）—— 判定解码档恢复所需的安静时长。
+2. **`CdnTuning.decodeCleanWindow` = 4s**（`cdn_switch_mixin.dart`）—— 判定解码档恢复所需的安静时长。
    - 太小：慢一点才坏的镜像在下一场风暴来临前就被判
      `解码错误档换源后 Ns 无新报错，判定已恢复`，几秒后画面又冻（来回弹）。
    - 太大：真的好镜像被判未恢复 → 多余的重载/位置抖动；而每次失败都禁一个 host，
      候选被耗光，正常的网络最后落到放弃。
 
-3. **`_kCdnDecodeRecoverGrace` = 4s**（`cdn_switch_mixin.dart`）—— 旧流的报错不算新镜像账的宽限期。
+3. **`CdnTuning.decodeRecoverGrace` = 4s**（`cdn_switch_mixin.dart`）—— 旧流的报错不算新镜像账的宽限期。
    - 太小：重载（实测 5~10s）期间旧流还在排空，那些报错刷新 `lastDecoderCorruptionAt`，
      干净窗口永远满足不了，连好候选也判未恢复 → 干净地放弃。
    - 太大：新镜像真实的坏字节被忽略那么久 → 坏镜像看着"干净"，在画面还冻着时被判已恢复
      （正是条目 7 修掉的那个 bug）。
    - **注意它必须按时刻滤**（`lastDecoderCorruptionAt` 早于 `start + grace` 的整段忽略），
-     不能只用来重置一个 `since`：grace 和 `_kCdnDecodeCleanWindow` 等长时，后者会把
+     不能只用来重置一个 `since`：grace 和 `CdnTuning.decodeCleanWindow` 等长时，后者会把
      宽限期想区分的那件事原样抹平（判据退化成"离最近一次报错满 4 秒"，而那次报错可能
      来自旧流）。这两条谁改都必须一起改。
 
-4. **`_kCdnDecodeRecoverWindow` = 18s**（`cdn_switch_mixin.dart`）—— 解码档等待恢复的总上限。
+4. **`CdnTuning.decodeRecoverWindow` = 18s**（`cdn_switch_mixin.dart`）—— 解码档等待恢复的总上限。
    - 太小：重载（5~10s）+ 宽限（4s）+ 干净窗口（4s）≈ 13~18s 塞不下，正好在镜像快要自证干净时
      判失败 → 提前禁 host、来回弹。
-   - 太大：一心想换掉一条真坏的镜像时，每次尝试都要烧这么久；配上 `_kCdnMaxAttempts = 3`，
+   - 太大：一心想换掉一条真坏的镜像时，每次尝试都要烧这么久；配上 `CdnTuning.maxAttempts = 3`，
      一轮可以在冻着画面上耗掉约 54s 才放弃。
 
-5. **`PlPlayerController._kDecodeErrorBurst` = 12 / `_kDecodeErrorWindow` = 6s**
+5. **`PlPlayerController.PlayerTuning.decodeErrorBurst` = 12 / `PlayerTuning.decodeErrorWindow` = 6s**
    （`lib/plugin/pl_player/controller.dart`）—— **✅ 已实测（2026-10-12）：门槛够得到，不是死代码。**
    先把口径说清：它数的是**去重后**的条数（同包在 `av1:` / `libdav1d:` / `NULL:` 各记一行、
    以及 `mpv [error] ffmpeg:` 与 `mpv error:` 两条路径各记一次，都按 5ms 间隔合并），在一个
@@ -1022,7 +1022,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
    多密决定，**不是固定的 3:1**。
    - **量法**：拿 `docs/logs/` 下带时间戳的档案，按 `decode_error.dart` 的签名表
      （`kDecoderCorruptionSignatures`）grep 出相关行，按 **6 秒滑动窗**取峰值，并复算 5ms
-     去重（`_kDecodeLineDedupe`）。注意 `HW` 是大写、`Error while decoding frame` /
+     去重（`PlayerTuning.decodeLineDedupe`）。注意 `HW` 是大写、`Error while decoding frame` /
      `HW accel end frame fail.` **不在**这份签名表里（刻意排除，见 `decode_error.dart:86-92`），
      `invalid session` / `output image buffer is null` 走的是**另一条**通道（会话失效）。
    - 逐份读数（`docs/logs/`，2026-10-12 实测）：
@@ -1041,7 +1041,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
    - **旧的算数担心在一个具体场景里却是对的**：log 4 那场 **524 行**去重后**只有 9 条** ——
      因为全部挤在 **44 毫秒**里，5ms 去重把这段封顶到约 9 条。**放宽窗口救不了**（整段就
      44ms，任何长度的窗口都只数得出 9 条），所以旧文"把窗口放宽到 12s"的建议**无效**。这一档
-     归**密集档**（`_kDecodeErrorDenseBurst` = 20 行 / 100ms、**不去重**）兜 —— 见条目 17。
+     归**密集档**（`PlayerTuning.decodeErrorDenseBurst` = 20 行 / 100ms、**不去重**）兜 —— 见条目 17。
    - **log 7 现场那两行怎么读**：`13:56:10.169` 报的「100ms 内 20 行」是**密集档**（= 200 行/s
      原始）。这 20 行按 5ms 去重只折合**约 5 条**、离 12 差得远；稀疏档要等到 2.4 秒尾巴上的
      `13:56:11.600` 才凑够 12 条，比密集档晚 **1.43 秒** —— 那时两档共用的 `_kDecodeErrorUntil`
@@ -1049,19 +1049,19 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
      在**档案里从未成为首个上报者**；它防的是"**横跨数秒**、每秒几条"那种稀疏长风暴。
    - ⚠️ log 7 那局有**代理污染**（`No route to host … 192.168.1.101:8899`），**只能当门槛量测
      的素材，不能当收益基准**。
-   - 顺带写实了两处注释：`decode_error.dart` 顶部与 `controller.dart` 里 `_kDecodeErrorBurst`
+   - 顺带写实了两处注释：`decode_error.dart` 顶部与 `controller.dart` 里 `PlayerTuning.decodeErrorBurst`
      那段，都换成"524 行 / 44 毫秒（log 4）、58 行横跨 2.4 秒、去重后 17 条（log 7）"这套实测
      数，并写明**不是固定的 3:1 去重比**；原来那句「横跨 100 多秒」**是错的** —— 那 100 多秒是
      **画面冻着的时长**，不是报错的跨度（log 4 的 524 行全在 44 毫秒里）。
 
-6. **`PlPlayerController._kNoVideoWindow` = 3s**（`lib/plugin/pl_player/controller.dart`）——
+6. **`PlPlayerController.PlayerTuning.noVideoWindow` = 3s**（`lib/plugin/pl_player/controller.dart`）——
    **强指纹成立**时「有声音黑屏」的定罪窗口（1s 一拍，≈4 拍）。
    - ⚠️ **1s 粒度下窗口值在 (2s,3s] 区间内行为相同**（都攒成 4 拍）—— 调这个值别在这区间里找差。
    - 太小：起播慢的大文件、或**视频轨饿死**（视频轨那条 URL 读到一半断）会被误判成渲染死锁 →
      白重建。
    - 太大：白对黑屏、晚动手。
 
-7. **`PlPlayerController._kNoVideoWindowWeak` = 8s**（`lib/plugin/pl_player/controller.dart`）——
+7. **`PlPlayerController.PlayerTuning.noVideoWindowWeak` = 8s**（`lib/plugin/pl_player/controller.dart`）——
    **强指纹不成立**（含「位置冻住」）时的定罪窗口；比 3s 档长，是为了放过另一族病：**视频轨
    饿死**（同上）—— 那一族的**正解是换源、不是重建**，所以宁可多等。
    - 太小：饿死族被误判成渲染死锁 → 白重建。
@@ -1117,7 +1117,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
 - **恢复判定提前到 4s（HIGH，在第一批的修复里）**：滤掉旧流报错之后，安静时长是从
   `start` 算的（不是从宽限期结束算），于是 `elapsed >= 4 && since >= 4` 在 elapsed 刚
   够 4 那一刻同时成立 —— **一秒安静都没观察到**就宣布恢复，宽限期又从另一头变成空转，
-  跟 `_kCdnDecodeRecoverWindow` 注释里的"宽限 + 干净窗口（≈8s）"自相矛盾。现在从宽限期
+  跟 `CdnTuning.decodeRecoverWindow` 注释里的"宽限 + 干净窗口（≈8s）"自相矛盾。现在从宽限期
   结束算，合计 ≈8s。查法：看 `解码错误档换源后 Ns 无新报错` 里的 Ns，成功时它必须 ≥4。
 - **跳相关视频回来之后永久静默（MEDIUM）**：旧页被顶掉时停掉自己的探测定时器，而返回时
   没有任何东西重挂 —— 连换集都不恢复（`restartCdnProbe` 只重启定时器，不重挂回调）。

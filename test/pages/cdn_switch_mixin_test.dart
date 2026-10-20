@@ -320,7 +320,7 @@ void main() {
     // "画面已冻"这个前提摆出来才测得到。
     //
     // 前提摆两样：
-    //   - `cache-secs` 30s（mpv 的缓存上限）× `_kDivergedFactor` 3 倍 = 90s 是
+    //   - `cache-secs` 30s（mpv 的缓存上限）× `PlayerTuning.divergedFactor` 3 倍 = 90s 是
     //     失真线，余量 200s 压在上面 —— 也就是"音频在走、画面冻着"那份被抬到
     //     上千秒的余量。判据是**现场取值**的（那段注释：一轮跑好几秒，期间可能
     //     自己缓过来），所以整轮都得让它成立；
@@ -378,7 +378,7 @@ void main() {
     // `if (!switched && telemetryDiverged)` 直接短路。裁定怎么摆出来：
     //   - 基线在 [_steadyBaselineUrl] 上 —— host 一离开 [_baselineHost]，假适配器
     //     就按候选档发字节，基线于是**拿得出**有效速度；
-    //   - 候选拿到的字节数与基线一模一样，比值 ≈ 1.0x，够不着 `_kCdnStarveRatio`
+    //   - 候选拿到的字节数与基线一模一样，比值 ≈ 1.0x，够不着 `CdnTuning.starveRatio`
     //     1.5 → 判成 `healthy`（"CDN 都正常"）→ 不切换。真要两边比出差距得靠
     //     真实墙钟去堆分块延迟，那既慢又不稳（文件头那句"刻意不用速度比来造
     //     better"）。实测这条路上比值一直落在 0.99x 附近，阈值在 1.5。
@@ -766,7 +766,7 @@ void main() {
     // 半，直到定期档碰巧撞上"基线无有效样本 → 直接切换"才恢复。
     //
     // 解码错误是唯一**跳过比值、直接换源**的触发，它自己的节流是播放器侧的
-    // `_kDecodeErrorCooldown`（一次故障只报一次）—— 这里再压一道等于双保险变零保险。
+    // `PlayerTuning.decodeErrorCooldown`（一次故障只报一次）—— 这里再压一道等于双保险变零保险。
     // 所以它像绕过进展闸那样，也绕过放弃冷却。
     cdn.allTiny = true; // 造一轮 unmeasurable，顺手把 20s 冷却装上（与 F6 同法）
     hostA.attachCdnSwitch();
@@ -1674,13 +1674,13 @@ void main() {
   });
 }
 
-/// 判据 3 的连续采样拍数（`controller.dart:_kStarveSeconds`）。只用在失败原因里，
+/// 判据 3 的连续采样拍数（`controller.dart:PlayerTuning.starveSeconds`）。只用在失败原因里，
 /// 别跟着生产常量一起改。
 const _kStarveSecondsExpect = 4;
 
-/// 「无视频轨」定罪要攒够的时间窗（`controller.dart:_kNoVideoWindow` 强指纹档 /
-/// `controller.dart:_kNoVideoWindowWeak` 弱指纹档）与重建上限
-/// （`controller.dart:_kNoVideoRebuildMax`）。同上：只用在断言里。
+/// 「无视频轨」定罪要攒够的时间窗（`controller.dart:PlayerTuning.noVideoWindow` 强指纹档 /
+/// `controller.dart:PlayerTuning.noVideoWindowWeak` 弱指纹档）与重建上限
+/// （`controller.dart:PlayerTuning.noVideoRebuildMax`）。同上：只用在断言里。
 const _kNoVideoWindowExpect = Duration(seconds: 3);
 const _kNoVideoWindowWeakExpect = Duration(seconds: 8);
 const _kNoVideoRebuildMaxExpect = 2;

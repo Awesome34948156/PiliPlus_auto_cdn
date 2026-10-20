@@ -20,7 +20,7 @@
 /// `pili-console.log`（档案 log 4，`av1: obu_forbidden_bit out of range` 之类），
 /// H.264 的两条来自换集边界上的零星报错 —— 那种一两条就停，不该触发换源。
 ///
-/// 判定门槛（`PlPlayerController._kDecodeErrorBurst` = 12 条 / 6 秒）数的是
+/// 判定门槛（`PlPlayerController.PlayerTuning.decodeErrorBurst` = 12 条 / 6 秒）数的是
 /// **去重后**的条数，不是原始行数 —— 两者的比由爆发有多密决定，**不是固定的
 /// 3:1**（去重按时间间隔合并，不是按"一个包报几层"）。实测依据（档案 log 4 /
 /// log 7，2026-10-12 复核）：log 4 的 524 行全挤在 44 毫秒里，去重后**只剩 9 条**
