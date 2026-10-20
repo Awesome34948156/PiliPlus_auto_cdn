@@ -284,6 +284,72 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// `onTelemetryDiverged`/`onRebuffer`）仍是 [ValueChanged]。
   bool Function(Duration)? onDecodeError;
 
+  // ---------------------------------------------------------------------------
+  // CDN 回调的归属。上面 5 个字段是跨页共享的，页面各自抢占；只比对其中一个
+  // 回调没法原子地判断"这 5 个现在是不是都归我"。登记一组 handler + 一个身份
+  // 牌，让挂载、撤下、自查都看成整体。
+  // ---------------------------------------------------------------------------
+
+  Object? _cdnSwitchOwner;
+  ValueChanged<Duration>? _cdnSwitchOnStall;
+  ValueChanged<Duration>? _cdnSwitchOnBufferStarve;
+  ValueChanged<Duration>? _cdnSwitchOnTelemetryDiverged;
+  ValueChanged<Duration>? _cdnSwitchOnRebuffer;
+  bool Function(Duration)? _cdnSwitchOnDecodeError;
+
+  /// 一次性登记这 5 个回调属于 [owner]，并立刻挂到公开字段上。
+  ///
+  /// 先把 handler 引用存进私有登记表、再赋公开字段、最后写 owner —— 全同步，
+  /// 不存在"只挂了一半"的可观察状态。
+  void claimCdnSwitchCallbacks(
+    Object owner, {
+    required ValueChanged<Duration> onStall,
+    required ValueChanged<Duration> onBufferStarve,
+    required ValueChanged<Duration> onTelemetryDiverged,
+    required ValueChanged<Duration> onRebuffer,
+    required bool Function(Duration) onDecodeError,
+  }) {
+    _cdnSwitchOnStall = onStall;
+    _cdnSwitchOnBufferStarve = onBufferStarve;
+    _cdnSwitchOnTelemetryDiverged = onTelemetryDiverged;
+    _cdnSwitchOnRebuffer = onRebuffer;
+    _cdnSwitchOnDecodeError = onDecodeError;
+    this.onStall = onStall;
+    this.onBufferStarve = onBufferStarve;
+    this.onTelemetryDiverged = onTelemetryDiverged;
+    this.onRebuffer = onRebuffer;
+    this.onDecodeError = onDecodeError;
+    _cdnSwitchOwner = owner;
+  }
+
+  /// [owner] 是不是这组回调的现役主人。
+  ///
+  /// 除了身份牌，还要求 [onStall] 仍是登记时那一个：单测会绕过
+  /// [releaseCdnSwitchCallbacks] 直接把回调置空，那时身份牌还在，但页面显然
+  /// 已经不在台上了。
+  bool cdnSwitchCallbacksOwnedBy(Object owner) =>
+      identical(_cdnSwitchOwner, owner) && onStall == _cdnSwitchOnStall;
+
+  /// [owner] 退场：只撤自己挂的那几个回调。
+  ///
+  /// 每个字段都先与登记时的 handler 比对 —— 被顶掉的旧页不能把新页的回调清掉，
+  /// 也不怕测试直接覆盖其中某一个。
+  void releaseCdnSwitchCallbacks(Object owner) {
+    if (!identical(_cdnSwitchOwner, owner)) return;
+    if (onStall == _cdnSwitchOnStall) onStall = null;
+    if (onBufferStarve == _cdnSwitchOnBufferStarve) onBufferStarve = null;
+    if (onTelemetryDiverged == _cdnSwitchOnTelemetryDiverged) {
+      onTelemetryDiverged = null;
+    }
+    if (onRebuffer == _cdnSwitchOnRebuffer) onRebuffer = null;
+    if (onDecodeError == _cdnSwitchOnDecodeError) onDecodeError = null;
+    _cdnSwitchOnStall = null;
+    _cdnSwitchOnBufferStarve = null;
+    _cdnSwitchOnTelemetryDiverged = null;
+    _cdnSwitchOnRebuffer = null;
+    _cdnSwitchOnDecodeError = null;
+    _cdnSwitchOwner = null;
+  }
 
   Timer? _stallTicker;
   int _stallLastSecond = 0;

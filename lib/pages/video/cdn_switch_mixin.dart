@@ -146,6 +146,202 @@ enum _CdnTrigger {
 // `defaultCDNService` 显式传给 getCdnUrl，否则会静默改掉用户的手动设置。
 // ---------------------------------------------------------------------------
 
+/// 自动切换的**整集状态**。
+///
+/// 这些字段原先散在 mixin 里，合法性靠调用顺序维持：`generation` 与 `autoBusy`
+/// 必须在同一口气里推进/清掉，预检的 pending/since 必须同拍，成功时要同时清
+/// attempts / lastAttemptPos / triedAt / giveUpUntil。分开写不会报错，只会在某个
+/// 分支里漏一行，然后以"偶尔多等 20 秒"或"换画质后再也不换源"的形式出现。
+/// 这里把成组写入收成语义方法：调用点只说"开一轮 / 记一次尝试 / 成功了"。
+///
+/// **对象本身永不替换**：[attachedOnce]、预检状态与常驻测速 [autoDio] 要跨重置
+/// 存活，整体替换会把它们一起丢掉。
+class _CdnSwitchState {
+  bool autoBusy = false;
+  int autoAttempts = 0;
+  int generation = 0;
+
+  /// 测过的镜像以及测的时间。原来是永久的 Set：一个镜像测过一次，整集就
+  /// 再不考虑。长时间播放里那是致命的 —— 轮换窗口一路滑下去，实测第 4 轮
+  /// 只剩 aliov/hwov 两个海外节点，而真正快的国内节点早在网络还正常的时候
+  /// 就被"测过"并永久拉黑，此后每次卡顿都只能在这两个最差的里面挑。CDN 的
+  /// 快慢是随时间变的（同一个偏移隔几分钟实测能差 4 倍），所以改成冷却重测。
+  final Map<CDNService, DateTime> triedAt = {};
+
+  /// 上一轮一个字节都没到的候选。见 [CdnTuning.deadRetryAfter]。
+  final Set<CDNService> noSample = {};
+
+  /// 本集里给过**坏字节**的镜像 host。
+  ///
+  /// 和 [noSample] 的区别是正好相反的两种病：那是"一个字节都到不了"，这是
+  /// "字节到得又快又好，只是解不出画面"。所以测速两种都测不出来 —— 坏镜像的
+  /// 吞吐实测 2~14MB/s，比健康镜像还高。这笔账只能由解码器来记（见
+  /// [_CdnTrigger.decode]）。
+  ///
+  /// **不记的话会来回弹**：坏镜像当基线时被强制换走，下一轮**测速**又会把它评成
+  /// 最快候选（它是真的快），于是换回去、画面再冻一次。按 host 记而不是按
+  /// [CDNService]：基线那个 host 是 API 分的，不一定来自枚举表，而候选一律来自
+  /// 枚举表，两边对不上就没法比。
+  ///
+  /// 只在换集/换 P 时清（[CdnSwitchMixin.resetCdnAutoSwitch]）：换一个视频就是
+  /// 另一个对象，同一条边完全可能是好的。
+  final Set<String> badHosts = {};
+
+  /// 历史冠军的"欠账"：连着多少轮**没能成为切换目标**。达到
+  /// [CdnTuning.championMisses] 就不再给它留候选位。
+  ///
+  /// 冠军位是一张**保留票** —— 让快的镜像不必等轮换排到（见
+  /// [CdnSwitchMixin._cdnChampion]）。但保留票的前提是"迟早能兑现"。
+  /// [CdnSwitchMixin._recordCdnSample] 只留最大值、且只在**刷新纪录**时才续
+  /// 30 分钟的时钟，于是当一条记录是靠一次突发立起来的、此后每轮实测都更慢
+  /// 时，它既不更新也不作废（覆盖不了自己，也够不着 6 小时的作废线），冠军位
+  /// 就被永久占住。
+  ///
+  /// 实测 2026-10-11 一局 25 轮：`ali（阿里云）` 连任 25/25 轮冠军，轮轮实测
+  /// 0.475–0.879MB/s，而同一轮的基线有 1.7–6.1MB/s（比值 0.12–0.47，门槛 1.5）
+  /// —— 一个候选位白占到底，轮换一轮只够走一个镜像。
+  ///
+  /// 用**结果**记这个账，而不是拿记录去比当下基线：基线每轮都在变（实测同一条
+  /// 链路隔几分钟能差 4 倍），静态记录比动态读数本来就没有可靠门限；而"这一轮
+  /// 它有没有被选中"是确定的事实。被选中就清零，所以降级可逆 —— 它还能从轮换
+  /// 窗口里被取到，并靠被选中重新挣回冠军位（见
+  /// [CdnSwitchMixin._noteChampionOutcome]）。
+  final Map<CDNService, int> championMisses = {};
+
+  /// 这一集的对象总长。所有镜像服务字节一致的同一个对象，探一次就够；
+  /// 缓存它主要是为了小卡顿档 —— 3 秒预算里不该再花几秒去探大小。
+  int? objectSize;
+
+  Duration lastAttemptPos = Duration.zero;
+  CDNService? autoServiceSnapshot;
+  Dio? autoDio;
+
+  // ---------------------------------------------------------------------------
+  // 时钟与闸门。三个时间闸互相独立，谁也别合并谁：
+  //   giveUpUntil  整集放弃——一轮试完仍不行，60s 内不再响应任何触发
+  //   quickProbeAt 只压"小卡顿"这一条触发（30s），其余触发照常
+  //   probeTimer   后台探测的 tick，顺带承担起播预检
+  // ---------------------------------------------------------------------------
+
+  Timer? probeTimer;
+
+  /// 装载后那一次"预检"还没做。和周期性的常规测速区分开：预检无视缓冲水位，
+  /// 常规测速只在缓冲吃紧时才跑。见 [CdnSwitchMixin._onCdnProbeTick]。
+  bool preflightPending = false;
+
+  /// 本页**有没有挂载过**。只给 [CdnSwitchMixin.attachCdnSwitch] 分场合用：
+  /// 页面创建时那一次（宿主 `onInit`）要武装装载后的预检，之后每次回页
+  /// （`didPopNext`）不要 —— 两次调用的是同一个方法，只能靠它区别。
+  /// 见 [CdnSwitchMixin.restartCdnProbe] 的 `armPreflight`。
+  bool attachedOnce = false;
+
+  /// 本次预检从什么时候开始等（起播那一刻算起，不是页面创建时刻）。
+  DateTime? preflightSince;
+
+  DateTime? quickProbeAt;
+  DateTime? giveUpUntil;
+
+  /// 换集/换 P/重置：整集的时间与镜像账一并作废。
+  ///
+  /// **不碰** [attachedOnce]、[preflightPending]、[preflightSince]、[probeTimer]
+  /// 与 [autoDio]：它们描述的是页面/连接的生命周期，不是当前这一集。
+  void resetEpisode() {
+    generation++;
+    autoBusy = false;
+    autoAttempts = 0;
+    triedAt.clear();
+    noSample.clear();
+    // 换集/换画质是新的对象，坏字节的账也跟着作废：同一条边对另一个视频
+    // 完全可能是好的。
+    badHosts.clear();
+    // 换集/换画质是新的比较对象，冠军位的欠账重新计。
+    championMisses.clear();
+    // 换集/换画质后对象变了，缓存的总长不再适用。
+    objectSize = null;
+    giveUpUntil = null;
+    lastAttemptPos = Duration.zero;
+    autoServiceSnapshot = null;
+    // 小卡顿的节流也要重来：不带上它，新一集开头 30 秒的 rebuffer 全被上一集的
+    // 时间戳压住。
+    quickProbeAt = null;
+  }
+
+  /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
+  ///
+  /// 和 [resetEpisode] 的区别在时间型冷却：这里**保留** [giveUpUntil] /
+  /// [triedAt] / [noSample]。原先把整套 reset 无条件放在换画质路径上，会顺手
+  /// 清掉放弃冷却和镜像冷却，等于每次调画质都重新开闸。
+  ///
+  /// 清 [autoBusy] 必须和 [_autoSwitchLoop] 的代际守卫配套：在途那一轮被
+  /// generation++ 作废后，它的 whenComplete 不会再清 busy，所以只能在这里放闸，
+  /// 否则闸门永远关着、此后再也不响应任何触发。
+  void resetForNewObject() {
+    generation++;
+    objectSize = null;
+    badHosts.clear();
+    championMisses.clear();
+    lastAttemptPos = Duration.zero;
+    autoServiceSnapshot = null;
+    if (autoBusy) {
+      autoBusy = false;
+      autoAttempts = 0;
+    }
+  }
+
+  /// 挂载即宣告"在台上的又是我"：作废在途轮次并放闸。
+  ///
+  /// 只推进代际不让 [_roundVoided] 认账还不够：那一轮的 whenComplete 只在代际
+  /// 没变时才放闸，代际一动就再也不放手，留着 busy 为真等于把自动换源永久关掉。
+  void noteAttach() {
+    generation++;
+    autoBusy = false;
+  }
+
+  /// 开一轮：占住并发闸，记下这一轮的基线快照，返回本轮代际。
+  int beginRound(CDNService? baseline) {
+    autoBusy = true;
+    autoServiceSnapshot = baseline;
+    return generation;
+  }
+
+  /// 收轮：只清**本代**的闸。中途换集/换画质会 generation++，那一轮已经作废，
+  /// 而新的一轮（新代）可能已经把 busy 置真 —— 陈旧的这里不能把它清掉。
+  void completeRound(int roundGeneration) {
+    if (roundGeneration == generation) autoBusy = false;
+  }
+
+  /// 记一次尝试。[zeroBasedAttempt] 是循环里的零基下标，日志与对外口径用一基。
+  void noteAttempt(int zeroBasedAttempt, Duration stalledAt) {
+    autoAttempts = zeroBasedAttempt + 1;
+    lastAttemptPos = stalledAt;
+  }
+
+  /// 换源后恢复：尝试计数、进展闸门、镜像冷却、放弃冷却一起归零。
+  void noteSuccess() {
+    autoAttempts = 0;
+    lastAttemptPos = Duration.zero;
+    triedAt.clear();
+    giveUpUntil = null;
+  }
+
+  /// 装一档"整集放弃"冷却。
+  void armGiveUp(Duration cooldown) {
+    giveUpUntil = DateTime.now().add(cooldown);
+  }
+
+  /// 预检武装：等待起播，尚不计时。
+  void armPreflight() {
+    preflightPending = true;
+    preflightSince = null;
+  }
+
+  /// 预检已被接受：消费 pending，之后按常规周期走。
+  void consumePreflight() {
+    preflightPending = false;
+    preflightSince = null;
+  }
+}
+
 /// 以 mixin 的形式挂在页面控制器上，而不是独立类：本功能要用到页面的一大堆
 /// 状态（当前地址、画质、播放器、data…），独立类得为它们造一整套接口；而
 /// 页面控制器本来就已经 `with BlockMixin`（lib/pages/sponsor_block/block_mixin.dart），
@@ -201,67 +397,16 @@ mixin CdnSwitchMixin on GetxController {
   // 参数：改这些数字就是在改自动切换的性格。触发语义见上面的契约。
   // ---------------------------------------------------------------------------
 
-
   // ---------------------------------------------------------------------------
-  // 一集之内的状态：换集、换 P、换画质都走 resetCdnAutoSwitch() 清掉。
+  // 一集之内的状态：见 [_CdnSwitchState]。对象本身永不替换，换集/换画质只调
+  // 它的 reset 方法。
   // ---------------------------------------------------------------------------
 
-  bool _cdnAutoBusy = false;
-  int _cdnAutoAttempts = 0;
-  int _cdnGeneration = 0;
+  final _CdnSwitchState _cdnState = _CdnSwitchState();
 
-  /// 测过的镜像以及测的时间。原来是永久的 Set：一个镜像测过一次，整集就
-  /// 再不考虑。长时间播放里那是致命的 —— 轮换窗口一路滑下去，实测第 4 轮
-  /// 只剩 aliov/hwov 两个海外节点，而真正快的国内节点早在网络还正常的时候
-  /// 就被"测过"并永久拉黑，此后每次卡顿都只能在这两个最差的里面挑。CDN 的
-  /// 快慢是随时间变的（同一个偏移隔几分钟实测能差 4 倍），所以改成冷却重测。
-  final Map<CDNService, DateTime> _cdnTriedAt = {};
-
-  /// 上一轮一个字节都没到的候选。见 [CdnTuning.deadRetryAfter]。
-  final Set<CDNService> _cdnNoSample = {};
-
-  /// 本集里给过**坏字节**的镜像 host。
-  ///
-  /// 和 [_cdnNoSample] 的区别是正好相反的两种病：那是"一个字节都到不了"，这是
-  /// "字节到得又快又好，只是解不出画面"。所以测速两种都测不出来 —— 坏镜像的
-  /// 吞吐实测 2~14MB/s，比健康镜像还高。这笔账只能由解码器来记（见
-  /// [_CdnTrigger.decode]）。
-  ///
-  /// **不记的话会来回弹**：坏镜像当基线时被强制换走，下一轮**测速**又会把它评成
-  /// 最快候选（它是真的快），于是换回去、画面再冻一次。按 host 记而不是按
-  /// [CDNService]：基线那个 host 是 API 分的，不一定来自枚举表，而候选一律来自
-  /// 枚举表，两边对不上就没法比。
-  ///
-  /// 只在换集/换 P 时清（[resetCdnAutoSwitch]）：换一个视频就是另一个对象，
-  /// 同一条边完全可能是好的。
-  final Set<String> _cdnBadHosts = {};
-
-  /// 历史冠军的"欠账"：连着多少轮**没能成为切换目标**。达到
-  /// [CdnTuning.championMisses] 就不再给它留候选位。
-  ///
-  /// 冠军位是一张**保留票** —— 让快的镜像不必等轮换排到（见 [_cdnChampion]）。
-  /// 但保留票的前提是"迟早能兑现"。[_recordCdnSample] 只留最大值、且只在**刷新
-  /// 纪录**时才续 30 分钟的时钟，于是当一条记录是靠一次突发立起来的、此后每轮
-  /// 实测都更慢时，它既不更新也不作废（覆盖不了自己，也够不着 6 小时的作废线），
-  /// 冠军位就被永久占住。
-  ///
-  /// 实测 2026-10-11 一局 25 轮：`ali（阿里云）` 连任 25/25 轮冠军，轮轮实测
-  /// 0.475–0.879MB/s，而同一轮的基线有 1.7–6.1MB/s（比值 0.12–0.47，门槛 1.5）
-  /// —— 一个候选位白占到底，轮换一轮只够走一个镜像。
-  ///
-  /// 用**结果**记这个账，而不是拿记录去比当下基线：基线每轮都在变（实测同一条
-  /// 链路隔几分钟能差 4 倍），静态记录比动态读数本来就没有可靠门限；而"这一轮
-  /// 它有没有被选中"是确定的事实。被选中就清零，所以降级可逆 —— 它还能从轮换
-  /// 窗口里被取到，并靠被选中重新挣回冠军位（见 [_noteChampionOutcome]）。
-  final Map<CDNService, int> _cdnChampionMisses = {};
-
-  /// 这一集的对象总长。所有镜像服务字节一致的同一个对象，探一次就够；
-  /// 缓存它主要是为了小卡顿档 —— 3 秒预算里不该再花几秒去探大小。
-  int? _cdnObjectSize;
-
-  Duration _cdnLastAttemptPos = Duration.zero;
-  CDNService? _cdnAutoServiceSnapshot;
-  Dio? _cdnAutoDio;
+  /// 本页在 [PlPlayerController] 上的身份牌。回调归属见
+  /// [PlPlayerController.claimCdnSwitchCallbacks]。
+  final Object _cdnClaimToken = Object();
 
   /// 单测注入点：填了就用它测速，不填就走真网络（[CdnSpeedTest.createDio]）。
   ///
@@ -275,37 +420,13 @@ mixin CdnSwitchMixin on GetxController {
   /// 测试用：这一轮是不是还在途。T2 用例要靠它确定"轮次收尾、busy 已清"，
   /// 而不是靠猜一个 sleep 时长。
   @visibleForTesting
-  bool get debugCdnAutoBusy => _cdnAutoBusy;
-
-  // ---------------------------------------------------------------------------
-  // 时钟与闸门。三个时间闸互相独立，谁也别合并谁：
-  //   _cdnGiveUpUntil  整集放弃——一轮试完仍不行，60s 内不再响应任何触发
-  //   _cdnQuickProbeAt 只压"小卡顿"这一条触发（30s），其余触发照常
-  //   _cdnProbeTimer   后台探测的 tick，顺带承担起播预检
-  // ---------------------------------------------------------------------------
-
-  Timer? _cdnProbeTimer;
-
-  /// 装载后那一次"预检"还没做。和周期性的常规测速区分开：预检无视缓冲水位，
-  /// 常规测速只在缓冲吃紧时才跑。见 [_onCdnProbeTick]。
-  bool _cdnPreflightPending = false;
-
-  /// 本页**有没有挂载过**。只给 [attachCdnSwitch] 分场合用：页面创建时那一次
-  /// （宿主 `onInit`）要武装装载后的预检，之后每次回页（`didPopNext`）不要 —— 两次
-  /// 调用的是同一个方法，只能靠它区别。见 [restartCdnProbe] 的 `armPreflight`。
-  bool _cdnAttachedOnce = false;
-
-  /// 本次预检从什么时候开始等（起播那一刻算起，不是页面创建时刻）。
-  DateTime? _cdnPreflightSince;
-
-  DateTime? _cdnQuickProbeAt;
-  DateTime? _cdnGiveUpUntil;
+  bool get debugCdnAutoBusy => _cdnState.autoBusy;
 
   /// 冷却窗口还没过（时长取决于上一轮的样本是"慢"还是"一个字都没有"）。
   bool _cdnRecentlyTried(CDNService service, DateTime now) {
-    final at = _cdnTriedAt[service];
+    final at = _cdnState.triedAt[service];
     if (at == null) return false;
-    final window = _cdnNoSample.contains(service)
+    final window = _cdnState.noSample.contains(service)
         ? CdnTuning.deadRetryAfter
         : CdnTuning.retryAfter;
     return now.difference(at) < window;
@@ -363,7 +484,7 @@ mixin CdnSwitchMixin on GetxController {
   /// 造成误切，只是白占一个位子。
   ///
   /// 但"只是白占一个位子"这件事本身是要还的：连着 [CdnTuning.championMisses] 轮没能
-  /// 成为切换目标就不再发这张保留票，见 [_cdnChampionMisses]。
+  /// 成为切换目标就不再发这张保留票，见 `_cdnState.championMisses`。
   ///
   /// 要求"当过候选"是因为基线样本和候选样本不是同一个测量：基线用原始签名
   /// URL，候选用改写 host 之后的 URL。`akamai` 就是反例 —— 当基线能跑到
@@ -387,13 +508,16 @@ mixin CdnSwitchMixin on GetxController {
       // 当前在播的已经坐在基线位置上了，再占一个候选位子等于白少测一个镜像。
       if (service.host == currentHost) continue;
       // 给过坏字节的镜像不是"快不快"的问题，历史记录里它可能正是最快的那个
-      // （见 [_cdnBadHosts]）。留着它等于每一轮都白占一个候选位。
-      if (service.host == null || _cdnBadHosts.contains(service.host)) continue;
-      // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 [_cdnChampionMisses]。
-      if ((_cdnChampionMisses[service] ?? 0) >= CdnTuning.championMisses) {
+      // （见 `_cdnState.badHosts`）。留着它等于每一轮都白占一个候选位。
+      if (service.host == null || _cdnState.badHosts.contains(service.host)) {
+        continue;
+      }
+      // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 `_cdnState.championMisses`。
+      if ((_cdnState.championMisses[service] ?? 0) >=
+          CdnTuning.championMisses) {
         debugPrint(
           'CDN 自动切换: 历史冠军候选 ${service.desc} 已降级，本轮不发保留票 '
-          '(欠账 ${_cdnChampionMisses[service]}/${CdnTuning.championMisses})',
+          '(欠账 ${_cdnState.championMisses[service]}/${CdnTuning.championMisses})',
         );
         continue;
       }
@@ -428,7 +552,7 @@ mixin CdnSwitchMixin on GetxController {
   /// 这三种都是没兑现。
   void _noteChampionOutcome(_CdnRound round) {
     if (round.verdict == _CdnRoundVerdict.better) {
-      _cdnChampionMisses.remove(round.service);
+      _cdnState.championMisses.remove(round.service);
     }
     final champion = round.champion;
     if (champion == null ||
@@ -436,8 +560,8 @@ mixin CdnSwitchMixin on GetxController {
         round.service == champion) {
       return;
     }
-    final misses = (_cdnChampionMisses[champion] ?? 0) + 1;
-    _cdnChampionMisses[champion] = misses;
+    final misses = (_cdnState.championMisses[champion] ?? 0) + 1;
+    _cdnState.championMisses[champion] = misses;
     debugPrint(
       misses >= CdnTuning.championMisses
           ? 'CDN 自动切换: 历史冠军 ${champion.desc} 连续 $misses 轮没能成为切换目标，'
@@ -465,24 +589,7 @@ mixin CdnSwitchMixin on GetxController {
   /// [resetPlayerAccounting] 为假时不动共享播放器的解码账 —— 见 [detachCdnSwitch]：
   /// 那份账属于现役页面，一个已经不在台上的旧页退出时没资格清它。
   void resetCdnAutoSwitch({bool resetPlayerAccounting = true}) {
-    _cdnGeneration++;
-    _cdnAutoBusy = false;
-    _cdnAutoAttempts = 0;
-    _cdnTriedAt.clear();
-    _cdnNoSample.clear();
-    // 换集/换画质是新的对象，坏字节的账也跟着作废：同一条边对另一个视频
-    // 完全可能是好的。
-    _cdnBadHosts.clear();
-    // 换集/换画质是新的比较对象，冠军位的欠账重新计。
-    _cdnChampionMisses.clear();
-    // 换集/换画质后对象变了，缓存的总长不再适用。
-    _cdnObjectSize = null;
-    _cdnGiveUpUntil = null;
-    _cdnLastAttemptPos = Duration.zero;
-    _cdnAutoServiceSnapshot = null;
-    // 小卡顿的节流也要重来：不带上它，新一集开头 30 秒的 rebuffer 全被上一集的
-    // 时间戳压住。
-    _cdnQuickProbeAt = null;
+    _cdnState.resetEpisode();
     // 解码错误的账在播放器侧，换对象时一并作废（同一条边对另一个视频可能是好的）。
     if (resetPlayerAccounting) plPlayerController.resetDecodeErrorAccounting();
   }
@@ -493,28 +600,19 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
   ///
-  /// 和 [resetCdnAutoSwitch] 的区别在时间型冷却：这里**保留** [_cdnGiveUpUntil] /
-  /// [_cdnTriedAt] / [_cdnNoSample]。原先把整套 reset 无条件放在换画质路径上，会
+  /// 和 [resetCdnAutoSwitch] 的区别在时间型冷却：这里**保留** `_cdnState.giveUpUntil` /
+  /// `_cdnState.triedAt` / `_cdnState.noSample`。原先把整套 reset 无条件放在换画质路径上，会
   /// 顺手清掉放弃冷却和镜像冷却，等于每次调画质都重新开闸。
   ///
-  /// 但对象相关的几样必须清 —— 尤其是 [_cdnObjectSize]：换了画质对象长度就变了，
+  /// 但对象相关的几样必须清 —— 尤其是 `_cdnState.objectSize`：换了画质对象长度就变了，
   /// 留着旧值会把取样偏移指到新对象之外，服务端回 416，整集每轮都测不出东西。
   ///
-  /// 清 [_cdnAutoBusy] 必须和 [_autoSwitchLoop] 里的代际守卫配套：在途那一轮被
+  /// 清 `_cdnState.autoBusy` 必须和 [_autoSwitchLoop] 里的代际守卫配套：在途那一轮被
   /// generation++ 作废后，它的 whenComplete 不会再清 busy（见那里的注释），所以
   /// 只能在这里放闸，否则闸门永远关着、此后再也不响应任何触发。
   void resetCdnForNewObject() {
-    _cdnGeneration++;
-    _cdnObjectSize = null;
-    _cdnBadHosts.clear();
-    _cdnChampionMisses.clear();
-    _cdnLastAttemptPos = Duration.zero;
-    _cdnAutoServiceSnapshot = null;
+    _cdnState.resetForNewObject();
     plPlayerController.resetDecodeErrorAccounting();
-    if (_cdnAutoBusy) {
-      _cdnAutoBusy = false;
-      _cdnAutoAttempts = 0;
-    }
   }
 
   /// 小卡顿（余量刚归零）触发的后台探测。
@@ -524,7 +622,7 @@ mixin CdnSwitchMixin on GetxController {
   /// 的播放器抢同一根管子，所以单独压一个 [CdnTuning.rebufferCooldown]。只测速，
   /// 换不换仍由 [CdnTuning.starveRatio] 决定 —— 一次抖动的样本不该换来一次重载。
   void _onPlayerRebuffer(Duration position) {
-    final at = _cdnQuickProbeAt;
+    final at = _cdnState.quickProbeAt;
     final now = DateTime.now();
     if (at != null && now.difference(at) < CdnTuning.rebufferCooldown) {
       debugPrint(
@@ -539,7 +637,7 @@ mixin CdnSwitchMixin on GetxController {
     // 于是画面一直冻着也要等满 30s 才轮到下一次。连续 rebuffer 刷不爆：一旦被
     // 接受，时间戳当场落下，后面的都在节流里。
     if (_onPlayerStall(position, trigger: _CdnTrigger.rebuffer)) {
-      _cdnQuickProbeAt = now;
+      _cdnState.quickProbeAt = now;
     }
   }
 
@@ -557,7 +655,7 @@ mixin CdnSwitchMixin on GetxController {
     if (_onPlayerStall(position, trigger: _CdnTrigger.decode)) return true;
     // 在途轮次 = 稍后会有人动手 → 回 false，请播放器退避后重发；
     // 页面已关 / 不符合资格 = 永远没人动手 → 回 true（按已受理回报，免得播放器无限重发）。
-    return !(_cdnAutoBusy && !isClosed && _cdnAutoEligible);
+    return !(_cdnState.autoBusy && !isClosed && _cdnAutoEligible);
   }
 
   /// 返回**这次触发有没有真的起步**（闸门全过、[_autoSwitchLoop] 已起）。调用方
@@ -577,10 +675,10 @@ mixin CdnSwitchMixin on GetxController {
     _CdnTrigger trigger = _CdnTrigger.stall,
   }) {
     final what = trigger.label;
-    if (_cdnAutoBusy || isClosed || !_cdnAutoEligible) {
+    if (_cdnState.autoBusy || isClosed || !_cdnAutoEligible) {
       debugPrint(
         'CDN 自动切换: 忽略$what @${position.inSeconds}s '
-        '(busy=$_cdnAutoBusy closed=$isClosed eligible=$_cdnAutoEligible)',
+        '(busy=${_cdnState.autoBusy} closed=$isClosed eligible=$_cdnAutoEligible)',
       );
       return false;
     }
@@ -602,7 +700,7 @@ mixin CdnSwitchMixin on GetxController {
     // - 21:29:22 / 21:29:43 两次「遥测失真」（切画质拿到坏地址，音频在走、画面
     //   冻着）被 21:28:48 一次**无关**尝试留下的 60s 放弃冷却吞掉，直到 21:30:04
     //   冷却过期才放行 —— 画面多冻了 61 秒。
-    final cooldownUntil = _cdnGiveUpUntil;
+    final cooldownUntil = _cdnState.giveUpUntil;
     if (!trigger.bypassesGates &&
         cooldownUntil != null &&
         DateTime.now().isBefore(cooldownUntil)) {
@@ -619,23 +717,22 @@ mixin CdnSwitchMixin on GetxController {
     // 位置回退（用户回拖、playRepeat 循环）会让下面的差值恒为负，闸门就永远
     // 关上了 —— 直到播回上一次尝试的位置为止。回退一律当作新的播放区间，重开闸。
     // 放在这里（前面几道 return 之后）：被丢弃的触发不该改状态。
-    if (_cdnLastAttemptPos != Duration.zero && position < _cdnLastAttemptPos) {
-      _cdnLastAttemptPos = Duration.zero;
+    if (_cdnState.lastAttemptPos != Duration.zero &&
+        position < _cdnState.lastAttemptPos) {
+      _cdnState.lastAttemptPos = Duration.zero;
     }
     if (!trigger.bypassesGates &&
-        _cdnLastAttemptPos != Duration.zero &&
-        position - _cdnLastAttemptPos < CdnTuning.minReProgress) {
+        _cdnState.lastAttemptPos != Duration.zero &&
+        position - _cdnState.lastAttemptPos < CdnTuning.minReProgress) {
       debugPrint(
         'CDN 自动切换: 距上次尝试只推进了 '
-        '${(position - _cdnLastAttemptPos).inSeconds}s，忽略',
+        '${(position - _cdnState.lastAttemptPos).inSeconds}s，忽略',
       );
       return false;
     }
 
     debugPrint('CDN 自动切换: ${_describeTrigger(trigger, position)}');
-    _cdnAutoBusy = true;
-    _cdnAutoServiceSnapshot = VideoUtils.cdnService;
-    final generation = _cdnGeneration;
+    final generation = _cdnState.beginRound(VideoUtils.cdnService);
     _autoSwitchLoop(
       generation,
       position,
@@ -646,7 +743,7 @@ mixin CdnSwitchMixin on GetxController {
       // 只清**本代**的闸。中途换集/换画质会 generation++，那一轮已经作废，而新的
       // 一轮（新代）可能已经把 busy 置真 —— 陈旧的这里不能把它清掉，否则会出现
       // 两条 loop 并发跑。
-      if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;
+      if (!isClosed) _cdnState.completeRound(generation);
     });
     return true;
   }
@@ -680,18 +777,17 @@ mixin CdnSwitchMixin on GetxController {
   /// [armPreflight] 把"重新挂定时器"和"武装预检"两件事分开。回页（[attachCdnSwitch]
   /// 的第二次及以后）只要前者：那是"重新露面"，不是新视频，无条件再武装一次预检
   /// 等于每次从相关视频返回都白花一轮 ~6MB 的测速。传假时**不碰**
-  /// [_cdnPreflightPending]，所以被顶掉期间还没做的那次预检照旧留着。传真（默认）
+  /// `_cdnState.preflightPending`，所以被顶掉期间还没做的那次预检照旧留着。传真（默认）
   /// 的是换 P / 换集（[onReset]）与页面的**首次**挂载。
   void restartCdnProbe({bool armPreflight = true}) {
-    if (armPreflight) {
-      _cdnPreflightPending = true;
-      _cdnPreflightSince = null;
-    }
-    _cdnProbeTimer?.cancel();
+    if (armPreflight) _cdnState.armPreflight();
+    _cdnState.probeTimer?.cancel();
     // 节拍跟着**当前 pending 状态**走，而不是跟着入参：回页时若预检还没做，就
     // 仍用 [CdnTuning.preflightPoll] 让它尽快跑掉；做完了才降到 [CdnTuning.probeInterval]。
-    _cdnProbeTimer = Timer.periodic(
-      _cdnPreflightPending ? CdnTuning.preflightPoll : CdnTuning.probeInterval,
+    _cdnState.probeTimer = Timer.periodic(
+      _cdnState.preflightPending
+          ? CdnTuning.preflightPoll
+          : CdnTuning.probeInterval,
       (_) => _onCdnProbeTick(),
     );
   }
@@ -699,21 +795,23 @@ mixin CdnSwitchMixin on GetxController {
   /// 本页是不是当前挂在播放器上的那一页。
   ///
   /// [PlPlayerController] 是**跨页单例**，而相关视频跳转会再 push 一个 `/videoV`
-  /// （不 onClose 旧的），于是两个页面各有自己的 [_cdnProbeTimer]。后挂的那一页会
+  /// （不 onClose 旧的），于是两个页面各有自己的 `_cdnState.probeTimer`。后挂的那一页会
   /// 覆盖回调，所以"回调是不是我的"就等于"我是不是当前页"。
   /// [PlPlayerController._isCurrVideoPage] 判不了这件事 —— 新旧两页都是 `/videoV`。
-  bool get _cdnIsAttached => plPlayerController.onStall == _onPlayerStall;
+  bool get _cdnIsAttached =>
+      plPlayerController.cdnSwitchCallbacksOwnedBy(_cdnClaimToken);
 
   /// 这一轮测速是不是已经作废：用户换了画质/换 P/换集（[resetCdnForNewObject]
-  /// 推进了 [_cdnGeneration]、清空了 [_cdnObjectSize]），或者本页已经关了。
+  /// 推进了 `_cdnState.generation`、清空了 `_cdnState.objectSize`），或者本页已经关了。
   ///
   /// 一轮要跑好几秒，中间全是 await，作废之后**一个字节的状态都不许提交**。
-  /// 尤其是 [_cdnObjectSize]：它是**一次性**的（只有 `size == null` 才会去探），
+  /// 尤其是 `_cdnState.objectSize`：它是**一次性**的（只有 `size == null` 才会去探），
   /// 一旦被旧对象的长度重新填上，这一集就再也不会探第二次；此后每一轮都拿旧
   /// 长度算 [CdnSpeedTest.targetOffset]，落到短一截的新对象上必得 416 →
   /// unmeasurable → 自动换源整集失效。这正是 [resetCdnForNewObject] 要防的那个
   /// 416 循环 —— 它清掉了缓存，却在几秒后被在途的那一轮又填回去。
-  bool _roundVoided(int generation) => generation != _cdnGeneration || isClosed;
+  bool _roundVoided(int generation) =>
+      generation != _cdnState.generation || isClosed;
 
   /// [_roundVoided] 之外再补一条：本页**是不是还挂在播放器上**。
   ///
@@ -723,7 +821,8 @@ mixin CdnSwitchMixin on GetxController {
   /// 复查）早就用 [_cdnIsAttached] 了，**尾段漏了**：[_switchTo] 重载完之后的
   /// 位置纠正、[_awaitRecovery] 的恢复判定，都会让被顶掉的旧页拿旧视频的落点
   /// 去 seek 新视频的播放器。尾段里驱动播放器的调用点里，这三处正是原先漏掉的。
-  bool _roundLive(int generation) => !_roundVoided(generation) && _cdnIsAttached;
+  bool _roundLive(int generation) =>
+      !_roundVoided(generation) && _cdnIsAttached;
 
   /// 把本页挂到播放器的上报口上（见 [detachCdnSwitch]）。
   ///
@@ -736,32 +835,33 @@ mixin CdnSwitchMixin on GetxController {
     // 共享播放器的回调，我又在用户退回来时重新挂上（`view.dart` 的 `didPopNext`）。
     // 这一挂就等于宣告"在台上的又是我"：被顶掉期间留下的那一轮已经跑在**别的视频**
     // 的地址上，必须当场作废，否则它醒来时会发现 `_cdnIsAttached` 又成了真，接着
-    // 往下指挥播放器。推进代际只是让 [_roundVoided] 认得它；`_cdnAutoBusy` 必须
+    // 往下指挥播放器。推进代际只是让 [_roundVoided] 认得它；`_cdnState.autoBusy` 必须
     // 同一口气清掉 —— 那一轮的 whenComplete（见 [_onPlayerStall]）只在代际没变时
     // 才放闸，代际一动就再也不放手，留着 busy 为真等于把本页的自动换源永久关掉。
-    _cdnGeneration++;
-    _cdnAutoBusy = false;
+    _cdnState.noteAttach();
     // 一页 = 一个对象。相关视频跳转会再 push 一个 `/videoV` 而**不** onClose
     // 旧的，播放器却是同一个跨页单例，于是旧页留下的解码账会直接算到新视频
     // 头上：[_decodeErrors] 的残余让新视频几条零星报错就凑满风暴门槛（提前
     // 换源），没过期的 [_decodeErrorUntil] 又把新视频真正的风暴按下去（30s 内
     // 不换源），而一条陈旧的 [lastDecoderCorruptionAt] 会让新镜像的恢复判定
     // 立刻通过。挂载即换对象，重新记账。
-    plPlayerController
-      ..resetDecodeErrorAccounting()
-      ..onStall = _onPlayerStall
-      ..onBufferStarve = _onPlayerBufferStarve
-      ..onTelemetryDiverged = _onTelemetryDiverged
-      ..onRebuffer = _onPlayerRebuffer
-      ..onDecodeError = _onDecodeError;
+    plPlayerController.resetDecodeErrorAccounting();
+    plPlayerController.claimCdnSwitchCallbacks(
+      _cdnClaimToken,
+      onStall: _onPlayerStall,
+      onBufferStarve: _onPlayerBufferStarve,
+      onTelemetryDiverged: _onTelemetryDiverged,
+      onRebuffer: _onPlayerRebuffer,
+      onDecodeError: _onDecodeError,
+    );
     // **首次挂载**（页面 `onInit`）要武装装载后那一次预检 —— 那正是"新视频装载
     // 后测一轮"的入口（初次装载走 `queryVideoUrl`，**不经过** `onReset`，所以不
     // 能指望 onReset 替它武装）。之后每次**回页**（`didPopNext`）只重挂定时器，
     // **不**重置 pending：那个视频的预检要么已经做过、要么还留着 pending 在等，
     // 无条件再武装等于每次从相关视频返回都白花一轮 ~6MB 的测速。两次调用的是
     // 同一个方法，只能靠"本页有没有挂载过"来分。
-    restartCdnProbe(armPreflight: !_cdnAttachedOnce);
-    _cdnAttachedOnce = true;
+    restartCdnProbe(armPreflight: !_cdnState.attachedOnce);
+    _cdnState.attachedOnce = true;
   }
 
   /// 页面销毁：只撤掉自己的回调，别把新页面的覆盖掉。
@@ -769,23 +869,9 @@ mixin CdnSwitchMixin on GetxController {
     // 先记下自己是不是现役页：下面把回调置空之后 _cdnIsAttached 就成了假，
     // 连"我是不是当前那页"都判不出来了。
     final wasAttached = _cdnIsAttached;
-    if (plPlayerController.onStall == _onPlayerStall) {
-      plPlayerController.onStall = null;
-    }
-    if (plPlayerController.onBufferStarve == _onPlayerBufferStarve) {
-      plPlayerController.onBufferStarve = null;
-    }
-    if (plPlayerController.onTelemetryDiverged == _onTelemetryDiverged) {
-      plPlayerController.onTelemetryDiverged = null;
-    }
-    if (plPlayerController.onRebuffer == _onPlayerRebuffer) {
-      plPlayerController.onRebuffer = null;
-    }
-    if (plPlayerController.onDecodeError == _onDecodeError) {
-      plPlayerController.onDecodeError = null;
-    }
-    _cdnProbeTimer?.cancel();
-    _cdnProbeTimer = null;
+    plPlayerController.releaseCdnSwitchCallbacks(_cdnClaimToken);
+    _cdnState.probeTimer?.cancel();
+    _cdnState.probeTimer = null;
     // 被顶掉的旧页关掉时（相关视频跳转后返回再退出），**共享播放器的**解码账
     // 是现役那一页的，不能被我这个正在退场的人清掉：清了会让它正攒的风暴从头
     // 再攒（推迟换源），或者让它在 _awaitRecovery 里因为 lastDecoderCorruptionAt
@@ -800,12 +886,12 @@ mixin CdnSwitchMixin on GetxController {
   /// 从 `ListenableMixin` 拿到的那个 `dispose()` 只是 ChangeNotifier 式的通知
   /// 清理，不是生命周期；Get 删除控制器走的是 `onDelete()` → `onClose()`）。所以
   /// 关 [Dio] 这件事挂在 `onClose` 上。除了撤回调（[detachCdnSwitch]），还要把
-  /// 测速用的 [Dio] 关掉 —— [_cdnAutoDio] 一旦建起来就常驻（每轮复用它省掉重连
+  /// 测速用的 [Dio] 关掉 —— `_cdnState.autoDio` 一旦建起来就常驻（每轮复用它省掉重连
   /// 开销），不关就跟着页面泄漏。
   @override
   void onClose() {
-    _cdnAutoDio?.close();
-    _cdnAutoDio = null;
+    _cdnState.autoDio?.close();
+    _cdnState.autoDio = null;
     super.onClose();
   }
 
@@ -860,19 +946,19 @@ mixin CdnSwitchMixin on GetxController {
     // onClose）：我这一拍只会用**旧视频的 URL** 去重载播放器。发现被顶掉就停掉
     // 自己的定时器。
     if (!_cdnIsAttached) {
-      _cdnProbeTimer?.cancel();
-      _cdnProbeTimer = null;
+      _cdnState.probeTimer?.cancel();
+      _cdnState.probeTimer = null;
       return;
     }
-    if (isClosed || _cdnAutoBusy || !_cdnAutoEligible) return;
+    if (isClosed || _cdnState.autoBusy || !_cdnAutoEligible) return;
     // 还没开播就把预检留着，下一个 tick 再试 —— 页面创建到真正起播之间可能
     // 隔很久（分段加载、用户没点播放），一次错过就永远不做预检了。
     if (!plPlayerController.playerStatus.isPlaying) return;
 
-    final preflight = _cdnPreflightPending;
+    final preflight = _cdnState.preflightPending;
     final floor = _cdnBufferFloor;
     if (preflight) {
-      final since = _cdnPreflightSince ??= DateTime.now();
+      final since = _cdnState.preflightSince ??= DateTime.now();
       final filled = floor != null && plPlayerController.bufferedAhead >= floor;
       if (!filled &&
           DateTime.now().difference(since) < CdnTuning.preflightDeadline) {
@@ -893,10 +979,9 @@ mixin CdnSwitchMixin on GetxController {
       trigger: preflight ? _CdnTrigger.preflight : _CdnTrigger.probe,
     );
     if (preflight && accepted) {
-      _cdnPreflightPending = false;
-      _cdnPreflightSince = null;
-      _cdnProbeTimer?.cancel();
-      _cdnProbeTimer = Timer.periodic(
+      _cdnState.consumePreflight();
+      _cdnState.probeTimer?.cancel();
+      _cdnState.probeTimer = Timer.periodic(
         CdnTuning.probeInterval,
         (_) => _onCdnProbeTick(),
       );
@@ -948,7 +1033,7 @@ mixin CdnSwitchMixin on GetxController {
     // 这一轮什么都没测出来时只锁 [CdnTuning.unmeasuredCooldown]：详见那个常量的注释。
     var giveUpCooldown = CdnTuning.giveUpCooldown;
     for (var attempt = 0; attempt < CdnTuning.maxAttempts; attempt++) {
-      if (generation != _cdnGeneration ||
+      if (generation != _cdnState.generation ||
           isClosed ||
           isQuerying ||
           // 本页已经被后挂的另一页顶掉了：回调早被覆盖，这一轮测的是**上一个
@@ -959,7 +1044,7 @@ mixin CdnSwitchMixin on GetxController {
         return;
       }
       // 用户中途手动换了 CDN，听他的。
-      if (_cdnAutoServiceSnapshot != VideoUtils.cdnService) return;
+      if (_cdnState.autoServiceSnapshot != VideoUtils.cdnService) return;
 
       final round = await _pickFastestCdn(
         stalledAt,
@@ -975,9 +1060,7 @@ mixin CdnSwitchMixin on GetxController {
         // 这里说「CDN 都正常」是假话：根本没测出可比的数据。解码错误这一档
         // 更要说清楚病在哪 —— 字节是坏的这件事已经由解码器证实了，缺的是
         // "换到哪儿去"。
-        giveUp = force
-            ? '当前镜像的字节解不出画面，但没找到可换的镜像'
-            : '无法测出更快的 CDN，暂不切换';
+        giveUp = force ? '当前镜像的字节解不出画面，但没找到可换的镜像' : '无法测出更快的 CDN，暂不切换';
         giveUpCooldown = CdnTuning.unmeasuredCooldown;
         break;
       }
@@ -1001,9 +1084,10 @@ mixin CdnSwitchMixin on GetxController {
         bestMicros = round.micros;
       }
 
-      _cdnAutoAttempts = attempt + 1;
-      _cdnLastAttemptPos = stalledAt;
-      debugPrint('CDN 自动切换: 第$_cdnAutoAttempts次 -> ${chosen.desc} ($speed)');
+      _cdnState.noteAttempt(attempt, stalledAt);
+      debugPrint(
+        'CDN 自动切换: 第${_cdnState.autoAttempts}次 -> ${chosen.desc} ($speed)',
+      );
       _cdnToast('$what，尝试切换到 ${chosen.desc}\n$speed');
 
       // 强制换源这一档的账：解码器已经证明**正在播的这个 host** 给了坏字节，
@@ -1012,7 +1096,7 @@ mixin CdnSwitchMixin on GetxController {
       // 不该拿来给新 host 定罪。
       if (force && attempt == 0) {
         final bad = Uri.tryParse(videoUrl ?? '')?.host;
-        if (bad != null && bad.isNotEmpty && _cdnBadHosts.add(bad)) {
+        if (bad != null && bad.isNotEmpty && _cdnState.badHosts.add(bad)) {
           debugPrint('CDN 自动切换: $bad 给的字节解不出画面，本集不再作为候选');
         }
       }
@@ -1020,10 +1104,7 @@ mixin CdnSwitchMixin on GetxController {
       switched = true;
       if (!await _switchTo(chosen, generation, resumeAt: stalledAt)) return;
       if (await _awaitRecovery(generation, stalledAt, decode: force)) {
-        _cdnAutoAttempts = 0;
-        _cdnLastAttemptPos = Duration.zero;
-        _cdnTriedAt.clear();
-        _cdnGiveUpUntil = null;
+        _cdnState.noteSuccess();
         debugPrint('CDN 自动切换: 成功，已切到 ${chosen.desc}');
         _cdnToast(
           '已切换到 ${chosen.desc}',
@@ -1040,7 +1121,7 @@ mixin CdnSwitchMixin on GetxController {
       // 轮仍然有效，"换过去以后还在报错"才算证据。
       if (force && _roundLive(generation)) {
         final bad = chosen.host;
-        if (bad != null && _cdnBadHosts.add(bad)) {
+        if (bad != null && _cdnState.badHosts.add(bad)) {
           debugPrint('CDN 自动切换: $bad 换过去仍解不出画面，本集不再作为候选');
         }
       }
@@ -1065,7 +1146,7 @@ mixin CdnSwitchMixin on GetxController {
       giveUp = '画面已冻，没有更快的镜像，已重载当前源';
     }
 
-    _cdnGiveUpUntil = DateTime.now().add(giveUpCooldown);
+    _cdnState.armGiveUp(giveUpCooldown);
     debugPrint(
       'CDN 自动切换: 放弃，${giveUpCooldown.inSeconds}s 内不再尝试'
       '${giveUp == null ? '' : '（$giveUp）'}',
@@ -1077,7 +1158,8 @@ mixin CdnSwitchMixin on GetxController {
                   // 解码错误这一档"都正常"是句错话：坏镜像的速度本来就是正常的，
                   // 它坏在字节上。照实说换了几处都没解出来。
                   ? '换了几处镜像，画面仍然解不出来，已暂停尝试'
-                  : (bestMicros > 0 && bestBytes / bestMicros >= CdnTuning.healthyMBps
+                  : (bestMicros > 0 &&
+                            bestBytes / bestMicros >= CdnTuning.healthyMBps
                         ? 'CDN 都正常，可能是网络问题'
                         : '自动切换 CDN 未能改善，已暂停尝试'))
             : null);
@@ -1142,7 +1224,7 @@ mixin CdnSwitchMixin on GetxController {
     }
 
     // 轮换相位在**完整镜像表**上推进，而不是在当前可用候选上。后者会随
-    // `_cdnTriedAt` 收缩，两个模数（表长和候选数）对不上，窗口就会跳着走、
+    // `_cdnState.triedAt` 收缩，两个模数（表长和候选数）对不上，窗口就会跳着走、
     // 整轮整轮地漏掉镜像 —— 实测 hw 和 cos 就是这样被跳过的。在完整表上按
     // 固定相位走，每个镜像都保证有轮到的时候。
     // 相位持久化：控制器随页面销毁，onReset(换P) 也会清状态，轮换要跨这些事件累积。
@@ -1168,9 +1250,11 @@ mixin CdnSwitchMixin on GetxController {
         final host = service.host;
         if (host == null || host == currentHost) continue;
         // 本集里给过坏字节的镜像不再进候选 —— 它的**速度**没问题，测速拦不住它，
-        // 只有解码器认得出来（见 [_cdnBadHosts]）。
-        if (_cdnBadHosts.contains(host)) continue;
-        if (!pass.ignoreNoSample && _cdnNoSample.contains(service)) continue;
+        // 只有解码器认得出来（见 `_cdnState.badHosts`）。
+        if (_cdnState.badHosts.contains(host)) continue;
+        if (!pass.ignoreNoSample && _cdnState.noSample.contains(service)) {
+          continue;
+        }
         if (!pass.ignoreCooldown && _cdnRecentlyTried(service, now)) continue;
         // host 替换不起作用（mcdn-only / edl:// 合成项），换过去也是同一个 URL。
         final url = VideoUtils.cdnUrlFor(urls, service);
@@ -1185,12 +1269,13 @@ mixin CdnSwitchMixin on GetxController {
     }
 
     // 括号必须有：`??` 与 `??=` 混在一个表达式里不加括号会解析成非法左值。
-    final dio = cdnAutoDioForTest ?? (_cdnAutoDio ??= CdnSpeedTest.createDio());
+    final dio =
+        cdnAutoDioForTest ?? (_cdnState.autoDio ??= CdnSpeedTest.createDio());
 
     // 对象总长探一次就够：所有镜像服务的是字节一致的同一个对象。同一集内缓存
     // 下来 —— 小卡顿档只有 3 秒预算，每次再花几秒去探大小会把预算整个吃掉。
     // 换画质/换集走 [resetCdnAutoSwitch]，缓存随之作废。
-    var size = _cdnObjectSize;
+    var size = _cdnState.objectSize;
     if (size == null) {
       final sizeToken = CancelToken();
       try {
@@ -1207,9 +1292,9 @@ mixin CdnSwitchMixin on GetxController {
         if (!sizeToken.isCancelled) sizeToken.cancel();
       }
       // 探大小这几秒里用户可能换了画质/换集。作废了就一个格子都别落（见
-      // [_roundVoided]），尤其不能把**旧对象**的长度写回 [_cdnObjectSize]。
+      // [_roundVoided]），尤其不能把**旧对象**的长度写回 `_cdnState.objectSize`。
       if (_roundVoided(generation)) return null;
-      if (size != null && size > 0) _cdnObjectSize = size;
+      if (size != null && size > 0) _cdnState.objectSize = size;
     }
 
     final readOffset = _starveOffset(position, size);
@@ -1270,7 +1355,11 @@ mixin CdnSwitchMixin on GetxController {
 
     // 先把请求全部发出去，再逐个 await，中间不插入任何等待。
     final label = currentHost ?? '当前';
-    final baselineFuture = guarded(baselineUrl, '[基线 $label]', isBaseline: true);
+    final baselineFuture = guarded(
+      baselineUrl,
+      '[基线 $label]',
+      isBaseline: true,
+    );
     final candidateFutures = [
       for (final service in candidates)
         (
@@ -1312,9 +1401,9 @@ mixin CdnSwitchMixin on GetxController {
 
     // 无论测速成功与否，这一轮候选都进入冷却；[CdnTuning.retryAfter] 之后可以重测。
     // 压在两道作废判断**之后**：给旧对象记的冷却，到了新对象手里只是凭白少几个
-    // 候选（[_cdnTriedAt] 是刻意为换画质保留下来的）。
+    // 候选（`_cdnState.triedAt` 是刻意为换画质保留下来的）。
     for (final service in candidates) {
-      _cdnTriedAt[service] = now;
+      _cdnState.triedAt[service] = now;
     }
 
     String describe(String name, CdnSample? s) => s == null
@@ -1352,9 +1441,9 @@ mixin CdnSwitchMixin on GetxController {
     final gotSample = samples.map((e) => e.$1).toSet();
     for (final service in candidates) {
       if (gotSample.contains(service)) {
-        _cdnNoSample.remove(service);
+        _cdnState.noSample.remove(service);
       } else {
-        _cdnNoSample.add(service);
+        _cdnState.noSample.add(service);
       }
     }
 
@@ -1365,8 +1454,11 @@ mixin CdnSwitchMixin on GetxController {
     final minBytes = quick
         ? CdnSpeedTest.quickMinBytes
         : CdnSpeedTest.autoMinBytes;
-    bool usable(CdnSample? s) =>
-        CdnSpeedTest.usableSample(s, minBytes: minBytes, readOffset: readOffset);
+    bool usable(CdnSample? s) => CdnSpeedTest.usableSample(
+      s,
+      minBytes: minBytes,
+      readOffset: readOffset,
+    );
 
     // 记下这一轮的速度当作历史。放在这几道作废判断**之后**：连这一轮自己都判
     // "没法比较"的样本（416、未遵守 Range），也没有资格去当下一轮的冠军。
@@ -1517,7 +1609,7 @@ mixin CdnSwitchMixin on GetxController {
       '${_fmtSpeed(base.bytes, base.micros)} = '
       '${ratio.toStringAsPrecision(3)}x (阈值 $bar'
       '${starved ? '，需要 ${needBps.toStringAsPrecision(3)}MB/s，'
-            '基线只到 ${(baseBps / needBps * 100).toStringAsFixed(0)}% 故放宽' : ''}'
+                '基线只到 ${(baseBps / needBps * 100).toStringAsFixed(0)}% 故放宽' : ''}'
       ') -> '
       '${faster ? '切换' : '不切换'} '
       '(有效候选样本 ${samples.where((e) => usable(e.$2)).length}/${candidates.length})',
@@ -1585,16 +1677,16 @@ mixin CdnSwitchMixin on GetxController {
     required Duration resumeAt,
   }) async {
     // 测速期间用户可能已经换集/重置，此时这条 URL 属于上一轮的播放列表。
-    if (generation != _cdnGeneration) return false;
+    if (generation != _cdnState.generation) return false;
     final newVideo = VideoUtils.cdnUrlFor(firstVideo.playUrls, service);
     // 永远不要用空的 source 调 setDataSource。
     if (newVideo.isEmpty) {
       // 这是**真的失败**，不是作废轮：上面那句 generation 不符的 return 才是作废
       // （作废没试过任何东西，不装冷却是对的），而这里 host 改写对这条镜像压根
       // 不生效、一个可用 URL 都拿不出来。[_autoSwitchLoop] 拿到 false 后直接
-      // return，既不写 [_cdnGiveUpUntil] 也没换过源 —— 于是下一次触发照样选中它、
+      // return，既不写 `_cdnState.giveUpUntil` 也没换过源 —— 于是下一次触发照样选中它、
       // 照样空手而归，无限重试。装一档冷却把这个死循环掐掉。
-      _cdnGiveUpUntil = DateTime.now().add(CdnTuning.giveUpCooldown);
+      _cdnState.armGiveUp(CdnTuning.giveUpCooldown);
       debugPrint(
         'CDN 自动切换: ${service.desc} host 改写后地址为空，放弃本次并冷却 '
         '${CdnTuning.giveUpCooldown.inSeconds}s',
@@ -1708,7 +1800,9 @@ mixin CdnSwitchMixin on GetxController {
     }
 
     player.addPositionListener(listener);
-    final window = decode ? CdnTuning.decodeRecoverWindow : CdnTuning.recoverWindow;
+    final window = decode
+        ? CdnTuning.decodeRecoverWindow
+        : CdnTuning.recoverWindow;
     final timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (completer.isCompleted) return;
       final elapsed = DateTime.now().difference(start);
