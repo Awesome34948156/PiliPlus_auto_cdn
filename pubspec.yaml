@@ -41,32 +41,32 @@ dependencies:
     git:
       url: https://github.com/bggRGjQaUbCoE/audio_service.git
       path: audio_service
-      ref: dev
+      ref: 9f91eb8d6aa0905661ab3914ebdd3c9fb5c37cc2
   audio_session:
     git:
       url: https://github.com/bggRGjQaUbCoE/audio_session.git
-      ref: dev
+      ref: c8c2143c1720292801f72867e29ddeb50c36134e
   battery_plus: ^7.0.0
   brotli: ^0.6.0
   cached_network_image_ce:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_cached_network_image_ce.git
       path: cached_network_image
-      ref: develop
+      ref: 733d4aae9cadaafa9e16f20a6f6a3682c935de01
   canvas_danmaku:
     git:
       url: https://github.com/bggRGjQaUbCoE/canvas_danmaku.git
-      ref: main
+      ref: 275046d8647a6a26cba1d0dadb9e28688cb3dbf1
   catcher_2:
     git:
       url: https://github.com/My-Responsitories/catcher_2.git
-      ref: dev
+      ref: 0a9f6fd4ee2ac13ab75591ea70530e245ddb4366
   characters: ^1.4.1
   chat_bottom_container:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_chat_packages.git
       path: packages/chat_bottom_container
-      ref: dev
+      ref: d2f7b8df63126d9f347c1320de10db15deab06db
   collection: ^1.19.1
   connectivity_plus: ^7.1.1
   cookie_jar: ^4.0.8
@@ -82,7 +82,7 @@ dependencies:
   extended_nested_scroll_view:
     git:
       url: https://github.com/bggRGjQaUbCoE/extended_nested_scroll_view.git
-      ref: dev
+      ref: d9136d5d85f41cd92f80771b84ef7c9d4c97e95c
   ffi: ^2.2.0
   file_picker: ^13.1.0
   fixnum: ^1.1.1
@@ -92,16 +92,16 @@ dependencies:
   flutter_html:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_html.git
-      ref: dev
+      ref: e33a789a4dce561267a995d3bc48c638c3950e02
   flutter_inappwebview: ^6.1.5
   flutter_smart_dialog:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_smart_dialog.git
-      ref: main
+      ref: 5a1be84314e8c53efa3b7324cd8dc535fefe931a
   flutter_sortable_wrap:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_sortable_wrap.git
-      ref: master
+      ref: 4c26cbdad3b6efb5625cc5bd5fd0ae2459bf31f7
   flutter_staggered_grid_view: ^0.7.0
   flutter_svg: ^2.0.14
   flutter_volume_controller: ^2.0.0
@@ -112,7 +112,7 @@ dependencies:
   get:
     git:
       url: https://github.com/bggRGjQaUbCoE/getx.git
-      ref: dev
+      ref: 3e65da893d9736135b2631a39e46c8f5388c2536
   hive_ce: ^2.19.3
   html: ^0.15.4
   http2: ^2.3.1
@@ -127,7 +127,7 @@ dependencies:
   material_design_icons_flutter:
     git:
       url: https://github.com/bggRGjQaUbCoE/material_design_icons_flutter.git
-      ref: const
+      ref: 2bb68d1de3c7bb8c6117fce54d43da65a2387163
   material_new_shapes: ^1.0.0
   material_ui: ^1.0.0
   media_kit: 1.1.11
@@ -137,7 +137,7 @@ dependencies:
   native_device_orientation:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_native_device_orientation.git
-      ref: master
+      ref: 7be186c79adca7d3ff5abc34bc75d171c68c2694
   package_info_plus: ^10.1.0
   path: ^1.9.1
   path_provider: ^2.1.5
@@ -155,7 +155,7 @@ dependencies:
   super_sliver_list:
     git:
       url: https://github.com/bggRGjQaUbCoE/super_sliver_list.git
-      ref: mod
+      ref: 71f34fa179e2d05818004e22e632dd59f2a223be
   synchronized: ^3.3.0
   tray_manager: ^0.8.0
   url_launcher: ^6.3.1
@@ -166,15 +166,27 @@ dependencies:
   webdav_client:
     git:
       url: https://github.com/wgh136/webdav_client.git
-      ref: main
+      ref: 2f669c98fb81cff1c64fee93466a1475c77e4273
   win32: ^6.3.0
   window_manager:
     git:
       url: https://github.com/bggRGjQaUbCoE/window_manager.git
       path: packages/window_manager
-      ref: main
+      ref: ac535d09a5850279e6591a9bdd285f9a3edeebf8
 
 dependency_overrides:
+  # `audio_service`（git，同样是 fork）自己也依赖 `cached_network_image_ce`，且写的是
+  # `develop`。同一个 git source 若出现两个不同的 ref，pub 直接判版本冲突 —— 所以把
+  # 直接依赖里那条钉死的 SHA 在这里再声明一次，让所有依赖者统一到同一个提交。
+  cached_network_image_ce:
+    git:
+      url: https://github.com/bggRGjQaUbCoE/flutter_cached_network_image_ce.git
+      path: cached_network_image
+      ref: 733d4aae9cadaafa9e16f20a6f6a3682c935de01
+  audio_session:
+    git:
+      url: https://github.com/bggRGjQaUbCoE/audio_session.git
+      ref: c8c2143c1720292801f72867e29ddeb50c36134e
   flutter_inappwebview_android:
     git:
       url: https://github.com/bggRGjQaUbCoE/flutter_inappwebview.git
@@ -189,32 +201,32 @@ dependency_overrides:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
       path: media_kit
-      ref: native
+      ref: 73771ec38176be2d984a3049c28177bce23b54a0
   media_kit_libs_android_video:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
       path: libs/android/media_kit_libs_android_video
-      ref: native
+      ref: 73771ec38176be2d984a3049c28177bce23b54a0
   media_kit_libs_ios_video:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
       path: libs/ios/media_kit_libs_ios_video
-      ref: native
+      ref: 73771ec38176be2d984a3049c28177bce23b54a0
   media_kit_libs_video:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
       path: libs/universal/media_kit_libs_video
-      ref: native
+      ref: 73771ec38176be2d984a3049c28177bce23b54a0
   media_kit_libs_windows_video:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
       path: libs/windows/media_kit_libs_windows_video
-      ref: native
+      ref: 73771ec38176be2d984a3049c28177bce23b54a0
   media_kit_native_event_loop:
     git:
       url: https://github.com/My-Responsitories/media-kit.git
       path: media_kit_native_event_loop
-      ref: native
+      ref: 73771ec38176be2d984a3049c28177bce23b54a0
   # 常驻探针版（2026-10-15，真机未验）：只出声、不改行为的 `VideoOutput.Probe`，随实例常驻 ——
   # 要回答"死锁时 `_updateCallback()` 到底有没有被叫过"（`n == 0` 即"回调压根没跑"，
   # `n > 0` 却仍 `configured:false` 即"回调跑了、输出没配上"，两种修法相反）。
