@@ -473,6 +473,7 @@ class DownloadService extends GetxService {
           _downloadManager = DownloadManager(
             url: first.url,
             path: path.join(videoDir.path, PathUtils.videoNameType1),
+            dio: Request.http11Dio,
             onReceiveProgress: _onReceive,
             onDone: _onDone,
           );
@@ -481,6 +482,7 @@ class DownloadService extends GetxService {
           _downloadManager = DownloadManager(
             url: mediaFileInfo.video.first.baseUrl,
             path: path.join(videoDir.path, PathUtils.videoNameType2),
+            dio: Request.http11Dio,
             onReceiveProgress: _onReceive,
             onDone: _onDone,
           );
@@ -489,6 +491,7 @@ class DownloadService extends GetxService {
             _audioDownloadManager = DownloadManager(
               url: audio.first.baseUrl,
               path: path.join(videoDir.path, PathUtils.audioNameType2),
+              dio: Request.http11Dio,
               onReceiveProgress: null,
               onDone: _onAudioDone,
             );

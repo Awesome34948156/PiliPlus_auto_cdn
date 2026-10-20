@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/models_new/download/bili_download_entry_info.dart';
 import 'package:PiliPlus/utils/extension/file_ext.dart';
 import 'package:PiliPlus/utils/extension/string_ext.dart';
@@ -10,6 +9,7 @@ import 'package:dio/dio.dart';
 class DownloadManager {
   final String url;
   final String path;
+  final Dio dio;
   final void Function(int, int)? onReceiveProgress;
   final void Function([Object? error]) onDone;
 
@@ -22,6 +22,7 @@ class DownloadManager {
   DownloadManager({
     required this.url,
     required this.path,
+    required this.dio,
     required this.onReceiveProgress,
     required this.onDone,
   }) {
@@ -58,7 +59,7 @@ class DownloadManager {
 
     Response<ResponseBody> response;
     try {
-      response = await Request.http11Dio.get<ResponseBody>(
+      response = await dio.get<ResponseBody>(
         url.http2https,
         options: Options(
           headers: {'range': 'bytes=$received-'},
