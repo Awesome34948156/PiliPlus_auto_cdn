@@ -1445,6 +1445,28 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _updatePlaybackState(debugLabel: 'onVideoPaused');
   }
 
+  /// 「流打不开」之后隔 3 秒再重载的那一拍。
+  ///
+  /// 以前 [stream.error] 的直播分支与点播分支各写了一个**匿名** `Timer`，没有任何
+  /// 引用能碰到它们：`dispose()`、[_removeListeners] 都取消不了，播放器拆掉之后
+  /// 的回调仍会醒来调 [refreshPlayer]。两处共用这一个槽 —— 同一媒体内 [isLive]
+  /// 不会变，两条分支不会同时进入。
+  ///
+  /// 顺带把同一批报错收敛成一次重载：连着来两条报错时，旧写法会排两个 3 秒定时器
+  /// 各调一次 [refreshPlayer]；现在是「最后一个报错之后 3 秒」重载一次。对一个已经
+  /// 打不开的流，连发两次重载没有意义。
+  Timer? _errorReloadTimer;
+
+  void _scheduleErrorReload(void Function() action) {
+    _errorReloadTimer?.cancel();
+    _errorReloadTimer = Timer(const Duration(milliseconds: 3000), action);
+  }
+
+  void _cancelErrorReload() {
+    _errorReloadTimer?.cancel();
+    _errorReloadTimer = null;
+  }
+
   void _updatePlaybackState({Duration? position, String? debugLabel}) {
     videoPlayerServiceHandler?.onUpdateState(
       playerStatus,
@@ -1585,7 +1607,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           if (event.startsWith('tcp: ffurl_read returned ') ||
               event.startsWith("Failed to open https://") ||
               event.startsWith("Can not open external file https://")) {
-            Timer(const Duration(milliseconds: 3000), () {
+            _scheduleErrorReload(() {
               // 直播分支原先无条件重载：连接报错是"事件"不是"采样量"，一次
               // 瞬时抖动也会把正在正常播放（或用户已手动暂停）的直播拆掉重开。
               // 补上与非直播分支同源的护栏 —— 只在"前方余量真的见底"时才重载。
@@ -1619,7 +1641,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
             'controllerStream.error.listen',
             const Duration(milliseconds: 10000),
             () {
-              Timer(const Duration(milliseconds: 3000), () {
+              _scheduleErrorReload(() {
                 // if (kDebugMode) {
                 //   debugPrint("isBuffering.value: ${isBuffering.value}");
                 // }
@@ -2968,6 +2990,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       IOSPipHelper.dispose();
     }
     _timer?.cancel();
+    _cancelErrorReload();
+    volumeTimer?.cancel();
     // _position.close();
     // _playerEventSubs?.cancel();
     // _sliderPosition.close();
