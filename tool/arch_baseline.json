@@ -1,0 +1,14 @@
+{
+  "commit": "d3f00658f",
+  "date": "2026-10-20",
+  "method": "import/export graph over lib/, excluding lib/grpc/ and lib/common/widgets/flutter/ plus *.g.dart and *.freezed.dart; Kosaraju SCC; edges deduplicated per (src, dst).",
+  "metrics": {
+    "nodes": 1204,
+    "edges": 6041,
+    "scc_gt1": 5,
+    "max_scc_size": 538,
+    "max_scc_internal_edges": 2405,
+    "low_level_files_importing_pages": 27,
+    "low_level_imports_into_pages": 74
+  }
+}
