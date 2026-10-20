@@ -523,6 +523,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 刻意不在 `setDataSource` / `player.open` 里调 —— 换源重载时旧流的报错要
   /// 继续算（见 [_decodeErrors] 的注释）。只由页面在换集 / 换画质时调。
   void resetDecodeErrorAccounting() {
+    _clearDecodeAccounting();
+  }
+
+  /// 两个「账本作废」的时机（换集/换画质、播放器创建）共用这一份清法。
+  /// 分开写时漏掉一行，两族账就会一半归零一半继续攒，而这**不会报错**、
+  /// 只会让阈值悄悄地偏 —— 所以只留一份。
+  void _clearDecodeAccounting() {
     _decodeErrors.clear();
     _decodeErrorDense.clear();
     _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
@@ -1485,12 +1492,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 这里是**播放器创建**时的重置，整个会话只跑一次（[player] 非空时
     // [_createVideoController] 不再走 [_initPlayer]）。所以它管不到换集/换画质 ——
     // 那些由页面调 [resetDecodeErrorAccounting]。
-    _decodeErrors.clear();
-    _decodeErrorDense.clear();
-    _decodeErrorUntil = DateTime.fromMillisecondsSinceEpoch(0);
-    lastDecoderCorruptionAt = null;
-    _sessionFailures.clear();
-    _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    _clearDecodeAccounting();
     final stream = player.stream;
     _subscriptions = [
       /// playing
