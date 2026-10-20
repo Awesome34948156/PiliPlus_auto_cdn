@@ -1270,7 +1270,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 「流打不开」之后隔 3 秒再重载的那一拍。
   ///
-  /// 以前 [stream.error] 的直播分支与点播分支各写了一个**匿名** `Timer`，没有任何
+  /// 以前 `stream.error` 的直播分支与点播分支各写了一个**匿名** `Timer`，没有任何
   /// 引用能碰到它们：`dispose()`、[_removeListeners] 都取消不了，播放器拆掉之后
   /// 的回调仍会醒来调 [refreshPlayer]。两处共用这一个槽 —— 同一媒体内 [isLive]
   /// 不会变，两条分支不会同时进入。
