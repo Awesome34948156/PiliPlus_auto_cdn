@@ -48,7 +48,7 @@
   **必须开**：关掉时 `_cdnAutoEligible` 为假，每条检查都会卡在资格门上。
 - **「详细播放日志」** → `SettingBoxKey.mpvVerboseLog` → `Pref.mpvVerboseLog`
   （`lib/utils/storage_pref.dart:517`）。它把 mpv 的 `logLevel` 抬到 `.v`，但
-  **只在控制台出口开着时生效**：`lib/plugin/pl_player/controller.dart:1207`
+  **只在控制台出口开着时生效**：`lib/plugin/pl_player/controller.dart` 的 `_initPlayer()`
   `logLevel: consoleLogActive && Pref.mpvVerboseLog ? .v : (kDebugMode ? .warn : .error)`。
 - **「CDN 切换提示」** → `SettingBoxKey.showCdnSwitchToast`（默认开）。可选，
   给同一批事件做旁证。
@@ -242,9 +242,8 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 步骤 (a)：风暴中途换集（或换画质），新一集得从头攒。
 步骤 (b)：同一集里，让一场风暴横跨一次自动换源（重载会排空旧流的报错）。
 通过 (a)：换集后**不立刻**出现看门狗行 —— 必须重新攒满 12 条/6s；旧流的账不带过去
-（页面 `onReset`（`controller.dart:1315`）调 `resetCdnAutoSwitch()`（`:1325`），它再到
-混入层 `:608` 把播放器的解码账清掉（`plPlayerController.resetDecodeErrorAccounting()`）；
-换画质走 `resetCdnForNewObject()`，那条直接清在 `cdn_switch_mixin.dart:634`）。
+（页面 `onReset`（`controller.dart:1315`）调 `resetCdnAutoSwitch()`（`:1325`），由它在混入层把播放器的解码账清掉（`plPlayerController.resetDecodeErrorAccounting()`）；
+换画质走 `resetCdnForNewObject()`，清理就在那个方法里）。
 通过 (b)：换源期间旧流的报错**继续计数** —— 换源前会触发的那场风暴，换源后照样触发
 （`_decodeErrors` 刻意不在 `player.open`/`setDataSource` 里清）。
 失败 (a)：新一集的 host 被上一集残留的风暴瞬间禁掉。
@@ -283,18 +282,18 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 > **正面那一半才是证据。** 回 A 之后 `22:13:36.188 CDN 自动切换: 预检 @37s` 出现，
 > 后面的 `目标偏移 81517065/543447102 字节 (位置 37000ms/2225075ms)` 用的是 **A 的
 > 对象、A 被盖住时的位置**。而 `attachCdnSwitch` 是幂等的
-> （`if (_cdnIsAttached) return;`，`cdn_switch_mixin.dart:855`），预检能重开
+> （`if (_cdnIsAttached) return;`，见 `attachCdnSwitch()`），预检能重开
 > **只可能**是因为重挂那一刻 `_cdnIsAttached` 为假 —— 也就是说 B 在播的那段时间里，
 > A 确实已经不挂在播放器上了。重挂的因果也是闭合的：`restartCdnProbe()` 只有两个
 > 调用点（`controller.dart:1327` 的 `onReset`，只有换 P/换集走得到；
-> `cdn_switch_mixin.dart:884` 的 `attachCdnSwitch`），返回 A 时唯一可能是后者，
+> `attachCdnSwitch()` 里），返回 A 时唯一可能是后者，
 > 而它在返回路径上的调用点只有 `view.dart:495`（`didPopNext`）。时间也对：
 > 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `CdnTuning.preflightPoll`
 > 的 2 s 加上等缓冲那一拍。
 >
 > ⚠️ **负那一半（"旧页面静默"）不构成证据，别拿它当通过的依据。** 旧页面的周期
 > tick 只有在 `bufferedAhead` 低于回填水位时才打印（`_onCdnProbeTick` 里
-> `if (bufferedAhead >= floor) return;`，`cdn_switch_mixin.dart:1004`），而那段
+> `if (bufferedAhead >= floor) return;`），而那段
 > 余量一直 22~31s，很健康 —— 所以"窗口里没有带 A 对象长度的行"这件事，
 > **A 已静默**和**A 仍挂着但没到该响的时候**两种解释都成立。
 > （清单早期版本写过"那 138 秒里一条 `CDN 自动切换:` 都没有"，**是错的**：
@@ -504,7 +503,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 > （早 0.64 s）。机制见条目 8 的 ⚠️ 之外另有一条：`CdnTuning.preflightDeadline`（10s）
 > 到期前你退了后台，iOS 冻住定时器，`_cdnPreflightSince` 就悬着 —— 584 秒后回前台
 > 第一拍 `now - since` 早就过线，于是**补做**了那一次预检。它值钱的前提是"位置还在
-> 起点、换源看不出闪"（`cdn_switch_mixin.dart:975`），在 **353 秒**处开火时这个前提
+> 起点、换源看不出闪"（见 `_onCdnProbeTick()`），在 **353 秒**处开火时这个前提
 > 已经没了：这时换源就是一次实打实的重载。这一局没造成伤害（基线 4.42MB/s 赢了，
 > 收在 `放弃`），但那是运气 —— 换与不换取决于那一刻谁快，跟"该不该现在换"无关。
 > 这是旧行为，与本条无关，**待定**。
@@ -516,32 +515,32 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 前置：与条目 18 同一档 —— 任意一集在播、**AV1 硬解**（心跳行
 `CDN 看门狗: 余量 … hwdec videotoolbox …` 能看到它）。差别只在**播放状态**：
 **手动按暂停**，画面停在最后一帧、控制条是暂停态；确认心跳行里 `播放中 false`
-（那句取自 `controller.dart:2164` 的 `播放中 ${playerStatus.isPlaying}`，
-`PlayerTuning.heartbeatSeconds = 10`（`controller.dart:424`），所以 10 秒内必有一拍能对上）。
+（那句取自 `_startStallTicker()` 的 `播放中 ${playerStatus.isPlaying}`，
+`PlayerTuning.heartbeatSeconds = 10`（见 `player_tuning.dart`），所以 10 秒内必有一拍能对上）。
 
 步骤：**保持暂停**退到后台 **≥5 分钟**（锁屏或切走都行），然后回到 app。
 
 病根与 18 是同一件事：iOS 挂起 app 时作废 `VTDecompressionSession`。18 那条判据修好的
 动作本身曾经留过个缺口 —— 它重开 Media 时**不带播放意图**，用户按的暂停会被丢掉：
 
-- **那个缺口 2026-10-12 已经修了**（`7eb5a64a2`，已在 main）。修之前 `:1353` 是
-  `return ctr.open(media, play: true);` —— `play:` **写死 `true`**，函数签名
+- **那个缺口 2026-10-12 已经修了**（`7eb5a64a2`，已在 main）。修之前 `refreshPlayer()`
+  返回的是 `return ctr.open(media, play: true);` —— `play:` **写死 `true`**，函数签名
   `Future<void>? refreshPlayer()` 里也没有"要不要接着播"的入参。现在签名是
-  `Future<void>? refreshPlayer({bool? play})`（`controller.dart:1344`），`:1353` 是
+  `Future<void>? refreshPlayer({bool? play})`（见 `refreshPlayer()`），返回的是
   `return ctr.open(media, play: play ?? playerStatus.isPlaying);` —— 不传参时按
-  "当前是不是在播"决定，暂停态得以保留。（对照 `:1333` 附近另一条重开路径，用的是
+  "当前是不是在播"决定，暂停态得以保留。（对照 `_createVideoController()` 里另一条重开路径，用的是
   `play: false`。）
-- 触发它的 `_sampleDecoderSessionFailure`（`controller.dart:2091`）闸门在
-  `:2107-2116`，只挡 `isSeeking` / `_processing` / `onlyPlayAudio` / `isBuffering` /
+- 触发它的 `_sampleDecoderSessionFailure()` 闸门在函数开头那段，只挡
+  `isSeeking` / `_processing` / `onlyPlayAudio` / `isBuffering` /
   `bufferedAhead <= 0` / `!_hasVideoTrack` —— **不读 `playerStatus`**，暂停态照样进得来。
   这是**有意**的：会话作废该修就修，只是修完得把播放意图还原回去。命中 6 条 / 3 秒
-  （`PlayerTuning.sessionFailBurst` `:377`、`PlayerTuning.sessionFailWindow` `:381`）后 `:2131` 打日志、
-  `:2137` 调 `refreshPlayer()`（返回值忽略）。
+  （`PlayerTuning.sessionFailBurst`、`PlayerTuning.sessionFailWindow`，见 `player_tuning.dart`）后打日志、
+  调 `refreshPlayer()`（返回值忽略）。
 - 缺口没修时为什么会丢：重开之后 mpv 一上报 playing，播放器就把 `playerStatus` 置成
   `.playing`，而用户按的暂停**没有任何地方记着**（全仓没有 `userPause` 之类的标记）。
 
-对比 **条目 13**：那条是**换源路**，同一口径 —— `cdn_switch_mixin.dart:1755`
-`final wasPlaying = plPlayerController.playerStatus.isPlaying;` → `:1760`
+对比 **条目 13**：那条是**换源路**，同一口径 —— `_switchTo()` 里
+`final wasPlaying = plPlayerController.playerStatus.isPlaying;` →
 `await playerInit(autoplay: wasPlaying);`。两条路现在是一致的。
 
 ⚠️ **本条现在验的是"修好了没有"，不是"缺口长什么样"** —— 代码已修，但**真机还没验过**
@@ -550,7 +549,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 通过：
 1. 那条重建行**照出**（说明暂停态没有被判据挡住，会话作废照样认得）：
    `CDN 看门狗: 硬解会话失效（3s 内 6 条），本机解码器被系统作废 —— 重建解码器`
-   （逐字，`controller.dart:2131-2134`；判定它的原始 mpv 行是
+   （逐字，`_sampleDecoderSessionFailure()`；判定它的原始 mpv 行是
    `av1: Failed to decode frame (invalid session, -12903)` 与
    `av1: vt decoder cb: output image buffer is null: -12909, reconfig 1`，
    签名表见 `lib/utils/decode_error.dart:94` 的 `kDecoderSessionFailureSignatures`，
@@ -560,8 +559,8 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 
 失败（**说明 `play ?? playerStatus.isPlaying` 没兜住**）：回前台后画面**自己动起来**，
 心跳行从 `播放中 false` 翻成 `播放中 true` —— 那就要查 `refreshPlayer()` 的调用点上
-`playerStatus` 当时到底是什么（`:1353`）。
-注意 30s 冷却（`PlayerTuning.sessionFailCooldown`，`controller.dart:386`）只压"动手"的频率，
+`playerStatus` 当时到底是什么（见 `refreshPlayer()`）。
+注意 30s 冷却（`PlayerTuning.sessionFailCooldown`，见 `player_tuning.dart`）只压"动手"的频率，
 不影响这一次的播放意图。
 
 ⚠️ 真机上要看清的**第一件事**是"签名到底响没响"：暂停时 mpv 不一定在解码，那两条会话
@@ -571,16 +570,16 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 
 ### 20 — 备注：换源轮次里 `now` 的取样时刻偏早几秒（无需真机验证）
 
-一轮换源的 `now` 是在**轮次开头**取的（`lib/pages/video/cdn_switch_mixin.dart:1243`
-`final now = DateTime.now();`），而它要到探完对象大小（`:1318` 的
+一轮换源的 `now` 是在**轮次开头**取的（`_pickFastestCdn()` 里
+`final now = DateTime.now();`），而它要到探完对象大小（同函数里
 `await CdnSpeedTest.probeSize`，预算 `probeMicros`/`probeConnect`/`probeReceive` 各 3s，
-`lib/utils/cdn_speed_test.dart:18-20`）和并发测速（`:1407-1414` 的 await，`autoMicros`
+`lib/utils/cdn_speed_test.dart:18-20`）和并发测速（`_pickFastestCdn()` 里那几处 await，`autoMicros`
 6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:30`/`:40`）**之后**才被拿去记账 ——
 也就是相对"读数真正落地的时刻"偏早约几秒（最多探大小 3s + 测速 6s）。受影响的是它喂的
-那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`:1295`，窗口 `CdnTuning.retryAfter`
-`:251` / `CdnTuning.deadRetryAfter` `:261`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
-（`:1438`）、`_cdnChampion` 的 6 小时过期（`:1252`，窗口 `CdnTuning.recordExpiry` `:316`）、
-`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`:1515`，`CdnTuning.recordReset` `:312`）。
+那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`_pickFastestCdn()`，窗口 `CdnTuning.retryAfter`
+/ `CdnTuning.deadRetryAfter`，见 `cdn_tuning.dart`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
+（`_pickFastestCdn()`）、`_cdnChampion` 的 6 小时过期（`_pickFastestCdn()` 里对它的调用，窗口 `CdnTuning.recordExpiry`，见 `cdn_tuning.dart`）、
+`_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`_pickFastestCdn()` 里那次调用，`CdnTuning.recordReset` 见 `cdn_tuning.dart`）。
 **对着这几档窗口，偏早几秒不产生行为差异**（窗口比误差大两三个数量级），所以它是备注、
 不是 bug。**无需真机验证。**
 
@@ -594,12 +593,12 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 —— 代理限速/闪断，或钉一条"测速一读就断"的镜像。最容易撞上的触发是**预检**
 （`预检 @Ns（新视频，在 size×15% 处测一轮，不看缓冲）`）：它是唯一**不看缓冲水位**的触发 ——
 别的触发都得等缓冲先掉下去，那时播放器本来就饿着，落不到本条要考的情形上。它自己等的是
-"缓冲补满（≥21.333s）**或**攒够 10 秒 deadline"（`cdn_switch_mixin.dart:979-1025`；`_cdnPreflightSince`
-只在 `restartCdnProbe(armPreflight: true)` 时清空，`:809`）。log 18 那局 `since` 从 `01:22:55` 就在攒、
+"缓冲补满（≥21.333s）**或**攒够 10 秒 deadline"（`_onCdnProbeTick()`；`_cdnPreflightSince`
+只在 `restartCdnProbe(armPreflight: true)` 时清空）。log 18 那局 `since` 从 `01:22:55` 就在攒、
 `01:23:12.942` 只是"选流"重载（不是 `armPreflight`），**所以那次预检大概率是 deadline 先到、
 缓冲还没补满就开测的** —— 不要读成"它故意等缓冲补满才测"。
 
-病根：`_pickFastestCdn` 里"基线无有效样本 → 直接切换"那条出口（原 `:1557`，现从 `:1579` 起）
+病根：`_pickFastestCdn` 里"基线无有效样本 → 直接切换"那条出口（见 `_pickFastestCdn()`）
 原先假设"基线拿不出速度 = 就是我们要修的那个故障本身"，于是一次连接超时 / 接收超时 / 0 字节
 就无条件换源，**既不比值、也不看播放器死活**。这条出口的代价是一整次重载。
 
@@ -625,19 +624,19 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 —— 基线 `upos-hz-mirrorakam.akamaized.net` 收超时、余量健康，形态与 log 18 逐条相同，
 **这条余量是读出来的**，可以当"新闸门会拦"的铁证。
 
-**修法**：新判据 `_playerInTrouble`（`cdn_switch_mixin.dart:956`）= `isBuffering.value ||
-telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!force && !_playerInTrouble)`
+**修法**：新判据 `_playerInTrouble`（`cdn_switch_mixin.dart`）= `isBuffering.value ||
+telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `_pickFastestCdn()` 里：`if (!force && !_playerInTrouble)`
 就 `return unmeasurable(...)`，放行才照旧走那条"直接切换"。`force`（解码档）豁免。**判据取的是现场值、
 不是触发那一刻**：一轮测速要跑好几秒，期间自己缓过来了就不该动 —— 与 `_autoSwitchLoop` 收尾那句
 `telemetryDiverged` 同一个口径。
 
 通过（逐字日志）：
-1. 新行**出现**（`unmeasurable` 助手，`cdn_switch_mixin.dart:1451`，前缀 `CDN 自动切换: ` 与后缀
+1. 新行**出现**（`unmeasurable` 助手，定义在 `_pickFastestCdn()` 里，前缀 `CDN 自动切换: ` 与后缀
    `，放弃本轮` 都由它补齐）：
    `CDN 自动切换: 基线探测没拿到样本，但播放器没在挨饿（余量 32s、重新缓冲 false）—— 一次新连接没建起来不等于镜像坏了，放弃本轮`
-   随后 `_autoSwitchLoop` 收尾（`:1190`）：`CDN 自动切换: 放弃，20s 内不再尝试（无法测出更快的 CDN，暂不切换）`
-   —— 这 20s 来自 `CdnTuning.unmeasuredCooldown`（`cdn_switch_mixin.dart:243`）。
-2. **没有**紧跟的 `CDN 自动切换: 基线无有效速度，直接切换 -> …`（`:1616`），**没有**
+   随后 `_autoSwitchLoop()` 收尾：`CDN 自动切换: 放弃，20s 内不再尝试（无法测出更快的 CDN，暂不切换）`
+   —— 这 20s 来自 `CdnTuning.unmeasuredCooldown`（见 `cdn_tuning.dart`）。
+2. **没有**紧跟的 `CDN 自动切换: 基线无有效速度，直接切换 -> …`（见 `_pickFastestCdn()`），**没有**
    `CDN 自动切换: 第1次 -> …`，**没有** `Setting option 'start' = …` 重载，**没有**
    `落点 … 补一次 seek`。
 3. 画面不顿、位置继续往前走（心跳行 `位置 Ns` 照常递增）。
@@ -665,7 +664,7 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
   `CDN 都正常，可能是网络问题`），它们走的是比值/健康判定，跟本闸门无关。
 
 已知代价：拦下这一轮会走 `unmeasurable` → 留 **20s 冷却**（`CdnTuning.unmeasuredCooldown`，
-`cdn_switch_mixin.dart:243`）：这 20 秒里**播放器侧触发也被这道放弃冷却挡着**，半死镜像最坏
+见 `cdn_tuning.dart`）：这 20 秒里**播放器侧触发也被这道放弃冷却挡着**，半死镜像最坏
 **晚约 20 秒**才被发现；不过 `解码错误` 与 `画面已冻`（`telemetryDiverged`）两档**不吃**这道冷却，
 真坏到那份上的镜像照旧立刻救。
 
@@ -715,7 +714,7 @@ telemetryDiverged || bufferedAhead < 回填水位`。闸门在 `:1607`：`if (!f
 1. **「详细播放日志」必须开** —— 设置 → 视频设置（入口副标题「画质、音质、解码、缓冲、
    音频输出等」）→「详细播放日志」。判据里那些 mpv 行（`Setting option 'start'`、
    `Set property: pause=`、`playback restart complete`、`NativeVideoController:
-   Texture ID`）**只有它开着才写**（`pl_player/controller.dart:1207`，logLevel 抬到 `.v`）。
+   Texture ID`）**只有它开着才写**（`pl_player/controller.dart` 的 `_initPlayer()`，logLevel 抬到 `.v`）。
 2. **「卡顿自动切换 CDN」保持默认开**（同一页）。它关掉时 `_cdnAutoEligible` 为假，
    换源那半边一条都不跑 —— 这一局的**判据不靠它**，但开着才能拿到 `CDN 自动切换: …` 的旁证。
 3. **接上 iCloud 日志同步**：设置 →「其它设置」（副标题「震动、搜索、收藏、ai、评论、
@@ -1152,26 +1151,26 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   只能掐掉重载**之后**的动作（补 seek、恢复判定、假"成功"），**掐不掉重载**。
   因为页面侧的 `playerInit`（`lib/pages/video/controller.dart:747`）干的事就是
   `await plPlayerController.setDataSource(NetworkSource(videoSource: videoUrl!, ...))`
-  （`:766`），而 `videoUrl` 是 `_switchTo` 在调用**前**几行写进去的（`cdn_switch_mixin.dart:1733`）
-  —— 也就是**重载发生在 `playerInit` 内部**。`setDataSource`
-  （`lib/plugin/pl_player/controller.dart:1031`）里没有任何"你是不是现役页"的检查。
-  要紧的是：从 `:1091` 那道闸门一路走到 `_switchTo` 里那句 `await playerInit`（`:1760`），
-  **中间一个 `await` 都没有** —— 新地址 `videoUrl = newVideo;`（`:1733`）也是在这段同步
+  （`:766`），而 `videoUrl` 是 `_switchTo()` 在调用**前**几行写进去的
+  —— 也就是**重载发生在 `playerInit` 内部**。`setDataSource()`
+  里没有任何"你是不是现役页"的检查。
+  要紧的是：从 `_autoSwitchLoop()` 里那道闸门一路走到 `_switchTo()` 里那句 `await playerInit`，
+  **中间一个 `await` 都没有** —— 新地址 `videoUrl = newVideo;`（`_switchTo()`）也是在这段同步
   代码里写下去的。所以旧页决定重载的那一刻**它确实还是现役页** —— 用户还没来得及跳走。
   这不算"漏了一处"，是**站在那个点上无从拦起**。
   后果：重载在飞的时候跳相关视频，它仍可能落地（`setDataSource` 里 `await pause()` 之后的
   `_createVideoController` 一样可能在 `playerInit` 返回前跑完），把播放器换成**旧视频**的地址，
-  并按 `:1102` 重置共享的 `position`/`buffered`。
-  与 `:1185` 那条**不是一回事**：兜底 `refreshPlayer()` 经两个独立分析确认够不着
-  （`!switched` 成立 ⟹ 循环每次都从 `:1092`/`:1103`/`:1107`/`:1114` 那几处 `break` 出去，
-  而那几处都在 `:1091` 那道闸门之后的**同一段同步代码**里 —— 中间没有 `await`，所以执行到
-  `:1183` 兜底那句时本页必然还是现役页；给它加 `_roundLive` 是死代码）。本条则相反：够得着，
+  并按 `setDataSource()` 重置共享的 `position`/`buffered`。
+  与 `_autoSwitchLoop()` 里 `refreshPlayer()` 兜底那条**不是一回事**：兜底 `refreshPlayer()` 经两个独立分析确认够不着
+  （`!switched` 成立 ⟹ 循环每次都从 `_autoSwitchLoop()` 里那几处 `break` 出去，
+  而那几处都在同函数那道闸门之后的**同一段同步代码**里 —— 中间没有 `await`，所以执行到
+  兜底那句时本页必然还是现役页；给它加 `_roundLive` 是死代码）。本条则相反：够得着，
   但无从拦。**要修得给 `PlPlayerController` 加"发起者身份"**（非现役页发起的换源直接丢弃），
   动的是播放器核心，单独一轮做。
   **真机观察项**：跳相关视频后偶发"画面跳回上一个视频 / 缓冲被清空"即命中 —— 这条只能真机看。
 - **补落点的那一发 seek 会悬在重载里，醒来时落到新页的片上（MEDIUM，本轮已修 —— 但只是收窄）**：
   `_restoreResumePosition` 补 seek 时调的是 `player.seekTo(target)`，走 `seekTo` 的默认档
-  `isSeek = true`；而 `lib/plugin/pl_player/controller.dart:2442-2444` 里
+  `isSeek = true`；而 `lib/plugin/pl_player/controller.dart` 的 `seek()` 里
   `seek()` 第一件事是 `await _videoPlayerController?.stream.buffer.first`。
   换源重载期间那条流要几秒才吐第一个 buffer（新文件还没 demux 出来），于是这一发 seek
   **整段悬在那里**；悬着的这几秒里用户跳相关视频，它醒来时 `_videoPlayerController` 已经
@@ -1181,7 +1180,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   **真机证据**：`docs/logs/pili-console-3`，22:00:54.646/55.446/56.246/57.054 连打四发
   `CDN 自动切换: 落点 … 补一次 seek`（此时 mpv position 还是 0），而 mpv 直到 22:00:57.497
   才第一次 `timeline: queuing seek to 7.250000` —— 四发全部先悬着、后一起落地。
-  **修法**：`await player.seekTo(target, isSeek: false)`（`cdn_switch_mixin.dart:1800` 一带）。
+  **修法**：`await player.seekTo(target, isSeek: false)`（`_restoreResumePosition()` 一带）。
   `isSeek: false` 跳过那道等待，seek 在 `_roundLive` 复查之后**当场**发出去 —— 窗口从
   「整个重载期」压到「一条 mpv 命令往返」。仓里程序化 seek 本来就多用这一档
   （`bottom_control.dart:44`、`view.dart:979`、`pip_helper.dart:60` 等 10 处）。
@@ -1190,12 +1189,12 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   `await null` 一个微任务就过，那几秒的悬停在假件上根本不存在 —— 所以这条**没有红灯**，
   证据只有上面那份真机日志。
   **复查更正**：我原先记的是「`duration.value == 0` 时 `seekTo` 把 seek 寄存到
-  `duration.listen` 上」—— 那个分支**几乎够不着**（`setDataSource` 在
-  `pl_player/controller.dart:1101` 就用 `duration ?? state.duration` 把 `duration.value`
+  `duration.listen` 上」—— 那个分支**几乎够不着**（`setDataSource()`
+  里就用 `duration ?? state.duration` 把 `duration.value`
   写成非零，之后也没有东西把它归零），真悬住的是 `stream.buffer.first`。两条都读过才改的口。
 - **被顶掉那一页重新露面后的那几秒，还会接着动播放器（MEDIUM，本轮已修）**：
   相关视频跳转 push 新页，既不 `onClose` 旧页、也不换代。旧页在途的那一轮在
-  `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`:1332`、`:1424`），
+  `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`_pickFastestCdn()` 里两处），
   **没有 `_cdnIsAttached`** —— 所以被顶掉多久它都活着。用户 pop 回来 → `didPopNext` 调
   旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:495`），它把 `onStall` 等回调**同步**
   装回去，`_cdnIsAttached` **立刻又为真**，而 `_cdnGeneration` 从头到尾没动过 ——
@@ -1205,7 +1204,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   时只把计数 2→1、**不卸载媒体**，所以那几秒确实还是新页的片。）
   **修法**：`attachCdnSwitch` 在幂等闸之后 `_cdnGeneration++;`，**并且同时**
   `_cdnAutoBusy = false;`。后半句不是配套美容，是必须的 —— 一轮收尾那句
-  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`:766-771`）
+  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`_onPlayerStall()` 的 `.whenComplete`）
   只在代际相同时清 busy，光换代不清就把 busy **永久钉死在真**，此后所有卡顿/探测都被
   `busy=true` 忽略，而 `attachCdnSwitch` 幂等、再也不会进来救它 —— 这一页的自动换源就死透了。
   **不复用** `resetCdnForNewObject()`：它还会清 `_cdnObjectSize` / `_cdnBadHosts` /
@@ -1220,7 +1219,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   修复后一条不发。两半都单独验过：只删 `_cdnAutoBusy = false;`，第二条断言（重挂之后
   新一轮要能起来）红在 `忽略卡顿 @300s (busy=true …)` 上 —— 清忙不是配套美容。
   它和已有的「被顶掉的那一页连兜底重载都不该碰」只差**重新露面**这一步：不露面时
-  那一轮本来就该停在 `:1091` 那道 `!_cdnIsAttached` 上（那条用例正是钉这个的）。
+  那一轮本来就该停在 `_autoSwitchLoop()` 那道 `!_cdnIsAttached` 上（那条用例正是钉这个的）。
 
 ## 备注
 

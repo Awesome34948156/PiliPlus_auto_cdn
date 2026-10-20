@@ -47,7 +47,7 @@
 #     ③ `落点 …ms 落后于 …ms，补一次 seek` 的条数 —— 丢点后落点校正会被触发
 #        （`cdn_switch_mixin.dart` 的 `_restoreResumePosition`）。
 #        ⚠️ 这行日志的**第一个数是播放器此刻的位置读数，第二个数才是目标**（发射点
-#        `cdn_switch_mixin.dart:1708`：`落点 ${player.positionInMilliseconds}ms 落后于
+#        `_restoreResumePosition()`：`落点 ${player.positionInMilliseconds}ms 落后于
 #        ${target.inMilliseconds}ms`）—— **不是"差值"**。所以判据只数「**落点读数 >0ms**」
 #        的那些：那是"播放器已经落在某个位置、但不是目标位置"的真落后；而「落点读数
 #        0ms」是新装载刚起步、位置读数还没跟上的固有形态（此刻发起补 seek 是这套双保险
