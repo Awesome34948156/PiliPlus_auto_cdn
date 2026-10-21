@@ -722,6 +722,69 @@ class UgcIntroController extends CommonIntroController with ReloadMixin {
     }
   }
 
+  /// 只读版 [nextPlay]/[prevPlay]：算出沿方向真正会去的那一集，没有就返回 null。
+  ///
+  /// 选表、跳空 cid、分 P → 合集/连播的委派必须与播放逻辑保持一致，
+  /// 否则会出现「按钮亮着但按了没反应」。
+  BaseEpisodeItem? _episodeInDirection({
+    required bool forward,
+    bool skipPart = false,
+  }) {
+    final videoDetail = this.videoDetail.value;
+    final episodes = <BaseEpisodeItem>[];
+    bool isPart = false;
+
+    if (!skipPart && videoDetail.hasParts) {
+      isPart = true;
+      episodes.addAll(videoDetail.pages!);
+    } else if (videoDetailCtr.isPlayAll) {
+      episodes.addAll(videoDetailCtr.mediaList);
+    } else if (videoDetail.ugcSeason != null) {
+      for (final section in videoDetail.ugcSeason!.sections!) {
+        episodes.addAll(section.episodes!);
+      }
+    }
+
+    if (episodes.isEmpty) return null;
+
+    final anchorCid = skipPart
+        ? (videoDetail.isPageReversed
+              ? videoDetail.pages!.last.cid
+              : videoDetail.pages!.first.cid)
+        : cid.value;
+    final currentIndex = episodes.indexWhere((e) => e.cid == anchorCid);
+    var index = forward ? currentIndex + 1 : currentIndex - 1;
+
+    if (index < 0 || index >= episodes.length) {
+      if (isPart &&
+          (videoDetailCtr.isPlayAll || videoDetail.ugcSeason != null)) {
+        return _episodeInDirection(forward: forward, skipPart: true);
+      }
+      if (videoDetailCtr.plPlayerController.playRepeat ==
+          PlayRepeat.listCycle) {
+        index = forward ? 0 : episodes.length - 1;
+      } else {
+        // autoPlayRelated 要异步拉列表，第一次按大概率空转；宁可不显示按钮。
+        return null;
+      }
+    }
+
+    while (index >= 0 && index < episodes.length) {
+      final episode = episodes[index];
+      if (episode.cid != null) {
+        return episode.cid == cid.value ? null : episode;
+      }
+      index += forward ? 1 : -1;
+    }
+    return null;
+  }
+
+  @override
+  bool get canSkipToNext => _episodeInDirection(forward: true) != null;
+
+  @override
+  bool get canSkipToPrevious => _episodeInDirection(forward: false) != null;
+
   bool playRelated() {
     RelatedController relatedCtr;
     if (Get.isRegistered<RelatedController>(tag: heroTag)) {

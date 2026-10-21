@@ -20,7 +20,7 @@ import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:collection/collection.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:get/get_core/src/get_main.dart';
 import 'package:get/get_instance/src/extension_instance.dart';
 import 'package:path/path.dart' as path;
@@ -46,17 +46,67 @@ typedef _StatusConfig = (
   bool isBuffering,
   bool isLive,
   double speed,
+  bool canSkipPrevious,
+  bool canSkipNext,
 );
+
+/// 系统「正在播放」上要暴露哪些按钮。
+///
+/// iOS 只认 [PlaybackState.controls] 里出现过的动作，没发出去的遥控命令不会启用；
+/// Android 的通知按钮也受这份列表影响，所以 skip 只在调用方算好可用性时才会进来。
+@visibleForTesting
+List<MediaControl> buildMediaControls({
+  required bool playing,
+  required bool isLive,
+  required bool canSkipPrevious,
+  required bool canSkipNext,
+}) {
+  return [
+    if (!isLive && canSkipPrevious) MediaControl.skipToPrevious,
+    if (!isLive)
+      const MediaControl(
+        androidIcon: 'drawable/ic_player_rewind_10s',
+        label: 'Rewind',
+        action: .rewind,
+      ),
+    if (playing)
+      const MediaControl(
+        androidIcon: 'drawable/ic_player_pause',
+        label: 'Pause',
+        action: .pause,
+      )
+    else
+      const MediaControl(
+        androidIcon: 'drawable/ic_player_play',
+        label: 'Play',
+        action: .play,
+      ),
+    if (!isLive)
+      const MediaControl(
+        androidIcon: 'drawable/ic_player_fast_forward_10s',
+        label: 'Fast Forward',
+        action: .fastForward,
+      ),
+    if (!isLive && canSkipNext) MediaControl.skipToNext,
+  ];
+}
 
 class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   static final List<MediaItem> _item = [];
-  bool enableBackgroundPlay = Pref.enableBackgroundPlay;
+  // iOS 上设置里已把「后台音频服务」并进「后台播放」，这里跟着同一个开关走。
+  bool enableBackgroundPlay = Platform.isIOS
+      ? Pref.continuePlayInBackground
+      : Pref.enableBackgroundPlay;
 
   Future<void>? Function()? onPlay;
   Future<void>? Function()? onPause;
   Future<void>? Function(Duration position)? onSeek;
   void Function()? onSkipToNext;
   void Function()? onSkipToPrevious;
+
+  /// 由拥有播放列表的页面（目前只有音频页）提供；为空时回退到 intro controller。
+  bool Function()? onCanSkipToNext;
+  bool Function()? onCanSkipToPrevious;
 
   @override
   Future<void> play() {
@@ -72,41 +122,88 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
         Future.syncValue(null);
   }
 
-  CommonIntroController? _findIntroController() {
+  /// 拿当前的 intro controller，失败一律返回 null。
+  ///
+  /// 会从播放器 stream 回调里调用，所以不能抛；也用于「上一集/下一集是否要显示」，
+  /// 保证按钮显示与否和按下去执行的是同一份解析。
+  /// GetX 按运行时具体类型注册，不能直接 `Get.find<CommonIntroController>`。
+  CommonIntroController? _peekIntroController() {
     final playOwner = PlPlayerController.playOwner;
-    if (playOwner != null) {
-      final tag = playOwner.tag;
-      try {
-        return switch (playOwner.type) {
-          UgcIntroController => Get.find<UgcIntroController>(tag: tag),
-          PgcIntroController => Get.find<PgcIntroController>(tag: tag),
-          LocalIntroController => Get.find<LocalIntroController>(tag: tag),
-          _ => throw UnimplementedError(playOwner.type.toString()),
-        };
-      } catch (_) {
-        if (kDebugMode) rethrow;
-      }
+    if (playOwner == null) return null;
+    final tag = playOwner.tag;
+    try {
+      final CommonIntroController? controller = switch (playOwner.type) {
+        UgcIntroController =>
+          Get.isRegistered<UgcIntroController>(tag: tag)
+              ? Get.find<UgcIntroController>(tag: tag)
+              : null,
+        PgcIntroController =>
+          Get.isRegistered<PgcIntroController>(tag: tag)
+              ? Get.find<PgcIntroController>(tag: tag)
+              : null,
+        LocalIntroController =>
+          Get.isRegistered<LocalIntroController>(tag: tag)
+              ? Get.find<LocalIntroController>(tag: tag)
+              : null,
+        _ => null,
+      };
+      return controller == null || controller.isClosed ? null : controller;
+    } catch (_) {
+      return null;
     }
-    return null;
+  }
+
+  bool _canSkipToNext() {
+    final resolve = onCanSkipToNext;
+    if (resolve != null) return resolve();
+    // 音频页在播时会把 onSkipToNext 设上；此时 playOwner 可能还停在底下的视频页。
+    if (onSkipToNext != null) return false;
+    try {
+      return _peekIntroController()?.canSkipToNext ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _canSkipToPrevious() {
+    final resolve = onCanSkipToPrevious;
+    if (resolve != null) return resolve();
+    if (onSkipToPrevious != null) return false;
+    try {
+      return _peekIntroController()?.canSkipToPrevious ?? false;
+    } catch (_) {
+      return false;
+    }
   }
 
   @override
   Future<void> skipToNext() {
-    final func = onSkipToNext ?? _findIntroController()?.nextPlay;
+    final func = onSkipToNext ?? _peekIntroController()?.nextPlay;
     return func == null ? Future.syncValue(null) : Future.sync(func);
   }
 
   @override
   Future<void> skipToPrevious() {
-    final func = onSkipToPrevious ?? _findIntroController()?.prevPlay;
+    final func = onSkipToPrevious ?? _peekIntroController()?.prevPlay;
     return func == null ? Future.syncValue(null) : Future.sync(func);
   }
 
   @override
-  Future<void> seek(Duration position) {
-    return onSeek?.call(position) ??
-        PlPlayerController.seekToIfExists(position, isSeek: false) ??
-        Future.syncValue(null);
+  Future<void> seek(Duration position) async {
+    final seekInPage = onSeek;
+    if (seekInPage != null) {
+      // 音频页自己会刷新 PlaybackState，不重复发布。
+      await seekInPage(position);
+      return;
+    }
+    final seek = PlPlayerController.seekToIfExists(position, isSeek: false);
+    if (seek == null) return;
+    await seek;
+    // 已经清空/关闭时不要再发状态，否则会把系统卡片唤回来。
+    if (playbackState.value.processingState == .idle) return;
+    // copyWith 会把 updateTime 重置为现在，暂停中拖动也能立刻重算系统进度。
+    playbackState.add(playbackState.value.copyWith(updatePosition: position));
+    _lastPos = position;
   }
 
   void setMediaItem(MediaItem newMediaItem) {
@@ -130,20 +227,28 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     required double speed,
     String? debugLabel,
   }) {
-    if (!enableBackgroundPlay || _item.isEmpty) {
-      return;
-    }
+    if (!enableBackgroundPlay || _item.isEmpty) return;
 
     if (onPlay != null && debugLabel == 'onVideoPaused') return;
 
-    final newConfig = (status, isBuffering, isLive, speed);
-    if (_lastConfig == newConfig) {
-      if (_lastPos != null) {
-        final pos = position.inSeconds;
-        final lastPos = _lastPos!.inSeconds;
-        _lastPos = position;
-        if (pos == lastPos && pos != 0) return;
-      }
+    // 只在 iOS 且非直播时才算：直播没有上下集，Android 通知里也不放 skip。
+    final canSkipPrevious = Platform.isIOS && !isLive && _canSkipToPrevious();
+    final canSkipNext = Platform.isIOS && !isLive && _canSkipToNext();
+
+    final newConfig = (
+      status,
+      isBuffering,
+      isLive,
+      speed,
+      canSkipPrevious,
+      canSkipNext,
+    );
+    final lastPos = _lastPos;
+    // 每次都要更新基准，否则 config 变化后 _lastPos 会停在旧值。
+    _lastPos = position;
+    if (_lastConfig == newConfig && lastPos != null) {
+      final pos = position.inSeconds;
+      if (pos == lastPos.inSeconds && pos != 0) return;
     }
     _lastConfig = newConfig;
 
@@ -166,6 +271,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       isLive,
       position: position,
       speed: speed,
+      canSkipPrevious: canSkipPrevious,
+      canSkipNext: canSkipNext,
     );
   }
 
@@ -175,38 +282,20 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     bool isLive, {
     required Duration position,
     required double speed,
+    bool canSkipPrevious = false,
+    bool canSkipNext = false,
   }) {
     playbackState.add(
       playbackState.value.copyWith(
         processingState: state,
         updatePosition: position,
         speed: speed,
-        controls: [
-          if (!isLive)
-            const MediaControl(
-              androidIcon: 'drawable/ic_player_rewind_10s',
-              label: 'Rewind',
-              action: .rewind,
-            ),
-          if (playing)
-            const MediaControl(
-              androidIcon: 'drawable/ic_player_pause',
-              label: 'Pause',
-              action: .pause,
-            )
-          else
-            const MediaControl(
-              androidIcon: 'drawable/ic_player_play',
-              label: 'Play',
-              action: .play,
-            ),
-          if (!isLive)
-            const MediaControl(
-              androidIcon: 'drawable/ic_player_fast_forward_10s',
-              label: 'Fast Forward',
-              action: .fastForward,
-            ),
-        ],
+        controls: buildMediaControls(
+          playing: playing,
+          isLive: isLive,
+          canSkipPrevious: canSkipPrevious,
+          canSkipNext: canSkipNext,
+        ),
         playing: playing,
         systemActions: const {.seek},
       ),
@@ -313,6 +402,40 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     }
     _item.add(mediaItem);
     setMediaItem(mediaItem);
+    // 换集后重新评估「上一集/下一集」是否可用。
+    _lastConfig = null;
+  }
+
+  /// 开关「后台音频服务」。
+  ///
+  /// 关闭时只撤掉系统播放器（锁屏/灵动岛/通知），不打断正在播放的声音，
+  /// 并保留 [_item]，重新打开时还能把卡片恢复回来。
+  void setEnableBackgroundPlay(bool value) {
+    if (enableBackgroundPlay == value) return;
+
+    if (value) {
+      enableBackgroundPlay = true;
+      _lastConfig = null;
+      _lastPos = null;
+      // 只在确实还有播放器/播放页时恢复卡片，避免关掉服务后残留的旧条目
+      // 在设置页一开开关就冒出一张幽灵卡片。
+      if (_item.isNotEmpty &&
+          (PlPlayerController.instance != null || onPlay != null)) {
+        setMediaItem(_item.last);
+      }
+      return;
+    }
+
+    // audio_service 只在「非 idle → idle」时调用 stopService；Darwin 端由此
+    // 把 nowPlayingInfo 置 nil 并收回遥控。单独 mediaItem.add(null) 没用，
+    // audio_service 的 _observeMediaItem 会直接忽略 null。
+    if (playbackState.value.processingState == .idle) {
+      playbackState.add(PlaybackState(processingState: .completed));
+    }
+    playbackState.add(PlaybackState(processingState: .idle));
+    enableBackgroundPlay = false;
+    _lastConfig = null;
+    _lastPos = null;
   }
 
   void onVideoDetailDispose(String herotag) {

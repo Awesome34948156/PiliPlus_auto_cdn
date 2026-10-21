@@ -347,6 +347,10 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
           player?.play();
         }
       }
+    } else if (state == AppLifecycleState.resumed) {
+      // 后台期间攒下的解码器重建推迟到了现在（见
+      // PlPlayerController._deferredDecoderRebuild）。
+      plPlayerController.resumeDeferredDecoderRebuild();
     }
   }
 
@@ -1901,7 +1905,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             return Center(
               child: GestureDetector(
                 onTap: () {
-                  debugPrint('缓冲遮罩被点: refreshPlayer @${plPlayerController.position.value}s');
+                  debugPrint(
+                    '缓冲遮罩被点: refreshPlayer @${plPlayerController.position.value}s',
+                  );
                   plPlayerController.refreshPlayer();
                 },
                 child: Container(

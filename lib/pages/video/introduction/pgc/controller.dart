@@ -388,6 +388,30 @@ class PgcIntroController extends CommonIntroController {
     }
   }
 
+  @override
+  bool get canSkipToNext {
+    final episodes = pgcItem.episodes;
+    if (episodes == null || episodes.isEmpty) return false;
+    final currentIndex = episodes.indexWhere(
+      (e) => e.cid == videoDetailCtr.cid.value,
+    );
+    if (currentIndex + 1 < episodes.length) return true;
+    return episodes.length > 1 &&
+        videoDetailCtr.plPlayerController.playRepeat == PlayRepeat.listCycle;
+  }
+
+  @override
+  bool get canSkipToPrevious {
+    final episodes = pgcItem.episodes;
+    if (episodes == null || episodes.isEmpty) return false;
+    final currentIndex = episodes.indexWhere(
+      (e) => e.cid == videoDetailCtr.cid.value,
+    );
+    if (currentIndex - 1 >= 0) return true;
+    return episodes.length > 1 &&
+        videoDetailCtr.plPlayerController.playRepeat == PlayRepeat.listCycle;
+  }
+
   // 一键三连
   @override
   Future<void> actionTriple() async {

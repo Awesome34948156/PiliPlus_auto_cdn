@@ -966,8 +966,11 @@ abstract final class Pref {
   static int get cacheVideoFit =>
       _video.get(VideoBoxKey.cacheVideoFit, defaultValue: 1);
 
-  static bool get continuePlayInBackground =>
-      _setting.get(SettingBoxKey.continuePlayInBackground, defaultValue: false);
+  static bool get continuePlayInBackground => _setting.get(
+    SettingBoxKey.continuePlayInBackground,
+    // iOS 默认继续后台播放，锁屏/灵动岛才有东西可控；其他平台保持原默认。
+    defaultValue: Platform.isIOS,
+  );
 
   static bool get directExitOnBack =>
       _setting.get(SettingBoxKey.directExitOnBack, defaultValue: false);

@@ -60,6 +60,10 @@ abstract class CommonIntroController extends GetxController
   bool prevPlay();
   bool nextPlay();
 
+  /// 系统「正在播放」要不要显示上一集/下一集（只读，不触发播放）。
+  bool get canSkipToPrevious => false;
+  bool get canSkipToNext => false;
+
   void actionShareVideo(BuildContext context);
 
   // 同时观看

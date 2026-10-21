@@ -199,7 +199,9 @@ class AudioController extends GetxController
       ..onPause = onPause
       ..onSeek = onSeek
       ..onSkipToNext = playNext
-      ..onSkipToPrevious = playPrev;
+      ..onSkipToPrevious = playPrev
+      ..onCanSkipToNext = _canSkipNext
+      ..onCanSkipToPrevious = _canSkipPrev;
 
     animController = AnimationController(
       vsync: this,
@@ -218,7 +220,19 @@ class AudioController extends GetxController
   }
 
   Future<void>? onPlay() {
+    // 音频页用的是自己的 player，不经过 PlPlayerController.play()，
+    // 锁屏/控制中心按播放时要自己把音频会话激活。
+    if (Platform.isIOS) {
+      return _activateSessionAndPlay();
+    }
     return player?.play();
+  }
+
+  Future<void>? _activateSessionAndPlay() async {
+    try {
+      await audioSessionHandler?.setActive(true);
+    } catch (_) {}
+    await player?.play();
   }
 
   Future<void>? onPause() {
@@ -424,14 +438,17 @@ class AudioController extends GetxController
         this.duration.value = duration.inSeconds;
       }),
       stream.playing.listen((playing) {
+        // 音频页自己的播放键不走 onPlay/onPause，统一在这里起停会话守卫。
         if (playing) {
           animController.forward();
           _playerStatus = .playing;
+          audioSessionHandler?.startNowPlayingGuard();
           _stopStatusTimer();
           _updatePlaybackState();
         } else {
           animController.reverse();
           _playerStatus = .paused;
+          audioSessionHandler?.stopNowPlayingGuard();
           _startStatusTimer();
         }
       }),
@@ -700,6 +717,17 @@ class AudioController extends GetxController
     return player?.playOrPause();
   }
 
+  /// 与 [playNext]/[playPrev] 的远端路径保持一致：只看播放列表的相邻项，
+  /// 不走分 P、也不触发 [_next] 懒加载。
+  bool _canSkipNext() =>
+      player != null &&
+      index != null &&
+      playlist != null &&
+      index! + 1 < playlist!.length;
+
+  bool _canSkipPrev() =>
+      player != null && index != null && playlist != null && index! > 0;
+
   bool playPrev() {
     if (index != null && playlist != null && player != null) {
       final prev = index! - 1;
@@ -821,6 +849,7 @@ class AudioController extends GetxController
 
   @override
   void onClose() {
+    audioSessionHandler?.stopNowPlayingGuard();
     _stopStatusTimer();
     shutdownTimerService
       ..onPause = null
@@ -832,6 +861,8 @@ class AudioController extends GetxController
       ..onSeek = null
       ..onSkipToNext = null
       ..onSkipToPrevious = null
+      ..onCanSkipToNext = null
+      ..onCanSkipToPrevious = null
       ..onVideoDetailDispose(hashCode.toString())
       ..clearIfNeeded();
     _subscriptions?.forEach((e) => e.cancel());

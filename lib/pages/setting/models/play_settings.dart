@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/setting/models/model.dart';
 import 'package:PiliPlus/pages/setting/pages/fullscreen_sc_size.dart';
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/pages/setting/widgets/slider_dialog.dart';
+import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/bottom_progress_behavior.dart';
 import 'package:PiliPlus/plugin/pl_player/models/fullscreen_mode.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
@@ -209,12 +210,23 @@ List<SettingsModel> get playSettings => [
     defaultVal: false,
   ),
   if (PlatformUtils.isMobile)
-    const SwitchModel(
+    SwitchModel(
       title: '后台播放',
-      subtitle: '进入后台时继续播放',
-      leading: Icon(Icons.motion_photos_pause_outlined),
+      subtitle: Platform.isIOS
+          ? '切到后台时继续播放；锁屏、控制中心、灵动岛显示播放信息并可控制'
+          : '进入后台时继续播放',
+      leading: const Icon(Icons.motion_photos_pause_outlined),
       setKey: SettingBoxKey.continuePlayInBackground,
-      defaultVal: false,
+      defaultVal: Platform.isIOS,
+      onChanged: (value) {
+        PlPlayerController.instance?.continuePlayInBackground.value = value;
+        if (Platform.isIOS) {
+          // iOS 上这一个开关同时管「继续播放」和「系统播放卡片」，
+          // 写盘一份到 enableBackgroundPlay，避免下次启动时两处不一致。
+          GStorage.setting.put(SettingBoxKey.enableBackgroundPlay, value);
+          videoPlayerServiceHandler?.setEnableBackgroundPlay(value);
+        }
+      },
     ),
   if ((Platform.isAndroid && PiliAndroidHelper.isPipAvailable) ||
       (Platform.isIOS && IOSPipHelper.isAvailable))
@@ -276,7 +288,8 @@ List<SettingsModel> get playSettings => [
         .put(SettingBoxKey.btmProgressBehavior, value.index)
         .whenComplete(setState),
   ),
-  if (PlatformUtils.isMobile)
+  // iOS 已并入「后台播放」，不再单独露出。
+  if (PlatformUtils.isMobile && !Platform.isIOS)
     SwitchModel(
       title: '后台音频服务',
       subtitle: '避免画中画没有播放暂停功能',

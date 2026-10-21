@@ -124,6 +124,17 @@ class LocalIntroController extends CommonIntroController {
     return false;
   }
 
+  @override
+  bool get canSkipToNext {
+    if (index.value + 1 < list.length) return true;
+    // 单集列表循环在 nextPlay 里是「重播自己」，没有下一集可去，按钮不显示。
+    return list.length > 1 &&
+        videoDetailCtr.plPlayerController.playRepeat == PlayRepeat.listCycle;
+  }
+
+  @override
+  bool get canSkipToPrevious => index.value > 0;
+
   void playIndex(
     int index, {
     BiliDownloadEntryInfo? entry,

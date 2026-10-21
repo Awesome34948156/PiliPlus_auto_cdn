@@ -357,6 +357,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   final List<DateTime> _rebufferEvents = [];
   DateTime _rebufferSuppressUntil = DateTime.fromMillisecondsSinceEpoch(0);
   bool _wasStalled = false;
+
   /// 余量是否已经归零过（[onRebuffer] 的上升沿去重）。
   bool _wasEmpty = false;
   int _starveSeconds = 0;
@@ -402,6 +403,53 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 重建解码器的冷却截止时刻。见 [PlayerTuning.sessionFailCooldown]。
   DateTime _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 后台攒下了「硬解会话失效」但没动手重建，等回前台再修。
+  ///
+  /// 重建会把音频输出一起拆掉、断音 1~3 秒。iOS 在断音那一瞬间就把「正在播放」
+  /// 交给了上一个播放器，之后声音回来了、播放器卡片也回不来（2026-10-21 真机：
+  /// 回主页 → 重建 → 2 秒断音 → 灵动岛变苹果音乐，重新认领也抢不回）。
+  /// 后台本来就没有画面，重建没有意义，推迟到回前台。
+  bool _deferredDecoderRebuild = false;
+
+  /// 回前台后把推迟的重建补上。由播放器页的生命周期回调调用。
+  void resumeDeferredDecoderRebuild() {
+    if (!_deferredDecoderRebuild) return;
+    _deferredDecoderRebuild = false;
+    debugPrint('CDN 看门狗: 回前台，原地重挂视频轨（后台那段硬解会话已作废）');
+    _reloadVideoTrack();
+  }
+
+  /// 只把**视频轨**重挂一遍：`vid=no` → `vid=auto`。
+  ///
+  /// 为什么不是 [reinitDecoderAfterBackground]（切 hwdec + seek）：那条路要求
+  /// 新的硬解解码器第一口就吃到关键帧，可 `set hwdec` 在 mpv 里是**立即**重开
+  /// 解码器、不等随后排队的 seek。正在播放时它先拿到 GOP 中间的帧，
+  /// `av1: Missing Sequence Header` 刷三条就一路降级到软解且不再回升（2026-10-21
+  /// 真机 20:47 现场：画面回来了，但这一集剩下的时间都是 CPU 软解，发热明显）。
+  /// 停顿中的调用方（`!continuePlayInBackground` 那条）没有这个竞争，所以那条
+  /// 路径保持不动。
+  ///
+  /// `vid` 重挂则是 mpv 自己按"新视频链从关键帧开始"来做的：本机对照实验
+  /// （mpv 0.41 + AV1 硬解，40s/8s GOP）里视频 134ms 回来、`hwdec-current`
+  /// 仍是 videotoolbox、音频时间轴一秒没停。它不碰音频轨，所以也永远不会触发
+  /// 「断音 → 系统把正在播放交给别的 App」那条链。
+  Future<void> _reloadVideoTrack() async {
+    final ctr = _videoPlayerController;
+    if (ctr == null) return;
+    // 视频链从关键帧重开的那一刻会冒续解报错（`Missing Sequence Header` 等），
+    // 和 [reinitDecoderAfterBackground] 一样要先把窗口打开，别让它们算到镜像头上。
+    _foregroundResumedAt = DateTime.now();
+    try {
+      await ctr.command(['set', 'vid', 'no']);
+      // 留一拍让 mpv 把旧视频链接干净；本机实测 300ms 足够。
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await ctr.command(['set', 'vid', 'auto']);
+    } catch (_) {
+      // 重挂失败就带着旧解码链继续放：看门狗还在，真治不好会升级成重载
+      // （[_noteForegroundResumeFailure]）。
+    }
+  }
 
   /// 回前台开始续播的时刻；窗口长度见 [PlayerTuning.foregroundResumeWindow]。
   ///
@@ -1416,6 +1464,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       stream.playing.listen((bool playing) {
         if (playing) {
           playerStatus = .playing;
+          // 播放期间盯住音频会话（mpv 起音频输出时会把它改成混音，
+          // iOS 就不认我们为「正在播放」）。挂在真实播放状态上，
+          // 双击播放、续播、打断恢复这些不经过 play() 的路径也能覆盖到。
+          audioSessionHandler?.startNowPlayingGuard();
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
@@ -1429,6 +1481,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           }
         } else {
           playerStatus = .paused;
+          // 暂停后 mpv 不会再动会话，守卫可以歇着。
+          audioSessionHandler?.stopNowPlayingGuard();
           _startWakeLockTimer();
           _disableAutoEnterPip();
           _updateIOSPip();
@@ -1735,7 +1789,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _noVideoStrongFingerprint && position.value > _noVideoLastPosition;
     _noVideoLastPosition = position.value;
     if (now.difference(start) <
-        (strong ? PlayerTuning.noVideoWindow : PlayerTuning.noVideoWindowWeak)) {
+        (strong
+            ? PlayerTuning.noVideoWindow
+            : PlayerTuning.noVideoWindowWeak)) {
       return;
     }
     // 重新开窗：下一次定罪要再攒满一个窗口。额度用尽之后就靠这个节奏在日志里
@@ -1826,7 +1882,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   set debugPlayerCount(int value) => _playerCount = value;
 
   @visibleForTesting
-  set debugRebuildingRenderContext(bool value) => _rebuildingRenderContext = value;
+  set debugRebuildingRenderContext(bool value) =>
+      _rebuildingRenderContext = value;
 
   /// 「闸门一成立就关窗」这条断言要有个能直接看的对象，不然只能靠"报没报"间接推。
   ///
@@ -1881,7 +1938,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> _runRenderContextRebuild() async {
     _rebuildingRenderContext = true;
     _noVideoRebuilds++;
-    debugPrint('就地重建: 开始（第 $_noVideoRebuilds/${PlayerTuning.noVideoRebuildMax} 次）');
+    debugPrint(
+      '就地重建: 开始（第 $_noVideoRebuilds/${PlayerTuning.noVideoRebuildMax} 次）',
+    );
     try {
       // 次序不可换：_removeListeners 先跑（取消 ticker + 把 _subscriptions 置
       // null，否则 _startListeners 的 assert 会炸、旧订阅也会泄漏），两个字段
@@ -2030,8 +2089,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     debugPrint(
       'CDN 看门狗: 解码错误风暴（'
       '${sparseReached ? '${PlayerTuning.decodeErrorWindow.inSeconds}s 内 '
-              '${PlayerTuning.decodeErrorBurst} 条' : '${PlayerTuning.decodeErrorDenseWindow.inMilliseconds}ms'
-              ' 内 ${PlayerTuning.decodeErrorDenseBurst} 行'}'
+                '${PlayerTuning.decodeErrorBurst} 条' : '${PlayerTuning.decodeErrorDenseWindow.inMilliseconds}ms'
+                ' 内 ${PlayerTuning.decodeErrorDenseBurst} 行'}'
       '），当前镜像给的字节解不出画面 —— 上报换源',
     );
     // 回执：页面在途轮次收不下这一发（返回 false）时把静默期缩到 [PlayerTuning.decodeErrorRetryBackoff]
@@ -2138,6 +2197,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 先记账、再判冷却：同 [_sampleDecodeError]，冷却压的是"动手"不是计数。
     // 这里不用清 [_sessionFailures] —— 冷却（30s）比窗口（3s）长得多，到那时
     // 旧记录早就自己出窗了，清是句死代码。
+    //
+    // 后台不重建：重建会拆掉音频输出、断音 1~3 秒，iOS 会趁这一下把「正在播放」
+    // 交给别的 App，声音回来卡片也回不来（2026-10-21 真机，见
+    // [_deferredDecoderRebuild]）。后台没有画面，回前台再修。
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      if (!_deferredDecoderRebuild) {
+        _deferredDecoderRebuild = true;
+        debugPrint('CDN 看门狗: 硬解会话失效，但在后台 —— 推迟到回前台再重建');
+      }
+      return;
+    }
     if (now.isBefore(_sessionHealUntil)) return;
     _sessionHealUntil = now.add(PlayerTuning.sessionFailCooldown);
     debugPrint(
@@ -2168,7 +2238,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 心跳放在闸门之前：闸门本身也可能是"什么都不发生"的原因之一，
       // 必须先看到它当时的取值。
       final now = DateTime.now();
-      if (now.difference(_lastHeartbeat).inSeconds >= PlayerTuning.heartbeatSeconds) {
+      if (now.difference(_lastHeartbeat).inSeconds >=
+          PlayerTuning.heartbeatSeconds) {
         _lastHeartbeat = now;
         debugPrint(
           'CDN 看门狗: 余量 ${bufferedAhead}s 阈值 '
@@ -2333,7 +2404,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                   '${threshold.toStringAsFixed(1)}s (连续 ${PlayerTuning.starveSeconds} s) '
                   '@${position.value}s',
       );
-      onBufferStarve?.call(videoPlayerController?.state.position ?? Duration.zero);
+      onBufferStarve?.call(
+        videoPlayerController?.state.position ?? Duration.zero,
+      );
       return;
     }
     _starveSeconds = 0;
@@ -2414,7 +2487,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (!_wasEmpty) {
         _wasEmpty = true;
         debugPrint('CDN 余量归零 @${position.value}s，上报小卡顿');
-        onRebuffer?.call(videoPlayerController?.state.position ?? Duration.zero);
+        onRebuffer?.call(
+          videoPlayerController?.state.position ?? Duration.zero,
+        );
       }
     } else {
       _wasEmpty = false;
@@ -2423,7 +2498,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final stalled = isBuffering.value && bufferedAhead == 0;
     if (stalled && !_wasStalled) {
       _rebufferEvents.add(now);
-      _rebufferEvents.removeWhere((t) => now.difference(t) > PlayerTuning.rebufferWindow);
+      _rebufferEvents.removeWhere(
+        (t) => now.difference(t) > PlayerTuning.rebufferWindow,
+      );
       debugPrint(
         'CDN 卡顿计数: ${_rebufferEvents.length}/${PlayerTuning.rebufferTrigger} '
         '(窗口 ${PlayerTuning.rebufferWindow.inSeconds}s)',
@@ -2524,9 +2601,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       await seekTo(Duration.zero, isSeek: false);
     }
 
-    await _videoPlayerController?.play();
+    // 先拿到音频会话再出声：锁屏/灵动岛要等会话激活后才认领「正在播放」。
+    // 激活失败（被其他音频占用等）不应阻塞播放。
+    try {
+      await audioSessionHandler?.setActive(true);
+    } catch (_) {}
 
-    audioSessionHandler?.setActive(true);
+    await _videoPlayerController?.play();
 
     playerStatus = .playing;
   }
@@ -2536,8 +2617,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     await _videoPlayerController?.pause();
     playerStatus = .paused;
 
-    // 主动暂停时让出音频焦点
-    if (!isInterrupt) {
+    // 主动暂停时让出音频焦点。
+    // iOS 例外：deactivate 会把系统「正在播放」卡片和遥控一起收走，
+    // 锁屏上第一次点暂停就再也回不来了；会话留给最终 dispose 收尾。
+    if (!isInterrupt && !Platform.isIOS) {
       audioSessionHandler?.setActive(false);
     }
   }
@@ -3023,6 +3106,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _videoController = null;
     _instance = null;
     videoPlayerServiceHandler?.clear();
+    audioSessionHandler?.stopNowPlayingGuard();
+
+    // iOS：会话一直留到播放器真正销毁，锁屏卡片才能在暂停后继续存在。
+    // 音频页（听视频）用的是另一个 player，onPlay 非空时不能掐它的会话。
+    if (Platform.isIOS && videoPlayerServiceHandler?.onPlay == null) {
+      audioSessionHandler?.setActive(false).catchError((_) => false);
+    }
   }
 
   static void updatePlayCount() {
@@ -3038,6 +3128,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (!tempPlayerConf) {
       setting.put(
         SettingBoxKey.continuePlayInBackground,
+        continuePlayInBackground.value,
+      );
+    }
+    // iOS 上系统播放卡片跟着这个开关走。
+    if (Platform.isIOS) {
+      videoPlayerServiceHandler?.setEnableBackgroundPlay(
         continuePlayInBackground.value,
       );
     }
