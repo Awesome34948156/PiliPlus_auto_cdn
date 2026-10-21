@@ -13,7 +13,6 @@ import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:collection/collection.dart';
 import 'package:dio/dio.dart' show CancelToken, Dio, DioException;
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
-import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 
@@ -348,7 +347,10 @@ class _CdnSwitchState {
   void noteSuccess() {
     autoAttempts = 0;
     lastAttemptPos = Duration.zero;
-    triedAt.clear();
+    // 慢（[CdnTuning.retryAfter]）的冷却清掉 —— 这一轮已经证明有得换。
+    // 但"连不上"的时刻要留着：那是 [_cdnDeadRecently] 计算死镜像窗口的起点，
+    // 一起清掉就等于让它们**永久**出局（成了 noSample 却永远没有一个到期时刻）。
+    triedAt.removeWhere((service, _) => !noSample.contains(service));
     giveUpUntil = null;
   }
 
@@ -454,6 +456,15 @@ mixin CdnSwitchMixin on GetxController {
   @visibleForTesting
   Set<CDNService> get debugCdnNoSample => _cdnState.noSample;
 
+  /// 测试用：把某个镜像"上次测过"的时刻往回拨。
+  ///
+  /// 死镜像窗口（[CdnTuning.deadRetryAfter]）与慢镜像冷却都从这里算起，测试不能
+  /// 真的等 30 分钟，只能把起点搬走。
+  @visibleForTesting
+  void debugBackdateCdnAttempt(CDNService service, Duration ago) {
+    _cdnState.triedAt[service] = DateTime.now().subtract(ago);
+  }
+
   /// 冷却窗口还没过（时长取决于上一轮的样本是"慢"还是"一个字都没有"）。
   bool _cdnRecentlyTried(CDNService service, DateTime now) {
     final at = _cdnState.triedAt[service];
@@ -462,6 +473,23 @@ mixin CdnSwitchMixin on GetxController {
         ? CdnTuning.deadRetryAfter
         : CdnTuning.retryAfter;
     return now.difference(at) < window;
+  }
+
+  /// [service] 是不是"这一阵子连不上"：上一轮一个字节都没到，且还在
+  /// [CdnTuning.deadRetryAfter] 之内。
+  ///
+  /// 和 [_cdnRecentlyTried] 的区别是它**不看胜负、只看这一条链路**：候选池和冠军位
+  /// 都用它，而不是直接查 [noSample]。只查集合的话，一旦连不上就再也轮不到它取样
+  /// （它正是靠这两处跳过才进不了候选），而 [_CdnSwitchState.noSample] 只在**测到
+  /// 样本**时移除 —— 于是"30 分钟后自然重试"永远不会发生，死镜像在整页生命周期里
+  /// 永久出局。时刻取 [triedAt]，就是上一轮真去连它的那一刻。
+  bool _cdnDeadRecently(CDNService service, DateTime now) {
+    if (!_cdnState.noSample.contains(service)) return false;
+    final at = _cdnState.triedAt[service];
+    // 没有时刻就保守当"仍连不上"：真出现了这种情况（正常路径不会），
+    // 让它再等一次成功的轮次，而不是凭一条无凭据的记录回到候选池。
+    if (at == null) return true;
+    return now.difference(at) < CdnTuning.deadRetryAfter;
   }
 
   /// 记下一个镜像这一轮实测到的速度，供 [_cdnChampion] 每轮把冠军送进候选窗口。
@@ -545,10 +573,11 @@ mixin CdnSwitchMixin on GetxController {
         continue;
       }
       // 上一轮一个字节都没到（连接超时 / 403 / 0 样本）：这是"这条链路连不上"
-      // 而不是"慢"，跟换集换对象无关，短时间内不会自愈。让它占着冠军位等于每轮
-      // 白赔一次超时、白占一个候选位。跳过它、让位给轮换；下次真出样本就自动恢复
-      // （见 [_pickFastestCdn] 里的 `_cdnState.noSample.remove`）。
-      if (_cdnState.noSample.contains(service)) continue;
+      // 而不是"慢"，跟换集换对象无关。让它占着冠军位等于每轮白赔一次超时、白占
+      // 一个候选位。跳过它、让位给轮换；[CdnTuning.deadRetryAfter] 之后按时刻
+      // 放行重试，真出样本就自动恢复（见 [_pickFastestCdn] 里的
+      // `_cdnState.noSample.remove`）。
+      if (_cdnDeadRecently(service, now)) continue;
       // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 `_cdnState.championMisses`。
       if ((_cdnState.championMisses[service] ?? 0) >=
           CdnTuning.championMisses) {
@@ -939,21 +968,44 @@ mixin CdnSwitchMixin on GetxController {
       _cdnState.deferredSwitch = pending;
       return;
     }
-    _cdnState.autoBusy = true;
+    // 和常规轮次一样用 beginRound：它会记下"这一轮开始时用户选的是哪个 CDN"，
+    // 补做期间用户手动换源时下面那道 `autoServiceSnapshot` 复查才识得出来。
+    // 直接写 autoBusy 会漏掉这层保护（以及 `_cdnAutoEligible` 那两道闸）。
+    if (!_cdnAutoEligible || isQuerying) return;
+    final generation = _cdnState.beginRound(VideoUtils.cdnService);
     final switchedAt = DateTime.now();
     debugPrint('CDN 自动切换: 回前台，补做推迟的换源 -> ${pending.service.desc}');
     try {
-      if (!await _switchTo(
+      // 兜底再记一次"正在播的这条源是坏的"：常规路径在排队时就记了（见
+      // [_autoSwitchLoop] 里那道记账），这里只防它将来又被挪到推迟之后。
+      // 幂等 —— 集合里已有就不会重复打印。
+      if (pending.decode) _noteTriggerBadHost();
+      // 「测速顺手发现」那两档本来就等得起，且这一刻往往正是视频链刚重建完
+      // （回前台重挂视频轨）：先让它热起来再换，否则刚修掉的冷启动静音会在这条
+      // 路径上原样复现。解码错误档不等 —— 画面已经坏了，多等就是白让用户看着坏。
+      if (!pending.decode) {
+        await _awaitVideoChainWarm();
+        if (_roundVoided(generation) ||
+            isClosed ||
+            isQuerying ||
+            !_cdnIsAttached) {
+          return;
+        }
+      }
+      final landed = await _switchTo(
         pending.service,
-        pending.generation,
+        generation,
         resumeAt: pending.resumeAt,
         switchedAt: switchedAt,
-      )) {
+      );
+      if (landed == null) {
         return;
       }
       if (await _awaitRecovery(
-        pending.generation,
-        pending.resumeAt,
+        generation,
+        // 落点用 _switchTo 实际用的那个，不是后台记下的 `pending.resumeAt`：
+        // 后台播了几分钟时实时位置远大于它，用旧值会让进度判据第一个事件就成立。
+        landed,
         decode: pending.decode,
         service: pending.service,
         since: switchedAt,
@@ -962,11 +1014,13 @@ mixin CdnSwitchMixin on GetxController {
         debugPrint('CDN 自动切换: 成功，已切到 ${pending.service.desc}');
       } else {
         // 没恢复就交回常规触发（卡顿/饥饿/定期测速都还在）：这里不再自己
-        // 接着换下一个候选，免得绕过那几道闸。
+        // 接着换下一个候选，免得绕过那几道闸。但解码档的账得记 —— 否则下一次
+        // 测速又会把这条"确实快、字节却解不出画面"的镜像评成最优而换回来。
+        if (pending.decode) _noteChosenBadHost(generation, pending.service);
         debugPrint('CDN 自动切换: ${pending.service.desc} 未恢复（回前台补做）');
       }
     } finally {
-      _cdnState.completeRound(pending.generation);
+      _cdnState.completeRound(generation);
     }
   }
 
@@ -984,16 +1038,13 @@ mixin CdnSwitchMixin on GetxController {
   /// 应用是否真的在后台（不是画中画）。
   ///
   /// `inactive` 不算：下拉控制中心、来电横幅那几秒里页面还会回来，没必要把
-  /// 一次已经判定好的换源按下不表。
+  /// 一次已经判定好的换源按下不表。判据本身在 [PlPlayerController.appInBackground]
+  /// —— 播放器的「后台推迟重建解码器」用同一份，两边口径必须一致，否则会出现
+  /// "换源推迟了、解码器重建却当场做了"这种半推半就的状态。
   bool get _cdnInBackground {
-    // 画中画里画面还在看，不算后台。
+    // 画中画里画面还在看，不算后台。这一条只有换源需要：它要重载播放器。
     if (IOSPipHelper.isActive) return false;
-    return switch (WidgetsBinding.instance.lifecycleState) {
-      AppLifecycleState.paused ||
-      AppLifecycleState.hidden ||
-      AppLifecycleState.detached => true,
-      _ => false,
-    };
+    return plPlayerController.appInBackground;
   }
 
   /// 测试用：把「这次要不要推迟换源」钉成指定值。
@@ -1249,6 +1300,16 @@ mixin CdnSwitchMixin on GetxController {
 
       _cdnState.noteAttempt(attempt, stalledAt);
 
+      // 强制换源这一档的账：解码器已经证明**正在播的这个 host** 给了坏字节，
+      // 那这一集就别再回到它身上。只在第一次尝试时记 —— 那是触发这一轮的
+      // 那条源；后面几次是"换过去仍没恢复"，那说明的是别的（落点、缓冲），
+      // 不该拿来给新 host 定罪。
+      //
+      // 必须压在下面的后台推迟**之前**：推迟只是把动作挪到回前台，这条账记的是
+      // "现在正在播的源坏了"，与什么时候换无关。放在推迟之后的话，后台判定的
+      // 解码档一推迟就再也不会记账，坏 host 下一轮测速又会被评成最快候选。
+      if (force && attempt == 0) _noteTriggerBadHost();
+
       // iOS 在后台就先别换：换源要重载播放器，音频输出拆了重建断音 1~3 秒，
       // 系统「正在播放」（锁屏/灵动岛）就是在这断音里被交出去的，回不来 ——
       // 见 [_CdnSwitchState.deferredSwitch]。后台没有画面可看，等回前台补做。
@@ -1285,32 +1346,22 @@ mixin CdnSwitchMixin on GetxController {
       );
       _cdnToast('$what，尝试切换到 ${chosen.desc}\n$speed');
 
-      // 强制换源这一档的账：解码器已经证明**正在播的这个 host** 给了坏字节，
-      // 那这一集就别再回到它身上。只在第一次尝试时记 —— 那是触发这一轮的
-      // 那条源；后面几次是"换过去仍没恢复"，那说明的是别的（落点、缓冲），
-      // 不该拿来给新 host 定罪。
-      if (force && attempt == 0) {
-        final bad = Uri.tryParse(videoUrl ?? '')?.host;
-        if (bad != null && bad.isNotEmpty && _cdnState.badHosts.add(bad)) {
-          debugPrint('CDN 自动切换: $bad 给的字节解不出画面，本集不再作为候选');
-        }
-      }
-
       switched = true;
       // 这一刻之前的「打不开」证词不算这一轮的：装载开始时播放器会清掉旧账，
       // 这里只用时刻把"换过去之后"与"换过去之前"分开。
       final switchedAt = DateTime.now();
-      if (!await _switchTo(
+      final landed = await _switchTo(
         chosen,
         generation,
         resumeAt: stalledAt,
         switchedAt: switchedAt,
-      )) {
+      );
+      if (landed == null) {
         return;
       }
       if (await _awaitRecovery(
         generation,
-        stalledAt,
+        landed,
         decode: force,
         service: chosen,
         since: switchedAt,
@@ -1330,12 +1381,7 @@ mixin CdnSwitchMixin on GetxController {
       // 还可能是这一轮作废了（用户换画质/换集，或本页被顶掉）—— 那时候新镜像
       // 根本没被播出过一秒，拿它头上定罪会凭空封掉一条好镜像 30 分钟。只有这一
       // 轮仍然有效，"换过去以后还在报错"才算证据。
-      if (force && _roundLive(generation)) {
-        final bad = chosen.host;
-        if (bad != null && _cdnState.badHosts.add(bad)) {
-          debugPrint('CDN 自动切换: $bad 换过去仍解不出画面，本集不再作为候选');
-        }
-      }
+      if (force) _noteChosenBadHost(generation, chosen);
       debugPrint('CDN 自动切换: ${chosen.desc} 未恢复，换下一个候选');
     }
 
@@ -1454,10 +1500,13 @@ mixin CdnSwitchMixin on GetxController {
     var fromRotation = 0;
     // 三遍，一遍比一遍放宽：
     //   1) 尊重冷却；
-    //   2) 忽略冷却，但仍躲开"上一轮零字节"的镜像 —— 让它们重新占掉唯一的候选位，
-    //      等于每轮白搭两个 3s 超时（正是 [CdnTuning.deadRetryAfter] 要避免的）；
+    //   2) 忽略冷却，但仍躲开"这一阵子连不上"的镜像 —— 让它们重新占掉唯一的候选
+    //      位，等于每轮白搭两个 3s 超时（正是 [CdnTuning.deadRetryAfter] 要避免的）；
     //   3) 全都不管，只求别出现"一轮没有候选"。
     // 只有前两遍都填不满窗口，才会走到第 3 遍。
+    //
+    // "连不上"用 [_cdnDeadRecently]（按时刻判）而不是直接查集合：过了 30 分钟要
+    // 放行重试，否则它永远轮不到取样、也就永远移不出 [noSample]，死镜像永久出局。
     for (final pass in const [
       (ignoreCooldown: false, ignoreNoSample: false),
       (ignoreCooldown: true, ignoreNoSample: false),
@@ -1471,7 +1520,7 @@ mixin CdnSwitchMixin on GetxController {
         // 本集里给过坏字节的镜像不再进候选 —— 它的**速度**没问题，测速拦不住它，
         // 只有解码器认得出来（见 `_cdnState.badHosts`）。
         if (_cdnState.badHosts.contains(host)) continue;
-        if (!pass.ignoreNoSample && _cdnState.noSample.contains(service)) {
+        if (!pass.ignoreNoSample && _cdnDeadRecently(service, now)) {
           continue;
         }
         if (!pass.ignoreCooldown && _cdnRecentlyTried(service, now)) continue;
@@ -1888,16 +1937,44 @@ mixin CdnSwitchMixin on GetxController {
     );
   }
 
+  /// 解码错误档的账（一）：**正在播的这条源**给了坏字节，本集不再回到它。
+  ///
+  /// 独立成方法是为了让后台推迟的那条路径也能记：推迟只挪动作、不改变"现在这条
+  /// 源是坏的"这个事实（见 [_autoSwitchLoop] 里那道推迟分支的位置）。
+  void _noteTriggerBadHost() {
+    final bad = Uri.tryParse(videoUrl ?? '')?.host;
+    if (bad != null && bad.isNotEmpty && _cdnState.badHosts.add(bad)) {
+      debugPrint('CDN 自动切换: $bad 给的字节解不出画面，本集不再作为候选');
+    }
+  }
+
+  /// 解码错误档的账（二）：换过去仍解不出画面 ⇒ 给**新镜像**定罪。
+  ///
+  /// 只在轮次仍然有效时算证据：作废的轮次里新镜像根本没被播出过一秒，那时定罪
+  /// 等于凭空封掉一条好镜像 30 分钟。
+  void _noteChosenBadHost(int generation, CDNService chosen) {
+    if (!_roundLive(generation)) return;
+    final bad = chosen.host;
+    if (bad != null && _cdnState.badHosts.add(bad)) {
+      debugPrint('CDN 自动切换: $bad 换过去仍解不出画面，本集不再作为候选');
+    }
+  }
+
   /// 只换镜像 host：不重新请求 playurl，也不动 codec（updatePlayer 里的
   /// `findVideoByQa(setCodecs: true)` 会改 codec，这里不需要）。
-  Future<bool> _switchTo(
+  ///
+  /// 返回**这一轮真正用的续播落点**；作废/失败返回 null。落点必须交出来：
+  /// [_awaitRecovery] 的进度判据是 `position - from >= recoverProgress`，拿触发
+  /// 时刻当 `from` 在"后台播了几分钟才补做"的场景里会立刻成立（实时位置早就
+  /// 远超它），于是没播一帧就宣布恢复。
+  Future<Duration?> _switchTo(
     CDNService service,
     int generation, {
     required Duration resumeAt,
     required DateTime switchedAt,
   }) async {
     // 测速期间用户可能已经换集/重置，此时这条 URL 属于上一轮的播放列表。
-    if (generation != _cdnState.generation) return false;
+    if (generation != _cdnState.generation) return null;
     final newVideo = VideoUtils.cdnUrlFor(firstVideo.playUrls, service);
     // 永远不要用空的 source 调 setDataSource。
     if (newVideo.isEmpty) {
@@ -1911,7 +1988,7 @@ mixin CdnSwitchMixin on GetxController {
         'CDN 自动切换: ${service.desc} host 改写后地址为空，放弃本次并冷却 '
         '${CdnTuning.giveUpCooldown.inSeconds}s',
       );
-      return false;
+      return null;
     }
 
     // 续播点不能用实时 position：换源会重载播放器，重载期间它短暂归零、也可能
@@ -1949,10 +2026,10 @@ mixin CdnSwitchMixin on GetxController {
     defaultST = null;
 
     await playerInit(autoplay: wasPlaying);
-    if (!_roundLive(generation)) return false;
+    if (!_roundLive(generation)) return null;
     if (_openFailedFor(service, switchedAt)) {
       // 流都没打开，落点永远是 0：补 seek 只会换来一串 `error running command`。
-      // 这一轮照常返回 true，交给 [_awaitRecovery] 立刻收尾、换下一个候选。
+      // 这一轮照常算换过（落点交回去），交给 [_awaitRecovery] 立刻收尾、换下一个候选。
       debugPrint(
         'CDN 自动切换: ${service.desc} 换过去之后新流没打开，跳过落点纠正',
       );
@@ -1964,7 +2041,7 @@ mixin CdnSwitchMixin on GetxController {
         since: switchedAt,
       );
     }
-    return _roundLive(generation);
+    return _roundLive(generation) ? pos : null;
   }
 
   /// 换源重载后确认播放位置真的回到了 [target]，落在后面就补一次 seek。
@@ -2082,13 +2159,13 @@ mixin CdnSwitchMixin on GetxController {
         // elapsed 刚够 grace 那一刻同时成立（since == elapsed == 4s）—— 也就是
         // **一秒安静都没观察到**就宣布恢复，grace 又从另一头变成了空转，而且跟
         // [CdnTuning.decodeRecoverWindow] 注释里写的"宽限 + 干净窗口（≈8s）"对不上。
-        final since = lastReal == null
+        final quietFor = lastReal == null
             ? elapsed - CdnTuning.decodeRecoverGrace
             : DateTime.now().difference(lastReal);
         if (elapsed >= CdnTuning.decodeRecoverGrace &&
-            since >= CdnTuning.decodeCleanWindow) {
+            quietFor >= CdnTuning.decodeCleanWindow) {
           debugPrint(
-            'CDN 自动切换: 解码错误档换源后 ${since.inSeconds}s 无新报错，判定已恢复',
+            'CDN 自动切换: 解码错误档换源后 ${quietFor.inSeconds}s 无新报错，判定已恢复',
           );
           completer.complete(true);
         }

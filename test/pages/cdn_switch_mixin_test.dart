@@ -6,6 +6,7 @@ import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/pages/video/cdn_switch_mixin.dart';
+import 'package:PiliPlus/pages/video/cdn_tuning.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
@@ -176,6 +177,39 @@ void main() {
       log.has('含 1 个历史冠军'),
       isFalse,
       reason: '上一轮连不上的冠军这一轮不该再占候选位：\n${log.text}',
+    );
+  });
+
+  test('连不上的镜像过了 deadRetryAfter 要重新回到候选/冠军位', () async {
+    // 死镜像窗口必须会过期。候选池两遍和冠军位原先都直接查 `noSample` 集合、
+    // 不看时刻，而集合只在**测到样本**时才移除 —— 它进不了候选就测不到样本，
+    // 于是"一次超时 = 整页生命周期内永久出局"，deadRetryAfter（30 分钟）形同虚设。
+    final record = List<int>.filled(CDNService.values.length * 3, 0);
+    final at = CDNService.ali.index * 3;
+    record[at] = 5 * 1000 * 1000;
+    record[at + 1] = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    record[at + 2] = 1;
+    Pref.cdnSpeedRecord = record;
+    cdn.deadHosts = {CDNService.ali.host!};
+
+    hostA.attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => hostA.debugCdnNoSample.contains(CDNService.ali));
+
+    // 换集不清链路账（见 resetEpisode），再把这笔账拨到窗口以外。
+    hostA
+      ..resetCdnAutoSwitch()
+      ..debugBackdateCdnAttempt(
+        CDNService.ali,
+        CdnTuning.deadRetryAfter + const Duration(minutes: 1),
+      );
+    log.clear();
+    _stall(hostA);
+    await _waitFor(() => log.has('测速 1 基线'));
+    expect(
+      log.has('含 1 个历史冠军'),
+      isTrue,
+      reason: '死镜像窗口已经过期，它还占着"永久出局"的位子：\n${log.text}',
     );
   });
 
@@ -1942,6 +1976,31 @@ void main() {
       log.has('回前台，补做推迟的换源'),
       isTrue,
       reason: '回前台没把推迟的换源补上：\n${log.text}',
+    );
+  });
+
+  test('后台推迟的解码档仍要记下坏 host', () async {
+    // 推迟只是把"换源"这个动作挪到回前台，"现在这条源给了坏字节"是**已经成立的
+    // 事实**，与什么时候换无关。记账若留在推迟分支之后，后台判定的解码档一推迟就
+    // 再也不记，下一轮测速又会把这条"确实快、字节却坏"的镜像评成最优而换回来。
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 0
+      ..isBuffering.value = true
+      ..buffer['demuxer-hysteresis-secs'] = '21.333'
+      ..buffer['cache-secs'] = '30';
+    hostA
+      ..debugForceCdnBackground = true
+      ..attachCdnSwitch();
+
+    PlPlayerController.getInstance().onDecodeError!(Duration.zero);
+
+    await _waitFor(() => log.has('在后台，推迟换到'));
+    expect(
+      log.has('$_baselineHost 给的字节解不出画面，本集不再作为候选'),
+      isTrue,
+      reason: '推迟把坏 host 的账一起吞了：\n${log.text}',
     );
   });
 
