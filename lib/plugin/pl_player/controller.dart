@@ -434,6 +434,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 到点时播放器是暂停的：等真正播放起来再关。
   bool _bgVideoSuspendDue = false;
 
+  /// 上一次看到的生命周期状态，只给 `hidden` 辨方向用
+  /// （见 [isForegroundTransitionHidden]）。
+  AppLifecycleState? _lastLifecycleForVideoTrack;
+
   @visibleForTesting
   bool? debugForceAppInBackground;
   bool _bgVideoSuspendDiagLogged = false;
@@ -502,23 +506,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       '后台省电: 生命周期 $state'
       '（开关 ${_backgroundVideoSuspendEnabled ? '开' : '关'}）',
     );
+    final previous = _lastLifecycleForVideoTrack;
+    _lastLifecycleForVideoTrack = state;
     switch (state) {
       case AppLifecycleState.resumed:
         _onForegroundForVideoTrack();
-      case AppLifecycleState.paused ||
-          AppLifecycleState.hidden ||
-          AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+        // `hidden` 两头都有：往后台走时它在 `inactive` 后面，回前台时它在
+        // `paused` 后面。后者是过渡，当后台处理会拿上一段会话的起点算出 0 秒。
+        if (isForegroundTransitionHidden(previous)) {
+          _cancelPendingBackgroundVideoSuspend();
+        } else {
+          _onBackgroundForVideoTrack();
+        }
+      case AppLifecycleState.paused || AppLifecycleState.detached:
         _onBackgroundForVideoTrack();
       case AppLifecycleState.inactive:
-        // iOS 回前台会先来一拍 inactive：先把还没到点的定时器取消，
-        // 免得它和随后的 resumed 抢跑。
-        if (_bgVideoSuspendTimer case final timer?) {
-          timer.cancel();
-          _bgVideoSuspendTimer = null;
-          debugPrint('后台省电: 回前台过渡，取消定时器');
-        }
-        _bgVideoSuspendDue = false;
+        _cancelPendingBackgroundVideoSuspend();
     }
+  }
+
+  /// 回前台的过渡：先把还没到点的定时器取消，免得它和随后的 `resumed` 抢跑。
+  void _cancelPendingBackgroundVideoSuspend() {
+    if (_bgVideoSuspendTimer case final timer?) {
+      timer.cancel();
+      _bgVideoSuspendTimer = null;
+      debugPrint('后台省电: 回前台过渡，取消定时器');
+    }
+    _bgVideoSuspendDue = false;
   }
 
   void _onBackgroundForVideoTrack() {

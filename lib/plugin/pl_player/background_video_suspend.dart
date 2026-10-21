@@ -9,6 +9,21 @@
 /// `reload_strategy.dart` 的注释），所以不能走那条路。
 library;
 
+import 'dart:ui' show AppLifecycleState;
+
+/// 回前台时 iOS 会先发一个 `hidden`：这一个是**过渡**，不是又一次进后台。
+///
+/// Flutter 把生命周期摆成一条链：往后台走是 `inactive → hidden → paused`，
+/// 回前台是 `paused → hidden → inactive → resumed` —— `hidden` 两头都有。
+/// 把回来那一侧的 `hidden` 当成"又进后台"，会拿**上一段后台会话**的起点去算
+/// 等待时间（早就是 0 秒），于是解锁那一刻就排一个 0 秒定时器；用户若在锁屏上
+/// 按过播放键，它会赶在紧随其后的 `inactive` 之前把视频轨关掉，`resumed` 再恢复
+/// 一次 —— 白付一次 refresh seek。2026-10-22 00:07:28 真机就打出过
+/// 「进入后台，0s 后关闭视频轨」，只是那次 `inactive` 快 1 毫秒、抢在定时器前面
+/// 取消了。往后台走时 `hidden` 前面是 `inactive`，回来时前面才是 `paused`。
+bool isForegroundTransitionHidden(AppLifecycleState? previous) =>
+    previous == AppLifecycleState.paused;
+
 /// 为什么这一轮不能关视频轨。`null` 表示可以关。
 enum BackgroundVideoSuspendBlocker {
   noPlayer('播放器不存在'),

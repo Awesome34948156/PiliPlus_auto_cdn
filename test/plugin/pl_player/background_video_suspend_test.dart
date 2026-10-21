@@ -1,3 +1,5 @@
+import 'dart:ui' show AppLifecycleState;
+
 import 'package:PiliPlus/plugin/pl_player/background_video_suspend.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -96,5 +98,18 @@ void main() {
     expect(blocker, BackgroundVideoSuspendBlocker.paused);
     expect(blocker!.waitForPlayback, isTrue);
     expect(blocker.retryable, isFalse);
+  });
+
+  group('hidden 辨方向', () {
+    // 往后台：inactive → hidden → paused；回前台：paused → hidden → inactive。
+    test('紧跟在 paused 后面的 hidden 是回前台过渡', () {
+      expect(isForegroundTransitionHidden(AppLifecycleState.paused), isTrue);
+    });
+
+    test('往后台那个 hidden 前面是 inactive，照常算进后台', () {
+      expect(isForegroundTransitionHidden(AppLifecycleState.inactive), isFalse);
+      expect(isForegroundTransitionHidden(AppLifecycleState.resumed), isFalse);
+      expect(isForegroundTransitionHidden(null), isFalse);
+    });
   });
 }
