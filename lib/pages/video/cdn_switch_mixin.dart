@@ -241,7 +241,13 @@ class _CdnSwitchState {
   DateTime? quickProbeAt;
   DateTime? giveUpUntil;
 
-  /// 换集/换 P/重置：整集的时间与镜像账一并作废。
+  /// 换集/换 P/重置：整集的对象账、动作闸门与放弃冷却一并重置。
+  ///
+  /// **保留** [triedAt] / [noSample]：慢（[CdnTuning.retryAfter]）和连不上
+  /// （[CdnTuning.deadRetryAfter]）是**链路层**状态，换集/换 P 不换链路，冷却
+  /// 应当跨集延续、靠时间戳自然过期。否则短视频连划时每集都清空，"冠军连不上
+  /// （一个字节都没到）"的账记不住，30 分钟冷却形同虚设 —— 冠军每集都白占一个
+  /// 候选位、还白赔一次超时（见 [_cdnChampion] 里的 `noSample` 检查）。
   ///
   /// **不碰** [attachedOnce]、[preflightPending]、[preflightSince]、[probeTimer]
   /// 与 [autoDio]：它们描述的是页面/连接的生命周期，不是当前这一集。
@@ -249,8 +255,6 @@ class _CdnSwitchState {
     generation++;
     autoBusy = false;
     autoAttempts = 0;
-    triedAt.clear();
-    noSample.clear();
     // 换集/换画质是新的对象，坏字节的账也跟着作废：同一条边对另一个视频
     // 完全可能是好的。
     badHosts.clear();
@@ -268,9 +272,11 @@ class _CdnSwitchState {
 
   /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
   ///
-  /// 和 [resetEpisode] 的区别在时间型冷却：这里**保留** [giveUpUntil] /
-  /// [triedAt] / [noSample]。原先把整套 reset 无条件放在换画质路径上，会顺手
-  /// 清掉放弃冷却和镜像冷却，等于每次调画质都重新开闸。
+  /// 和 [resetEpisode] 的区别在**整集级**的闸：这里保留 [giveUpUntil] 与
+  /// [quickProbeAt]，不清并发闸以外的动作状态。原先把整套 reset 无条件放在
+  /// 换画质路径上，会顺手清掉放弃冷却，等于每次调画质都重新开闸。
+  ///
+  /// 链路层的 [triedAt] / [noSample] 两处都保留（见 [resetEpisode]）。
   ///
   /// 清 [autoBusy] 必须和 [_autoSwitchLoop] 的代际守卫配套：在途那一轮被
   /// generation++ 作废后，它的 whenComplete 不会再清 busy，所以只能在这里放闸，
@@ -422,6 +428,10 @@ mixin CdnSwitchMixin on GetxController {
   @visibleForTesting
   bool get debugCdnAutoBusy => _cdnState.autoBusy;
 
+  /// 测试用：上一轮"一个字节都没到"的镜像（`_cdnState.noSample`）。
+  @visibleForTesting
+  Set<CDNService> get debugCdnNoSample => _cdnState.noSample;
+
   /// 冷却窗口还没过（时长取决于上一轮的样本是"慢"还是"一个字都没有"）。
   bool _cdnRecentlyTried(CDNService service, DateTime now) {
     final at = _cdnState.triedAt[service];
@@ -512,6 +522,11 @@ mixin CdnSwitchMixin on GetxController {
       if (service.host == null || _cdnState.badHosts.contains(service.host)) {
         continue;
       }
+      // 上一轮一个字节都没到（连接超时 / 403 / 0 样本）：这是"这条链路连不上"
+      // 而不是"慢"，跟换集换对象无关，短时间内不会自愈。让它占着冠军位等于每轮
+      // 白赔一次超时、白占一个候选位。跳过它、让位给轮换；下次真出样本就自动恢复
+      // （见 [_pickFastestCdn] 里的 `_cdnState.noSample.remove`）。
+      if (_cdnState.noSample.contains(service)) continue;
       // 连着几轮没被选中，这张保留票它兑现不了，让给轮换。见 `_cdnState.championMisses`。
       if ((_cdnState.championMisses[service] ?? 0) >=
           CdnTuning.championMisses) {
@@ -600,9 +615,10 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
   ///
-  /// 和 [resetCdnAutoSwitch] 的区别在时间型冷却：这里**保留** `_cdnState.giveUpUntil` /
-  /// `_cdnState.triedAt` / `_cdnState.noSample`。原先把整套 reset 无条件放在换画质路径上，会
-  /// 顺手清掉放弃冷却和镜像冷却，等于每次调画质都重新开闸。
+  /// 和 [resetCdnAutoSwitch] 的区别在**整集级**的闸：这里**保留**
+  /// `_cdnState.giveUpUntil` / `_cdnState.quickProbeAt`。原先把整套 reset 无条件放在
+  /// 换画质路径上，会顺手清掉放弃冷却，等于每次调画质都重新开闸。链路层的
+  /// `_cdnState.triedAt` / `_cdnState.noSample` 两处都保留（见 `resetEpisode`）。
   ///
   /// 但对象相关的几样必须清 —— 尤其是 `_cdnState.objectSize`：换了画质对象长度就变了，
   /// 留着旧值会把取样偏移指到新对象之外，服务端回 416，整集每轮都测不出东西。
