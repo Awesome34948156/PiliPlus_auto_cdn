@@ -406,6 +406,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 重建解码器的冷却截止时刻。见 [PlayerTuning.sessionFailCooldown]。
   DateTime _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// 会话族「回声」的截止时刻：会话族种子出现后开这么长一扇窗，窗内
+  /// [isDecoderSessionEchoLog] 那两条通用症状也计入 [_sessionFailures]。
+  /// 见 [PlayerTuning.sessionFailEchoWindow] 与 [classifyDecoderSessionLine]。
+  DateTime? _sessionEchoUntil;
+
   /// 后台攒下了「硬解会话失效」但没动手重建，等回前台再修。
   ///
   /// 重建会把音频输出一起拆掉、断音 1~3 秒。iOS 在断音那一瞬间就把「正在播放」
@@ -537,6 +542,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void _onBackgroundForVideoTrack() {
+    // 会话起点要**在所有门之前**记：它现在有两个用处 —— 省电的等待时间，以及
+    // 回前台判断"这一趟真的进过后台、要不要补重建解码链"（[_onForegroundForVideoTrack]）。
+    // 省电开关关着、或画中画在播时，VideoToolbox 的会话照样会被系统作废，只是
+    // 没有那条 `vid=auto` 的 refresh seek 顺带重建它。
+    final now = DateTime.now();
+    _backgroundEnteredAt ??= now;
+
     if (!_backgroundVideoSuspendEnabled) {
       debugPrint('后台省电: 跳过（功能或后台播放已关闭）');
       return;
@@ -546,9 +558,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return;
     }
     if (_videoSuspendedForBackground) return;
-
-    final now = DateTime.now();
-    _backgroundEnteredAt ??= now;
     // hidden → paused 会连发两次，第二次不能把计时推后。
     if (_bgVideoSuspendTimer != null) return;
 
@@ -562,6 +571,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   void _onForegroundForVideoTrack() {
     final hadPending = _bgVideoSuspendTimer != null || _bgVideoSuspendDue;
+    // 先把「这一趟进过后台」取出来 —— 下面就要把起点清掉。
+    final enteredBackground = _backgroundEnteredAt != null;
     _bgVideoSuspendTimer?.cancel();
     _bgVideoSuspendTimer = null;
     _bgVideoSuspendDue = false;
@@ -570,7 +581,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       debugPrint('后台省电: 未到点就回前台，取消');
     }
 
-    if (!_videoSuspendedForBackground) return;
+    if (!_videoSuspendedForBackground) {
+      _maybeRebuildDecoderAfterBackground(enteredBackground: enteredBackground);
+      return;
+    }
     _videoSuspendedForBackground = false;
     // 恢复视频轨本身就是重建视频解码链，后台攒下的那次重挂是同一件事 ——
     // 留着会再 `vid=no → vid=auto` 一遍，等于白付两次 refresh seek。
@@ -581,6 +595,51 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     debugPrint('后台省电: 回前台，恢复视频轨（file-local-options/vid=auto）');
     _setBackgroundVideoTrack(true);
     unawaited(_verifyVideoTrackRestored());
+  }
+
+  /// 回前台时，如果这一趟**没有任何东西重建过视频解码链**，趁还暂停着补一次。
+  ///
+  /// 后台省电的恢复路径只有一条能重建解码链：`vid=no → vid=auto` 的 refresh seek。
+  /// 而暂停着退后台时不会关轨（[BackgroundVideoSuspendBlocker.paused]：暂停本来就不
+  /// 产帧，关轨没有收益），于是回前台什么都不做，被 iOS 作废的 VideoToolbox 会话
+  /// 就一直留到用户按下播放 —— 2026-10-22 00:59 真机：回前台 2.7 秒后点播放，
+  /// `invalid session` ×1 + `HW accel end frame fail` 99 行横跨 3.3 秒，画面在坏帧
+  /// 之间来回切。判据见 [shouldReinitDecoderOnResume]。
+  ///
+  /// 动作复用 [reinitDecoderAfterBackground]（`hwdec=no → 偏好 → seek 回原位`），
+  /// 注释写的就是"趁还在暂停态拨一下 hwdec"。
+  void _maybeRebuildDecoderAfterBackground({required bool enteredBackground}) {
+    if (!shouldReinitDecoderOnResume(
+      backgroundPlay: _backgroundPlayEnabled,
+      enteredBackground: enteredBackground,
+      playing: playerStatus.isPlaying,
+      isLive: isLive,
+      onlyPlayAudio: onlyPlayAudio.value,
+      pipActive: IOSPipHelper.needsUpdate,
+    )) {
+      return;
+    }
+    // 装载在途（换源 / 换集）时别插进去：那一轮本来就会建一条新的视频链，
+    // 与 [resumeDeferredDecoderRebuild] 同一个理由。
+    if (_processing) {
+      debugPrint('后台省电: 装载在途，跳过补重建解码链（新链会自己建起来）');
+      return;
+    }
+    // 这次补重建就是后台那次推迟要做的事，别再让 view 走一遍 `vid=no → auto`。
+    _deferredDecoderRebuild = false;
+    debugPrint('后台省电: 回前台，补重建解码链（视频轨没挂起过）');
+    unawaited(reinitDecoderAfterBackground());
+  }
+
+  /// 后台播放开着吗（iOS 专属路径，读设置要防异常，理由同
+  /// [_backgroundVideoSuspendEnabled]）。
+  bool get _backgroundPlayEnabled {
+    try {
+      return continuePlayInBackground.value;
+    } catch (e) {
+      debugPrint('后台省电: 读取后台播放开关失败（$e）');
+      return false;
+    }
   }
 
   void _onBackgroundVideoSuspendTimer() {
@@ -819,6 +878,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     lastDecoderCorruptionAt = null;
     _sessionFailures.clear();
     _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    _sessionEchoUntil = null;
     // 换成另一个视频/画质之后，"回前台续播"这个上下文也作废：新对象的头几秒
     // 报错该按它自己的镜像算，不能继承上一段续播的豁免。
     _foregroundResumedAt = null;
@@ -2575,8 +2635,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 同样搭在 `stream.log` 上、同样因为"报错是事件不是采样量"，理由见
   /// [_sampleDecodeError] 的注释。
   void _sampleDecoderSessionFailure(String text) {
-    if (!isDecoderSessionFailureLog(text)) return;
     final now = DateTime.now();
+    // 种子（`invalid session` 之类）开一扇回声窗；窗内的 `HW accel end frame fail`
+    // 这类通用症状也算数 —— 会话作废那一下种子可能只有 1 行，后面几十行全是回声
+    // （2026-10-22 00:59：1 行种子 + 99 行回声，够不到 6 条门槛，画面闪了 3.3 秒）。
+    // 窗外的回声照旧谁都不算，坏字节风暴不会被抢走换源动作。
+    final line = classifyDecoderSessionLine(
+      text,
+      now,
+      echoUntil: _sessionEchoUntil,
+      echoWindow: PlayerTuning.sessionFailEchoWindow,
+    );
+    _sessionEchoUntil = line.echoUntil;
+    if (!line.counts) return;
     // 让位于坏字节：两族的动作相反，同时开火会互相拆台（见那个常量的注释）。
     final lastBadBytes = lastDecoderCorruptionAt;
     if (lastBadBytes != null &&

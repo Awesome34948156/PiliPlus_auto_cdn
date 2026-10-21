@@ -83,14 +83,18 @@ bool isDecoderCorruptionLog(String text) {
 ///   其余两条是通用症状），随后**画面再没回来** —— 位置 19s→28s 在推进、余量 28s、
 ///   音频 AAC 正常，直到用户点走别的视频把它拆掉。
 ///
-/// **刻意只收"会话 / 渲染缓冲"这一层。** 同一场风暴里的
+/// **这张表刻意只收"会话 / 渲染缓冲"这一层。** 同一场风暴里的
 /// `vd: Error while decoding frame (hardware decoding)!` 与
-/// `av1: HW accel end frame fail.` **不收**：它们是**通用症状** —— 坏字节时也刷，
+/// `av1: HW accel end frame fail.` 不在表里：它们是**通用症状** —— 坏字节时也刷，
 /// 而 `PLPlayerController` 里那段 `video-reload` 的事故记录（见
 /// `_rebuildRenderContextOnNoVideo` 上方的墓碑注释）正是我们自己的重载弄出来的
-/// 92 行同类报错。收进来会在**真正的坏
+/// 92 行同类报错。无条件收进来会在**真正的坏
 /// 字节风暴**里（那一族本该命中几百行并换源）把动作从"换源"改成"重建解码器"，
 /// 等于治错了病。
+///
+/// 但也不能完全不管：会话作废那一下种子可能只出现 1 行，后面几十行全是回声。
+/// 这两条因此另有 [kDecoderSessionEchoSignatures] —— 由 [classifyDecoderSessionLine]
+/// 用种子开出的短窗把它们框住，窗外一律不算。
 const List<String> kDecoderSessionFailureSignatures = [
   // VideoToolbox 的 DecompressionSession 被系统作废。iOS 在 app 被挂起时会这么干；
   // 之后每一帧都解不出来，而音频走的是另一条 EDL 源，照常播。
@@ -99,6 +103,67 @@ const List<String> kDecoderSessionFailureSignatures = [
   // 后面常跟 `reconfig N` —— mpv 自己试过重配，照样拿不到。
   'output image buffer is null',
 ];
+
+/// 会话死掉之后的**回声**：它们单独出现时没有定罪价值，只在会话族签名（种子）
+/// 刚出现过的短窗里才算是同一场病。
+///
+/// 也就是 [kDecoderSessionFailureSignatures] 注释里刻意不收的那两条。不收是对的：
+/// 它们是**通用症状** —— 坏字节时刷、我们自己重载渲染上下文时也刷。但 2026-10-22
+/// 00:59 真机揭了另一面：会话作废那一下，种子只打了 **1 行**（`invalid session`），
+/// 紧随其后的 **99 行**全是 `av1: HW accel end frame fail.`（3.3 秒，30 行/秒）。
+/// 只数种子的话 6 条门槛永远够不到，一场完整的风暴被当成无事发生 —— 画面在坏帧之间
+/// 来回切了 3.3 秒。
+///
+/// 所以改成**有条件的收**：种子开窗（[classifyDecoderSessionLine]），窗内的回声
+/// 才计入会话族。窗外的回声仍然谁都不算 —— 坏字节风暴里 `invalid session` 偶尔
+/// 也会冒一条，但那条种子之后的窗里 `lastDecoderCorruptionAt` 一直在续，
+/// 调用方的「让位坏字节」判据会先把动作让回去。
+const List<String> kDecoderSessionEchoSignatures = [
+  'hw accel end frame fail',
+  'error while decoding frame (hardware decoding)',
+];
+
+/// 预先转小写的签名表，理由同 [_kDecoderCorruptionSignaturesLower]。
+final List<String> _kDecoderSessionEchoSignaturesLower =
+    kDecoderSessionEchoSignatures.map((s) => s.toLowerCase()).toList(
+      growable: false,
+    );
+
+/// 这一行是不是会话族的**回声**（[kDecoderSessionEchoSignatures]）。
+///
+/// ⚠️ 单独看它**没有定罪价值**，必须由 [classifyDecoderSessionLine] 用种子窗口
+/// 框住 —— 理由见 [kDecoderSessionEchoSignatures]。
+bool isDecoderSessionEchoLog(String text) {
+  final lower = text.toLowerCase();
+  return _kDecoderSessionEchoSignaturesLower.any(lower.contains);
+}
+
+/// 判一行日志要不要计入**会话族**的计数窗口，并顺带给出新的回声截止时刻。
+///
+/// - 种子（[isDecoderSessionFailureLog]）：算数，并把回声窗开到 `now + echoWindow`；
+/// - 回声（[isDecoderSessionEchoLog]）：只在 `echoUntil` 之内算数，窗不续期 ——
+///   回声是种子那一场的尾巴，不该靠自身把窗口无限拖长；
+/// - 其余：不算数。
+///
+/// 回声窗取与会话计数窗口（`PlayerTuning.sessionFailWindow`）同值：两者的作用都是
+/// 「把同一场病圈在一起」。时钟回拨时 `now` 早于 `echoUntil`，按"窗内"处理 ——
+/// 与 [recordDecodeErrorHit] 对回拨的处理一致（宁可多算这一窗，不让判据整体失效）。
+({bool counts, DateTime? echoUntil}) classifyDecoderSessionLine(
+  String text,
+  DateTime now, {
+  required DateTime? echoUntil,
+  required Duration echoWindow,
+}) {
+  if (isDecoderSessionFailureLog(text)) {
+    return (counts: true, echoUntil: now.add(echoWindow));
+  }
+  if (isDecoderSessionEchoLog(text) &&
+      echoUntil != null &&
+      !now.isAfter(echoUntil)) {
+    return (counts: true, echoUntil: echoUntil);
+  }
+  return (counts: false, echoUntil: echoUntil);
+}
 
 /// 「解码器从 GOP 中间/没有参考帧的状态开始解」的签名 —— **续解族**。
 ///

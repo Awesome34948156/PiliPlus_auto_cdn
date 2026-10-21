@@ -121,6 +121,17 @@ abstract final class PlayerTuning {
   /// 风暴期内 2 秒内必有新的一条续上。
   static const Duration sessionFailDeferBadBytes = Duration(seconds: 2);
 
+  /// 回声窗：会话族**种子**出现后这么久之内，[isDecoderSessionEchoLog] 那两条
+  /// 通用症状（`HW accel end frame fail` / `Error while decoding frame (hardware
+  /// decoding)`）也计入会话族。
+  ///
+  /// 2026-10-22 00:59 真机：`invalid session` 只有 **1 行**，随后 3.3 秒里
+  /// **99 行** `HW accel end frame fail`（30 行/秒）—— 只数种子的话
+  /// [sessionFailBurst] 永远够不到，画面在坏帧之间闪了 3.3 秒没人管。
+  /// 取 3 秒与 [sessionFailWindow] 同值：回声是种子那一场的尾巴，不该把窗口拖得
+  /// 比计数窗口更远（回声不续期，见 `classifyDecoderSessionLine`）。
+  static const Duration sessionFailEchoWindow = Duration(seconds: 3);
+
   /// 回前台续播后，多长一段窗口里的解码报错算「本机解码链没接上」而不是
   /// 「镜像给了坏字节」。
   ///

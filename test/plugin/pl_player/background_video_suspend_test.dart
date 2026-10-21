@@ -112,4 +112,49 @@ void main() {
       expect(isForegroundTransitionHidden(null), isFalse);
     });
   });
+
+  group('回前台补重建解码链', () {
+    // 2026-10-22 00:59 真机那一场：暂停着退后台 → 视频轨没关 → 回前台什么都不做
+    // → 点播放时 `invalid session` ×1 + `HW accel end frame fail` 99 行、闪 3.3 秒。
+    bool resume({
+      bool backgroundPlay = true,
+      bool enteredBackground = true,
+      bool playing = false,
+      bool isLive = false,
+      bool onlyPlayAudio = false,
+      bool pipActive = false,
+    }) => shouldReinitDecoderOnResume(
+      backgroundPlay: backgroundPlay,
+      enteredBackground: enteredBackground,
+      playing: playing,
+      isLive: isLive,
+      onlyPlayAudio: onlyPlayAudio,
+      pipActive: pipActive,
+    );
+
+    test('暂停着退过后台、没人重建过视频链 —— 要补', () {
+      expect(resume(), isTrue);
+    });
+
+    test('播放中不动：拨 hwdec 要断音 1.5 秒，那种交给解码看门狗当场重建', () {
+      expect(resume(playing: true), isFalse);
+    });
+
+    test('这一趟没进过后台（只是 inactive / 启动）不动', () {
+      expect(resume(enteredBackground: false), isFalse);
+    });
+
+    test('后台播放关着不动：view 那条路已经在做同一件事，别重复', () {
+      expect(resume(backgroundPlay: false), isFalse);
+    });
+
+    test('直播 / 听视频 / 画中画都不动', () {
+      expect(resume(isLive: true), isFalse);
+      expect(resume(onlyPlayAudio: true), isFalse);
+      expect(resume(pipActive: true), isFalse);
+    });
+    // 视频轨真被关过的那一趟不走这条判据 —— 调用点
+    // （`_onForegroundForVideoTrack`）只在 `!_videoSuspendedForBackground` 分支
+    // 才问它，那条路的 `vid=auto` refresh seek 已经重建了解码链。
+  });
 }

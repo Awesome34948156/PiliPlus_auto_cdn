@@ -24,6 +24,32 @@ import 'dart:ui' show AppLifecycleState;
 bool isForegroundTransitionHidden(AppLifecycleState? previous) =>
     previous == AppLifecycleState.paused;
 
+/// 回前台时要不要**补一次解码链重建**（`hwdec` 重开 + seek 回原位）。
+///
+/// iOS 退后台会把 VideoToolbox 的解压会话作废。后台省电那条路只在**视频轨真被关掉**
+/// 时顺带重建（`vid=auto` 的 refresh seek）；而暂停着退后台时轨不会关，回前台就没有
+/// 任何东西重建它，死的会话一直留到用户按下播放 —— 2026-10-22 00:59 真机：
+/// 回前台 2.7 秒后点播放，`invalid session` ×1 + `HW accel end frame fail` **99 行**
+/// （30 行/秒，横跨 3.3 秒），画面在坏帧之间来回切。详见 [[background-video-suspend]]。
+///
+/// 只在**暂停态**补：暂停时没有音频输出，refresh seek 不产生 underrun，缓冲在用户
+/// 点播放前就补回来了。播放态退后台时 mpv 当场就会刷 `invalid session`（同一份日志
+/// 00:48:49，进后台 1.5 秒后），那种交给解码错误看门狗当场重建，不必在这里猜时长。
+bool shouldReinitDecoderOnResume({
+  required bool backgroundPlay,
+  required bool enteredBackground,
+  required bool playing,
+  required bool isLive,
+  required bool onlyPlayAudio,
+  required bool pipActive,
+}) =>
+    backgroundPlay &&
+    enteredBackground &&
+    !playing &&
+    !isLive &&
+    !onlyPlayAudio &&
+    !pipActive;
+
 /// 为什么这一轮不能关视频轨。`null` 表示可以关。
 enum BackgroundVideoSuspendBlocker {
   noPlayer('播放器不存在'),

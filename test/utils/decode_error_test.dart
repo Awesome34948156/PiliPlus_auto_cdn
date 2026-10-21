@@ -183,6 +183,173 @@ void main() {
     });
   });
 
+  group('isDecoderSessionEchoLog 认得回声，但单独不定罪', () {
+    test('2026-10-22 00:59 那一场：会话作废后 3.3 秒的 99 行回声', () {
+      // 逐字抄自 iPhone 上取回的 pili-console.log。种子只有 1 行
+      // （`invalid session`），后面全是这两条通用症状，只数种子永远够不到门槛。
+      const lines = [
+        'av1: HW accel end frame fail.',
+        'vd: Error while decoding frame (hardware decoding)!',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionEchoLog(line), isTrue, reason: line);
+        expect(isDecoderSessionFailureLog(line), isFalse, reason: line);
+        expect(isDecoderCorruptionLog(line), isFalse, reason: line);
+      }
+    });
+
+    test('大小写无关', () {
+      expect(
+        isDecoderSessionEchoLog('AV1: HW ACCEL END FRAME FAIL.'),
+        isTrue,
+      );
+      expect(
+        isDecoderSessionEchoLog('VD: ERROR WHILE DECODING FRAME (HARDWARE '
+            'DECODING)!'),
+        isTrue,
+      );
+    });
+
+    test('种子和坏字节的行都不算回声', () {
+      const lines = [
+        'av1: Failed to decode frame (invalid session, -12903)',
+        'av1: vt decoder cb: output image buffer is null: -12909, reconfig 1',
+        'av1: obu_forbidden_bit out of range: 1, but must be in [0,0].',
+        'libdav1d: Error parsing OBU data',
+      ];
+      for (final line in lines) {
+        expect(isDecoderSessionEchoLog(line), isFalse, reason: line);
+      }
+    });
+  });
+
+  group('classifyDecoderSessionLine 回声窗', () {
+    const echoWindow = Duration(seconds: 3);
+    final t0 = DateTime(2026, 10, 22, 0, 59, 41, 282);
+
+    ({bool counts, DateTime? echoUntil}) classify(
+      String text,
+      Duration offset, {
+      DateTime? echoUntil,
+    }) => classifyDecoderSessionLine(
+      text,
+      t0.add(offset),
+      echoUntil: echoUntil,
+      echoWindow: echoWindow,
+    );
+
+    const seed = 'av1: Failed to decode frame (invalid session, -12903)';
+    const echo = 'av1: HW accel end frame fail.';
+
+    test('没有种子时，回声一条都不算', () {
+      final line = classify(echo, Duration.zero);
+      expect(line.counts, isFalse);
+      expect(line.echoUntil, isNull);
+    });
+
+    test('种子算数，并把窗开到 3 秒后', () {
+      final line = classify(seed, Duration.zero);
+      expect(line.counts, isTrue);
+      expect(line.echoUntil, t0.add(echoWindow));
+    });
+
+    test('窗内的回声算数', () {
+      final window = t0.add(echoWindow);
+      expect(
+        classify(echo, const Duration(milliseconds: 33), echoUntil: window).counts,
+        isTrue,
+      );
+      // 正好落在边界上的那条还算数。
+      expect(classify(echo, echoWindow, echoUntil: window).counts, isTrue);
+    });
+
+    test('窗外的回声不算数', () {
+      final window = t0.add(echoWindow);
+      // 坏字节风暴里 `invalid session` 偶尔也会冒一条；那颗种子过期之后，
+      // `HW accel end frame fail` 必须回到"谁都不算"，否则会抢走换源动作。
+      expect(
+        classify(
+          echo,
+          echoWindow + const Duration(milliseconds: 1),
+          echoUntil: window,
+        ).counts,
+        isFalse,
+      );
+    });
+
+    test('回声不续期：自己不能把窗无限拖长', () {
+      final window = t0.add(echoWindow);
+      final line = classify(
+        echo,
+        const Duration(seconds: 2, milliseconds: 900),
+        echoUntil: window,
+      );
+      expect(line.counts, isTrue);
+      expect(line.echoUntil, window);
+    });
+
+    test('再出现一颗种子会重新开窗', () {
+      final line = classify(
+        seed,
+        const Duration(seconds: 10),
+        echoUntil: t0.add(echoWindow),
+      );
+      expect(line.counts, isTrue);
+      expect(line.echoUntil, t0.add(const Duration(seconds: 13)));
+    });
+
+    test('时钟回拨落在窗"之前"时按窗内处理，判据不整体失效', () {
+      final window = t0.add(echoWindow);
+      expect(
+        classify(echo, const Duration(seconds: -30), echoUntil: window).counts,
+        isTrue,
+      );
+    });
+
+    test('2026-10-22 那场：1 行种子 + 99 行回声，0.2 秒内就够到 6 条', () {
+      // 复放实测时序（30 行/秒）。修复前只数种子 ⇒ 1 条，永远够不到 6，
+      // 于是画面在坏帧之间闪满 3.3 秒没人管。
+      const window = Duration(seconds: 3);
+      const burst = 6;
+      const dedupe = Duration(milliseconds: 5);
+      final hits = <DateTime>[];
+      DateTime? echoUntil;
+      int? firedAtMs;
+
+      final lines = <(int, String)>[
+        (0, seed),
+        for (var i = 0; i < 99; i++) (2 + i * 33, echo),
+      ];
+      for (final (ms, text) in lines) {
+        final now = t0.add(Duration(milliseconds: ms));
+        final line = classifyDecoderSessionLine(
+          text,
+          now,
+          echoUntil: echoUntil,
+          echoWindow: echoWindow,
+        );
+        echoUntil = line.echoUntil;
+        if (!line.counts) continue;
+        final fired = recordDecodeErrorHit(
+          hits,
+          now,
+          window: window,
+          burst: burst,
+          lineDedupe: dedupe,
+        );
+        if (fired && firedAtMs == null) firedAtMs = ms;
+        if (firedAtMs != null) break;
+      }
+
+      expect(firedAtMs, isNotNull, reason: '整场风暴都没能定罪');
+      expect(
+        firedAtMs,
+        lessThan(250),
+        reason: '种子之后约 0.2 秒就该定罪，而不是等满 3.3 秒',
+      );
+    });
+  });
+
   group('recordDecodeErrorHit 攒风暴', () {
     // 播放器那边用的就是这三个数（PlPlayerController）。
     const window = Duration(seconds: 6);
