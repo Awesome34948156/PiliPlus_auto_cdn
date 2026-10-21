@@ -972,6 +972,13 @@ abstract final class Pref {
     defaultValue: Platform.isIOS,
   );
 
+  /// iOS 后台播放省电：进入后台 10 秒后关闭视频轨，只保留音频。
+  static bool get backgroundVideoSuspend => _setting.get(
+    SettingBoxKey.backgroundVideoSuspend,
+    // 只在 iOS 露出；其他平台默认 false，即使门禁漏了也不会改行为。
+    defaultValue: Platform.isIOS,
+  );
+
   static bool get directExitOnBack =>
       _setting.get(SettingBoxKey.directExitOnBack, defaultValue: false);
 

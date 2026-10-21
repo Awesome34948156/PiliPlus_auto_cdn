@@ -18,6 +18,7 @@ import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
+import 'package:PiliPlus/plugin/pl_player/background_video_suspend.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/double_tap_type.dart';
@@ -413,6 +414,48 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 后台本来就没有画面，重建没有意义，推迟到回前台。
   bool _deferredDecoderRebuild = false;
 
+  /// 后台省电：这次后台会话从什么时候开始（`null` = 不在后台会话里）。
+  ///
+  /// 记会话起点而不是"每次生命周期回调重新计时"：iOS 进后台会连发
+  /// `hidden` → `paused`，两次都重新计时会把等待时间拖成两倍。
+  DateTime? _backgroundEnteredAt;
+
+  /// 到点关视频轨的定时器（[PlayerTuning.backgroundVideoSuspendDelay]）。
+  Timer? _bgVideoSuspendTimer;
+
+  /// 视频轨是不是被后台省电关掉的。
+  ///
+  /// **不能用 `state.width/height` 判断**：`vid=no` 之后 libmpv 发的是
+  /// `MPV_FORMAT_NONE`，media_kit 只处理 NODE，宽高会一直停在旧值 ——
+  /// 既不会误触发无视频轨看门狗，也意味着恢复失败时看门狗是瞎的，
+  /// 兜底只能靠自己（见 [_verifyVideoTrackRestored]）。
+  bool _videoSuspendedForBackground = false;
+
+  /// 到点时播放器是暂停的：等真正播放起来再关。
+  bool _bgVideoSuspendDue = false;
+
+  @visibleForTesting
+  bool? debugForceAppInBackground;
+  bool _bgVideoSuspendDiagLogged = false;
+
+  bool get _appInBackground => debugForceAppInBackground ?? appInBackground;
+
+  /// 后台省电是否生效：iOS + 后台播放开着 + 设置里没关。
+  ///
+  /// 读设置要防一手异常：这个 getter 在生命周期回调的最前面被求值，抛出去会让
+  /// 整个回调（包括别的分支的动作）一起断在半路，而且日志里只留一行无从解释的
+  /// 堆栈 —— 宁可当成「关着」并留一句话。
+  bool get _backgroundVideoSuspendEnabled {
+    try {
+      return Platform.isIOS &&
+          continuePlayInBackground.value &&
+          Pref.backgroundVideoSuspend;
+    } catch (e) {
+      debugPrint('后台省电: 读取开关失败（$e）');
+      return false;
+    }
+  }
+
   /// 应用是不是真的退到后台了。
   ///
   /// 只有 `paused / hidden / detached` 算后台：`inactive` 是下拉控制中心、来电
@@ -441,6 +484,245 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     debugPrint('CDN 看门狗: 回前台，原地重挂视频轨（后台那段硬解会话已作废）');
     _reloadVideoTrack();
+  }
+
+  /// 后台省电的生命周期入口。由播放器视图在 PiP early return **之前**调用。
+  ///
+  /// 画中画由播放器自己排除（[IOSPipHelper.needsUpdate]）：PiP 激活时
+  /// `AppLifecycleState` 同样是 `paused`，光看生命周期分不出「真后台」和
+  /// 「画中画」——而后者画面还在看，关掉视频轨等于把小窗冻住。
+  void handleAppLifecycleForVideoTrack(AppLifecycleState state) {
+    if (!Platform.isIOS) return;
+    // 诊断：真机上「回调到没到、三个开关各是什么值」只能靠这一行回答。
+    // 2026-10-21 那局：后台音频在放、心跳在写、`resumed` 那条也打出来了，
+    // 唯独切后台这一侧没有任何「后台省电」日志 —— 没有这行就分不清是
+    // 回调没到、还是哪道门（含读取设置时抛异常）在 `_onBackgroundForVideoTrack`
+    // 之前就把路断了。
+    debugPrint(
+      '后台省电: 生命周期 $state'
+      '（开关 ${_backgroundVideoSuspendEnabled ? '开' : '关'}）',
+    );
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _onForegroundForVideoTrack();
+      case AppLifecycleState.paused ||
+          AppLifecycleState.hidden ||
+          AppLifecycleState.detached:
+        _onBackgroundForVideoTrack();
+      case AppLifecycleState.inactive:
+        // iOS 回前台会先来一拍 inactive：先把还没到点的定时器取消，
+        // 免得它和随后的 resumed 抢跑。
+        if (_bgVideoSuspendTimer case final timer?) {
+          timer.cancel();
+          _bgVideoSuspendTimer = null;
+          debugPrint('后台省电: 回前台过渡，取消定时器');
+        }
+        _bgVideoSuspendDue = false;
+    }
+  }
+
+  void _onBackgroundForVideoTrack() {
+    if (!_backgroundVideoSuspendEnabled) {
+      debugPrint('后台省电: 跳过（功能或后台播放已关闭）');
+      return;
+    }
+    if (IOSPipHelper.needsUpdate) {
+      debugPrint('后台省电: 跳过（画中画需要画面）');
+      return;
+    }
+    if (_videoSuspendedForBackground) return;
+
+    final now = DateTime.now();
+    _backgroundEnteredAt ??= now;
+    // hidden → paused 会连发两次，第二次不能把计时推后。
+    if (_bgVideoSuspendTimer != null) return;
+
+    final remaining =
+        PlayerTuning.backgroundVideoSuspendDelay -
+        now.difference(_backgroundEnteredAt!);
+    final delay = remaining.isNegative ? Duration.zero : remaining;
+    _bgVideoSuspendTimer = Timer(delay, _onBackgroundVideoSuspendTimer);
+    debugPrint('后台省电: 进入后台，${delay.inSeconds}s 后关闭视频轨（音频继续）');
+  }
+
+  void _onForegroundForVideoTrack() {
+    final hadPending = _bgVideoSuspendTimer != null || _bgVideoSuspendDue;
+    _bgVideoSuspendTimer?.cancel();
+    _bgVideoSuspendTimer = null;
+    _bgVideoSuspendDue = false;
+    _backgroundEnteredAt = null;
+    if (hadPending) {
+      debugPrint('后台省电: 未到点就回前台，取消');
+    }
+
+    if (!_videoSuspendedForBackground) return;
+    _videoSuspendedForBackground = false;
+    // 恢复视频轨本身就是重建视频解码链，后台攒下的那次重挂是同一件事 ——
+    // 留着会再 `vid=no → vid=auto` 一遍，等于白付两次 refresh seek。
+    _deferredDecoderRebuild = false;
+    // 先开续解窗口再发 auto：从关键帧重开视频链会冒 `Missing Sequence Header`
+    // 之类的报错，不能算到镜像头上。
+    _foregroundResumedAt = DateTime.now();
+    debugPrint('后台省电: 回前台，恢复视频轨（file-local-options/vid=auto）');
+    _setBackgroundVideoTrack(true);
+    unawaited(_verifyVideoTrackRestored());
+  }
+
+  void _onBackgroundVideoSuspendTimer() {
+    _bgVideoSuspendTimer = null;
+
+    if (!_backgroundVideoSuspendEnabled) {
+      debugPrint('后台省电: 到点但功能已关闭，跳过');
+      return;
+    }
+    if (!_appInBackground) {
+      debugPrint('后台省电: 到点但已回前台，跳过');
+      return;
+    }
+    if (IOSPipHelper.needsUpdate) {
+      debugPrint('后台省电: 到点但画中画在播，跳过');
+      return;
+    }
+
+    final player = _videoPlayerController;
+    final blocker = checkBackgroundVideoSuspend(
+      hasPlayer: player != null,
+      isLive: isLive,
+      onlyPlayAudio: onlyPlayAudio.value,
+      playing: playerStatus.isPlaying,
+      processing: _processing,
+      rebuildingRenderContext: _rebuildingRenderContext,
+      seeking: isSeeking.value,
+      completed: player?.state.completed ?? false,
+      seekable: _safeProp('seekable') == 'yes',
+      duration: player?.state.duration ?? Duration.zero,
+      videoTrackCount: player?.state.tracks.video.length ?? 0,
+      selectedVideoTrackId: player?.state.track.video.id ?? 'no',
+    );
+
+    if (blocker != null) {
+      if (blocker.waitForPlayback) {
+        _bgVideoSuspendDue = true;
+        debugPrint('后台省电: 到点但暂停中，恢复播放后再关');
+        return;
+      }
+      if (blocker.retryable) {
+        debugPrint(
+          '后台省电: 到点但${blocker.label}，'
+          '${PlayerTuning.backgroundVideoSuspendRetry.inSeconds}s 后重试',
+        );
+        _bgVideoSuspendTimer = Timer(
+          PlayerTuning.backgroundVideoSuspendRetry,
+          _onBackgroundVideoSuspendTimer,
+        );
+        return;
+      }
+      debugPrint('后台省电: 跳过（${blocker.label}）');
+      return;
+    }
+
+    _bgVideoSuspendDue = false;
+    _videoSuspendedForBackground = true;
+    debugPrint('后台省电: 关闭视频轨（file-local-options/vid=no），音频继续');
+    _setBackgroundVideoTrack(false);
+  }
+
+  /// 暂停态进后台时记下的那一次关轨，等真正播放后的第一拍补做。
+  void _maybeSuspendDueVideoInBackground() {
+    if (!_bgVideoSuspendDue) return;
+    if (!_backgroundVideoSuspendEnabled || !_appInBackground) {
+      _bgVideoSuspendDue = false;
+      return;
+    }
+    if (!playerStatus.isPlaying || _videoSuspendedForBackground) return;
+    _bgVideoSuspendDue = false;
+    // 所有闸门在定时器回调里会再判一次。
+    _onBackgroundVideoSuspendTimer();
+  }
+
+  /// 后台省电只动视频轨，而且走 `file-local-options/vid`。
+  ///
+  /// 全局 `vid` 是运行时选项、跨文件保留：漏一次恢复，后面每一集都会只剩声音。
+  /// file-local 在当前文件停止时自动复位，锁屏切下一集也不会把 `no` 带过去。
+  void _setBackgroundVideoTrack(bool enabled) {
+    final ctr = _videoPlayerController;
+    if (ctr == null) return;
+    try {
+      // 与「听视频」同一种写法（`header_control.dart`）：`setProperty` 是同步
+      // 原生调用，mpv 层失败静默，由自己的 track-list 校验兜底。
+      ctr.setProperty('file-local-options/vid', enabled ? 'auto' : 'no');
+    } catch (e) {
+      debugPrint('后台省电: 设置视频轨失败（$e）');
+    }
+  }
+
+  /// 恢复视频轨的兜底：宽高不可信，只认 `track-list` 里选中的那条。
+  Future<void> _verifyVideoTrackRestored() async {
+    final ctr = _videoPlayerController;
+    if (ctr == null) return;
+    // 装载在途时 `track-list` 还是空/旧的，而且此刻写 file-local 可能落到新文件
+    // 上（重挂的第一下正是 `no`）—— 等装载收尾再判，等不到就交给看门狗。
+    for (var i = 0; i < 6 && _processing; i++) {
+      await Future<void>.delayed(PlayerTuning.backgroundVideoResumeVerifyDelay);
+      if (!identical(ctr, _videoPlayerController)) return;
+    }
+    if (_processing) return;
+    await Future<void>.delayed(PlayerTuning.backgroundVideoResumeVerifyDelay);
+    if (!identical(ctr, _videoPlayerController)) return;
+    if (ctr.state.track.video.id != 'no') return;
+
+    debugPrint('后台省电: 恢复失败（track.video.id 仍为 no），重挂视频轨');
+    await _remountSuspendedVideoTrack();
+
+    await Future<void>.delayed(PlayerTuning.backgroundVideoResumeVerifyDelay);
+    if (!identical(ctr, _videoPlayerController)) return;
+    if (ctr.state.track.video.id != 'no') return;
+    if (_appInBackground) return;
+
+    debugPrint('后台省电: 重挂后仍无视频轨，请求就地重建');
+    _rebuildRenderContextOnNoVideo();
+  }
+
+  /// 重挂被后台省电关掉的视频轨：`no` → 300ms → `auto`。
+  ///
+  /// 与 [_reloadVideoTrack] 同一套节奏，但**必须走 file-local**：我们已经在这个
+  /// 文件上写过 `file-local-options/vid`，它会盖住全局 `vid` —— 这时候发
+  /// `command(['set','vid', ...])`（[_reloadVideoTrack] 的做法）等于什么都没做。
+  Future<void> _remountSuspendedVideoTrack() async {
+    final ctr = _videoPlayerController;
+    if (ctr == null) return;
+    _foregroundResumedAt = DateTime.now();
+    try {
+      _setBackgroundVideoTrack(false);
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      _setBackgroundVideoTrack(true);
+    } catch (_) {
+      // 重挂失败就带着旧解码链继续放，下一档兜底是就地重建。
+    }
+  }
+
+  /// 后台换集 / 错误重载：新文件让 `file-local-options/vid` 复位，视频轨又回来了。
+  ///
+  /// 装载完成后按**原后台会话的剩余时间**重排，而不是重新计时。
+  void _rearmBackgroundVideoSuspendAfterLoad() {
+    _videoSuspendedForBackground = false;
+    if (!_backgroundVideoSuspendEnabled) return;
+    if (!_appInBackground || IOSPipHelper.needsUpdate) return;
+
+    final now = DateTime.now();
+    _backgroundEnteredAt ??= now;
+    final remaining =
+        PlayerTuning.backgroundVideoSuspendDelay -
+        now.difference(_backgroundEnteredAt!);
+    // 已经超过等待时长的：新文件给 1 秒让首帧和播放状态稳定就关。
+    final delay = remaining.isNegative ? const Duration(seconds: 1) : remaining;
+
+    _bgVideoSuspendTimer?.cancel();
+    _bgVideoSuspendTimer = Timer(delay, _onBackgroundVideoSuspendTimer);
+    debugPrint(
+      '后台省电: 后台装载新文件，视频轨已随新文件复位，'
+      '${delay.inSeconds}s 后重新关闭',
+    );
   }
 
   /// 只把**视频轨**重挂一遍：`vid=no` → `vid=auto`。
@@ -528,6 +810,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 后台攒下的那次重建属于**上一个**视频：换集/换画质会新建整条播放链，
     // 回前台再拿新对象去 `vid=no → vid=auto` 一遍，是白丢 300ms 视频轨。
     _deferredDecoderRebuild = false;
+    // 后台省电关掉的视频轨随新文件复位（`file-local-options` 是 per-file 的），
+    // 装载完成后由 [_rearmBackgroundVideoSuspendAfterLoad] 按剩余时间重排。
+    // **刻意不清 `_backgroundEnteredAt`**：后台会话还在，换集不重新计时。
+    _videoSuspendedForBackground = false;
+    _bgVideoSuspendDue = false;
+    _bgVideoSuspendTimer?.cancel();
+    _bgVideoSuspendTimer = null;
   }
 
   /// 全屏方向
@@ -1120,6 +1409,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
     } finally {
       _processing = false;
+      // 后台装载（换集/换源/错误重载）会让 file-local 的 `vid=no` 随旧文件复位，
+      // 视频轨又回来了 —— 按原后台会话的剩余时间重新关。
+      _rearmBackgroundVideoSuspendAfterLoad();
     }
   }
 
@@ -1415,7 +1707,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           isLive: isLive,
         ),
         play: play ?? playerStatus.isPlaying,
-      );
+      ).whenComplete(_rearmBackgroundVideoSuspendAfterLoad);
     }
     return null;
   }
@@ -1855,7 +2147,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// —— 中间那一档「钉住输出尺寸」2026-10-15 已删（见 [_rebuildRenderContextOnNoVideo]
   /// 上方的墓碑注释）。
   void _checkNoVideoTrack(DateTime now) {
-    if (onlyPlayAudio.value ||
+    if (_videoSuspendedForBackground ||
+        onlyPlayAudio.value ||
         isLive ||
         position.value <= 0 ||
         isSeeking.value ||
@@ -1925,6 +2218,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   String? _renderRebuildBlocker() {
     if (_rebuildingRenderContext) {
       return '已在重建';
+    }
+    // 后台省电关掉的视频轨不是故障。
+    if (_videoSuspendedForBackground) {
+      return '视频轨是后台省电关掉的';
+    }
+    // 真在后台时也不动手：重建会拆音频输出、断音 1~3 秒，iOS 在这一下就把
+    // 「正在播放」交出去（见 [_deferredDecoderRebuild]）。画中画例外 ——
+    // 那里还有画面要看，真黑屏仍然需要这条唯一的救援路。
+    if (_appInBackground && !(Platform.isIOS && IOSPipHelper.needsUpdate)) {
+      return '在后台（重建会断音、丢正在播放）';
     }
     if (_noVideoRebuilds >= PlayerTuning.noVideoRebuildMax) {
       return '本媒体已重建 $_noVideoRebuilds 次';
@@ -2331,6 +2634,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void _startStallTicker() {
     _stallTicker?.cancel();
     _resetStallWatchdog();
+    // 诊断：一次进程只打一条，用来回答「装上的包到底带不带这段代码、开关读到
+    // 什么值」。生命周期那条日志只有在真收到事件时才会出现，没有它分不清
+    // 「包是旧的」和「回调没来」。
+    if (!_bgVideoSuspendDiagLogged) {
+      _bgVideoSuspendDiagLogged = true;
+      debugPrint(
+        '后台省电: 播放器就绪（诊断：开关 ${_backgroundVideoSuspendEnabled ? '开' : '关'}）',
+      );
+    }
     _stallTicker = Timer.periodic(const Duration(seconds: 1), (_) {
       // 心跳放在闸门之前：闸门本身也可能是"什么都不发生"的原因之一，
       // 必须先看到它当时的取值。
@@ -2356,6 +2668,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 「无视频轨」是**时间窗**判据（见 [PlayerTuning.noVideoWindow]），所以 1s 一拍都得看 ——
       // 少看一拍就是窗口判据白多出来的相位误差。旧的 2s 采样节流因此取消。
       _checkNoVideoTrack(now);
+      _maybeSuspendDueVideoInBackground();
       if (isLive ||
           dataSource is FileSource ||
           !playerStatus.isPlaying ||
@@ -3150,6 +3463,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     _playerCount = 0;
+    _bgVideoSuspendTimer?.cancel();
+    _bgVideoSuspendTimer = null;
+    _videoSuspendedForBackground = false;
+    _bgVideoSuspendDue = false;
+    _backgroundEnteredAt = null;
     if (removeSafeArea) {
       showSystemBar();
     }

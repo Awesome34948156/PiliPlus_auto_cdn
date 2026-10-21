@@ -228,6 +228,16 @@ List<SettingsModel> get playSettings => [
         }
       },
     ),
+  if (Platform.isIOS)
+    const SwitchModel(
+      title: '后台播放时关闭视频轨',
+      subtitle:
+          '进入后台 10 秒后停止视频解码以省电（声音继续）。'
+          '需开启「后台播放」；画中画、直播和听视频不受影响',
+      leading: Icon(Icons.battery_saver_outlined),
+      setKey: SettingBoxKey.backgroundVideoSuspend,
+      defaultVal: true,
+    ),
   if ((Platform.isAndroid && PiliAndroidHelper.isPipAvailable) ||
       (Platform.isIOS && IOSPipHelper.isAvailable))
     SwitchModel(

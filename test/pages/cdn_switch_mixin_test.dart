@@ -1493,6 +1493,8 @@ void main() {
         // 强指纹注入缝也还回默认值（null ⇒ 走真实判据）。不还的话，后面用例会
         // 在别人摆出的强指纹下悄悄走快路。
         ..debugNoVideoStrongOverride = null
+        // 后台注入缝同理：不还的话，后面的用例全被当成"在后台"。
+        ..debugForceAppInBackground = null
         // `isBuffering` 的初值就是 true（`controller.dart:222`），还回原样。
         ..isBuffering.value = true
         // openNoVideoGates 摆过、又不属于本 group 的字段，同样还回去。
@@ -1506,6 +1508,13 @@ void main() {
 
     test('没有页面认领重载就不许重建：拆了没人把它建回来', () {
       expect(pc.debugRenderRebuildBlocker(), '没有页面认领重载');
+    });
+
+    test('在后台不重建：那一下会断音、丢系统正在播放', () {
+      pc
+        ..debugForceAppInBackground = true
+        ..debugPlayerCount = 1;
+      expect(pc.debugRenderRebuildBlocker(), '在后台（重建会断音、丢正在播放）');
     });
 
     test('认领之后这一条让开，轮到下一道闸门（否定不是空的）', () {

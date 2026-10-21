@@ -135,6 +135,26 @@ abstract final class PlayerTuning {
   /// **真的**在吐坏字节的镜像多放过几秒。窗口一过，坏字节签名照常定罪换源。
   static const Duration foregroundResumeWindow = Duration(seconds: 5);
 
+  /// iOS 后台播放时，关闭视频轨前的等待时间。
+  ///
+  /// 取 10 秒是用户拍的板：锁屏看通知、切一下 App 这类几秒的短切换不触发，
+  /// 回前台时也就不白付一次 refresh seek（恢复 `vid=auto` 会让 mpv 从关键帧
+  /// 重开视频链，不可 seek 的流上实测过位置倒退 + 爆音，见 `_reloadVideoTrack`
+  /// 上方的墓碑）；而后台真待上十几秒的情况已经能吃到大部分省电。
+  ///
+  /// 别往 0 改：那等于每次锁屏都关一次，而收益要在分钟尺度上才看得出来。
+  static const Duration backgroundVideoSuspendDelay = Duration(seconds: 10);
+
+  /// 到点时装载 / seek / 重建在途时的重试间隔。
+  static const Duration backgroundVideoSuspendRetry = Duration(seconds: 5);
+
+  /// 恢复 `vid=auto` 后，等 `track-list` 事件回来的校验延迟。
+  ///
+  /// 不能用宽高判断：`vid=no` 时 media_kit 根本不会清零 `state.width/height`。
+  static const Duration backgroundVideoResumeVerifyDelay = Duration(
+    milliseconds: 500,
+  );
+
   /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
   /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
   /// 后停读，等掉回水位才续读，所以健康播放的锯齿在

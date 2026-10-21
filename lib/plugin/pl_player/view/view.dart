@@ -331,6 +331,10 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 后台省电状态机先看所有状态：它自己排除画中画，且只在 iOS 生效。
+    if (Platform.isIOS) {
+      plPlayerController.handleAppLifecycleForVideoTrack(state);
+    }
     // Keep playing in the PiP window.
     if (Platform.isIOS && IOSPipHelper.isActive) return;
     if (!plPlayerController.continuePlayInBackground.value) {
