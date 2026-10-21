@@ -28,6 +28,7 @@ import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
 import 'package:PiliPlus/plugin/pl_player/player_tuning.dart';
+import 'package:PiliPlus/plugin/pl_player/reload_strategy.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/danmaku_options.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/services/console_log.dart';
@@ -1153,6 +1154,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final opt = {
       'video-sync': Pref.videoSync,
       if (Platform.isAndroid) 'ao': Pref.audioOutput,
+      // iOS：换流时复用现有音频输出。默认 weak 只在格式完全一致时复用，yes 则
+      // 无条件复用（必要时由 mpv 重采样）—— 这是 [replaceSingle] 原地换流能
+      // 保住 AVAudioSession（进而保住系统「正在播放」）的前提，见
+      // [canReloadInPlace]。别的平台不设，行为逐字不变。
+      if (Platform.isIOS) 'gapless-audio': 'yes',
       'volume':
           (PlatformUtils.isMobile ? Pref.playerVolume : volume.value * 100)
               .toString(),
@@ -1292,7 +1298,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     assert(!isLive || seekTo == null);
-    await player.open(
+    await _loadMedia(
+      player,
       Media(
         video,
         start: seekTo,
@@ -1300,6 +1307,56 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       ),
       play: false,
     );
+  }
+
+  /// 换流：能原地替换就原地替换，不行再走 `Player.open()`。
+  ///
+  /// `open()` 会先 stop + 清播放列表，mpv 随之拆掉音频输出，它的收尾会给
+  /// `AVAudioSession` 发 `setActive:NO` —— iOS 就是在这 1~3 秒断音里把系统
+  /// 「正在播放」交出去、再也不还的（见 [canReloadInPlace]）。所以 iOS 上用
+  /// `replaceSingle` 走 mpv 的「播放下一条」路径，配合 `gapless-audio=yes`
+  /// 让音频输出原地复用，声音不断，卡片自然还在。
+  ///
+  /// 失败一律回落 `open()`：这里只是省下断音，不是必须成功的路径。
+  Future<void> _loadMedia(
+    Player player,
+    Media media, {
+    required bool play,
+  }) async {
+    final inPlace = await tryInPlaceReload(
+      allowed: canReloadInPlace(
+        isIOS: Platform.isIOS,
+        isLive: isLive,
+        isNetworkSource: dataSource is NetworkSource,
+        playlistLength: player.current.length,
+        completed: player.state.completed,
+      ),
+      replace: () => _replaceSingle(player, media, play: play),
+      onReplaceError: (error, _) =>
+          debugPrint('CDN 换流: 原地替换失败，回落 open(): $error'),
+    );
+    if (inPlace) return;
+    await player.open(media, play: play);
+  }
+
+  /// `Player.open()` 的原地版本：不 stop、不清播放列表，音频输出原地复用。
+  ///
+  /// 起播语义与 `open(play:)` 对齐：[play] 为 false 时先停在暂停态（也让
+  /// media_kit 不把这次装载当成播放状态变化，[playerStatus] 不会闪一下），
+  /// 为 true 时替换完再起播。`open(play:false)` 的暂停是它自己做的，这里补上。
+  Future<void> _replaceSingle(
+    Player player,
+    Media media, {
+    required bool play,
+  }) async {
+    if (!play) {
+      await player.pause();
+    }
+    await player.replaceSingle(media);
+    debugPrint('CDN 换流: replaceSingle 原地替换（iOS，保音频输出）');
+    if (play) {
+      await player.play();
+    }
   }
 
   /// 重开当前 Media 做故障恢复。
@@ -1316,9 +1373,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 重新打开同一个 Media，缓冲从头再来，看门狗同步重置。
     _resetStallWatchdog();
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
-      var media = ctr.current.last;
-      if (!isLive) media = media.copyWith(start: ctr.state.position);
-      return ctr.open(media, play: play ?? playerStatus.isPlaying);
+      return _loadMedia(
+        ctr,
+        resumeMedia(
+          current: ctr.current.last,
+          position: ctr.state.position,
+          isLive: isLive,
+        ),
+        play: play ?? playerStatus.isPlaying,
+      );
     }
     return null;
   }

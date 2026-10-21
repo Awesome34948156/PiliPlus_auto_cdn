@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
@@ -6,11 +7,13 @@ import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/pages/video/cdn_tuning.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/utils/cdn_speed_test.dart';
+import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:collection/collection.dart';
 import 'package:dio/dio.dart' show CancelToken, Dio, DioException;
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 
@@ -216,6 +219,19 @@ class _CdnSwitchState {
   CDNService? autoServiceSnapshot;
   Dio? autoDio;
 
+  /// 在后台判定要换源、但推迟到回前台才执行的那一次。
+  ///
+  /// 换源会重载播放器（[_CdnSwitchMixin._switchTo] → `playerInit`），音频输出
+  /// 拆了重建，断音 1~3 秒。iOS 就在这一下把系统「正在播放」交给别的 App，
+  /// 声音回来卡片也回不来 —— 2026-10-21 真机 21:20:37 现场：回主页 2 秒后预检
+  /// 判定换源，21:20:38.4 音频输出重建，灵动岛当场消失；对照那几局三次回前台
+  /// 一次换源都没有，卡片全在。后台本来没有画面可看，换源等回前台补做
+  /// （[_CdnSwitchMixin.resumeDeferredCdnSwitch]）。
+  ///
+  /// 带 [generation]：中途换集/换画质后这条就作废，不能再指挥播放器。
+  ({CDNService service, int generation, Duration resumeAt, bool decode})?
+  deferredSwitch;
+
   // ---------------------------------------------------------------------------
   // 时钟与闸门。三个时间闸互相独立，谁也别合并谁：
   //   giveUpUntil  整集放弃——一轮试完仍不行，60s 内不再响应任何触发
@@ -268,6 +284,8 @@ class _CdnSwitchState {
     // 小卡顿的节流也要重来：不带上它，新一集开头 30 秒的 rebuffer 全被上一集的
     // 时间戳压住。
     quickProbeAt = null;
+    // 换了集，后台攒下的那次换源指向的是上一个视频的镜像选择。
+    deferredSwitch = null;
   }
 
   /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
@@ -288,6 +306,8 @@ class _CdnSwitchState {
     championMisses.clear();
     lastAttemptPos = Duration.zero;
     autoServiceSnapshot = null;
+    // 换画质换了对象，后台攒下的那次换源按旧对象选的镜像，作废。
+    deferredSwitch = null;
     if (autoBusy) {
       autoBusy = false;
       autoAttempts = 0;
@@ -301,6 +321,8 @@ class _CdnSwitchState {
   void noteAttach() {
     generation++;
     autoBusy = false;
+    // 被顶掉期间判定出的换源属于上一个视频，挂载即作废。
+    deferredSwitch = null;
   }
 
   /// 开一轮：占住并发闸，记下这一轮的基线快照，返回本轮代际。
@@ -896,6 +918,85 @@ mixin CdnSwitchMixin on GetxController {
     _cdnState.attachedOnce = true;
   }
 
+  /// 回前台补做在后台推迟的那次换源。由页面生命周期回调调用
+  /// （`pages/video/view.dart` 的 `didChangeAppLifecycleState`）。
+  ///
+  /// 只在后台推迟过换源时才有事做；代际不符（中途换集/换画质/被顶掉）一律作废。
+  /// 走的是和正常轮次同一套动作：重载 → 补落点 → 等恢复，只是不再重新测速
+  /// —— 目标镜像在后台那一轮已经量过了。
+  Future<void> resumeDeferredCdnSwitch() async {
+    final pending = _cdnState.deferredSwitch;
+    if (pending == null) return;
+    _cdnState.deferredSwitch = null;
+    if (isClosed || !_cdnIsAttached) return;
+    if (pending.generation != _cdnState.generation) return;
+    // 正常轮次可能刚好在跑（比如回前台那一刻触发了卡顿档）：让它先来，
+    // 这一次放回待办，下一次触发/回前台再补。
+    if (_cdnState.autoBusy) {
+      _cdnState.deferredSwitch = pending;
+      return;
+    }
+    _cdnState.autoBusy = true;
+    final switchedAt = DateTime.now();
+    debugPrint('CDN 自动切换: 回前台，补做推迟的换源 -> ${pending.service.desc}');
+    try {
+      if (!await _switchTo(
+        pending.service,
+        pending.generation,
+        resumeAt: pending.resumeAt,
+        switchedAt: switchedAt,
+      )) {
+        return;
+      }
+      if (await _awaitRecovery(
+        pending.generation,
+        pending.resumeAt,
+        decode: pending.decode,
+        service: pending.service,
+        since: switchedAt,
+      )) {
+        _cdnState.noteSuccess();
+        debugPrint('CDN 自动切换: 成功，已切到 ${pending.service.desc}');
+      } else {
+        // 没恢复就交回常规触发（卡顿/饥饿/定期测速都还在）：这里不再自己
+        // 接着换下一个候选，免得绕过那几道闸。
+        debugPrint('CDN 自动切换: ${pending.service.desc} 未恢复（回前台补做）');
+      }
+    } finally {
+      _cdnState.completeRound(pending.generation);
+    }
+  }
+
+  /// 这次换源要不要推迟到回前台。只在 iOS 上推迟：断音会丢掉系统
+  /// 「正在播放」，别的平台没这个代价，后台照常修。
+  ///
+  /// 测试里 [debugForceCdnBackground] 非空就直接说了算 —— 单测跑在 macOS 上，
+  /// `Platform.isIOS` 永远是假，真实生命周期也摆不动。
+  bool get _deferSwitchInBackground {
+    final forced = debugForceCdnBackground;
+    if (forced != null) return forced;
+    return Platform.isIOS && _cdnInBackground;
+  }
+
+  /// 应用是否真的在后台（不是画中画）。
+  ///
+  /// `inactive` 不算：下拉控制中心、来电横幅那几秒里页面还会回来，没必要把
+  /// 一次已经判定好的换源按下不表。
+  bool get _cdnInBackground {
+    // 画中画里画面还在看，不算后台。
+    if (IOSPipHelper.isActive) return false;
+    return switch (WidgetsBinding.instance.lifecycleState) {
+      AppLifecycleState.paused ||
+      AppLifecycleState.hidden ||
+      AppLifecycleState.detached => true,
+      _ => false,
+    };
+  }
+
+  /// 测试用：把「这次要不要推迟换源」钉成指定值。
+  @visibleForTesting
+  bool? debugForceCdnBackground;
+
   /// 页面销毁：只撤掉自己的回调，别把新页面的覆盖掉。
   void detachCdnSwitch() {
     // 先记下自己是不是现役页：下面把回调置空之后 _cdnIsAttached 就成了假，
@@ -1117,6 +1218,25 @@ mixin CdnSwitchMixin on GetxController {
       }
 
       _cdnState.noteAttempt(attempt, stalledAt);
+
+      // iOS 在后台就先别换：换源要重载播放器，音频输出拆了重建断音 1~3 秒，
+      // 系统「正在播放」（锁屏/灵动岛）就是在这断音里被交出去的，回不来 ——
+      // 见 [_CdnSwitchState.deferredSwitch]。后台没有画面可看，等回前台补做。
+      // 代价是：后台期间真的卡住了也只能等回来再修 —— 换源本身就是一次断音，
+      // 先保住卡片。画中画里画面还在看，不算后台，该修照修；其它平台照旧。
+      if (_deferSwitchInBackground) {
+        _cdnState.deferredSwitch = (
+          service: chosen,
+          generation: generation,
+          resumeAt: stalledAt,
+          decode: force,
+        );
+        debugPrint(
+          'CDN 自动切换: 在后台，推迟换到 ${chosen.desc}（换源会重载播放器、断音）',
+        );
+        return;
+      }
+
       debugPrint(
         'CDN 自动切换: 第${_cdnState.autoAttempts}次 -> ${chosen.desc} ($speed)',
       );
@@ -1189,9 +1309,17 @@ mixin CdnSwitchMixin on GetxController {
     // 的**结论改写成"重载当前源"，去对同一个**坏 Media** 再 refreshPlayer 一次：
     // 治错病 —— 本机解码会话真坏了的话，换源和重载同一个 Media 都不治。
     if (!switched && !force && plPlayerController.telemetryDiverged) {
-      debugPrint('CDN 自动切换: 画面已冻（余量失真），重载当前源');
-      plPlayerController.refreshPlayer();
-      giveUp = '画面已冻，没有更快的镜像，已重载当前源';
+      if (_deferSwitchInBackground) {
+        // 后台重载一样会把音频输出拆了重建、丢掉「正在播放」，而画面在后台
+        // 本来就没人看。不留待办：这条要做的不是"换到某个镜像"，而是重载
+        // 当前源，目标没变 —— 回前台后失真会按 `starveRepeat` 的节奏再报，
+        // 那时在台前做（diverged 不吃放弃冷却，不用等 60s）。
+        debugPrint('CDN 自动切换: 画面已冻，但在后台 —— 回前台再重载');
+      } else {
+        debugPrint('CDN 自动切换: 画面已冻（余量失真），重载当前源');
+        plPlayerController.refreshPlayer();
+        giveUp = '画面已冻，没有更快的镜像，已重载当前源';
+      }
     }
 
     _cdnState.armGiveUp(giveUpCooldown);

@@ -152,22 +152,31 @@ void main() {
     _stall(hostA);
     // 第一轮：冠军照旧占位（此刻还没被标记连不上），测速后同时被记进"连不上"。
     await _waitFor(() => hostA.debugCdnNoSample.contains(CDNService.ali));
-    expect(log.has('含 1 个历史冠军'), isTrue,
-        reason: '第一轮冠军还没被标记连不上，本该占候选位：\n${log.text}');
+    expect(
+      log.has('含 1 个历史冠军'),
+      isTrue,
+      reason: '第一轮冠军还没被标记连不上，本该占候选位：\n${log.text}',
+    );
 
     // 换集（onReset 走这里）：放弃冷却/位置闸门要清，但"连不上"是链路层状态，
     // 得跨集留住。不必等第一轮那条换源跑完 —— 它在等假播放器的位置推进，测试里
     // 永远推进不了；reset 推代际，残留的那轮一拍之内就自己退场。
     hostA.resetCdnAutoSwitch();
-    expect(hostA.debugCdnNoSample, contains(CDNService.ali),
-        reason: '连不上不该随换集清空，否则 30 分钟冷却形同虚设');
+    expect(
+      hostA.debugCdnNoSample,
+      contains(CDNService.ali),
+      reason: '连不上不该随换集清空，否则 30 分钟冷却形同虚设',
+    );
 
     // 第二轮：这个冠军该让位给轮换了。
     log.clear();
     _stall(hostA);
     await _waitFor(() => log.has('测速 1 基线'));
-    expect(log.has('含 1 个历史冠军'), isFalse,
-        reason: '上一轮连不上的冠军这一轮不该再占候选位：\n${log.text}');
+    expect(
+      log.has('含 1 个历史冠军'),
+      isFalse,
+      reason: '上一轮连不上的冠军这一轮不该再占候选位：\n${log.text}',
+    );
   });
 
   test('被顶掉的那一页不许再动播放器（跨页污染）', () async {
@@ -447,7 +456,8 @@ void main() {
     expect(
       log.has('-> 不切换'),
       isTrue,
-      reason: '这一轮本该判成不切换（基线健康、候选不快）—— 裁定变了就不是这条用例在测的东西了：'
+      reason:
+          '这一轮本该判成不切换（基线健康、候选不快）—— 裁定变了就不是这条用例在测的东西了：'
           '\n${log.text}',
     );
     expect(
@@ -459,6 +469,34 @@ void main() {
       log.has('放弃，60s 内不再尝试（画面已冻，没有更快的镜像，已重载当前源）'),
       isTrue,
       reason: '重载之后那句收尾没写出来，说明兜底半路断了：\n${log.text}',
+    );
+  });
+
+  test('兜底重载在后台也要等回前台（同一条路，只差应用在不在前台）', () async {
+    // 和上一条**完全相同**的一轮，只多摆一件事：应用在后台。重载当前源一样要
+    // 重载播放器、断音、丢掉 iOS 的「正在播放」，而画面在后台本来没人看。
+    // 回前台后失真会按 `starveRepeat` 再报，那时再修（diverged 不吃放弃冷却）。
+    PlPlayerController.getInstance()
+      ..dataSource = NetworkSource(
+        videoSource: _steadyBaselineUrl,
+        audioSource: null,
+      )
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 200
+      ..position.value = 0;
+    hostA
+      ..videoUrl = _steadyBaselineUrl
+      ..debugForceCdnBackground = true
+      ..attachCdnSwitch();
+    _stall(hostA);
+
+    await _waitFor(() => log.has('画面已冻，但在后台'));
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(
+      log.has('画面已冻（余量失真），重载当前源'),
+      isFalse,
+      reason: '后台重载会断音、丢掉锁屏卡片，必须等回前台：\n${log.text}',
     );
   });
 
@@ -829,7 +867,9 @@ void main() {
     );
 
     // 同一窗口里的解码错误上报必须当场起步（`_describeTrigger` 打在闸门之后）。
-    PlPlayerController.getInstance().onDecodeError!(const Duration(seconds: 100));
+    PlPlayerController.getInstance().onDecodeError!(
+      const Duration(seconds: 100),
+    );
     expect(
       log.has('冷却中，忽略解码错误'),
       isFalse,
@@ -935,7 +975,8 @@ void main() {
       // 是 `late`，不摆好这里会抛。
       ..dataSource = NetworkSource(videoSource: _baselineUrl, audioSource: null)
       ..refreshPlayer()
-      ..buffer['demuxer-hysteresis-secs'] = '10' // 阈值 6.0s → 判据启用
+      ..buffer['demuxer-hysteresis-secs'] =
+          '10' // 阈值 6.0s → 判据启用
       ..duration.value = 3600
       ..position.value = 100
       ..buffered.value = 100; // 前方余量 0：趴在低位
@@ -944,7 +985,11 @@ void main() {
     for (var i = 0; i < 3; i++) {
       pc.debugSampleStarve(at(i));
     }
-    expect(reports, 0, reason: '还没攒够 $_kStarveSecondsExpect 拍就上报了：\n${log.text}');
+    expect(
+      reports,
+      0,
+      reason: '还没攒够 $_kStarveSecondsExpect 拍就上报了：\n${log.text}',
+    );
 
     pc.debugSampleStarve(at(3));
     expect(reports, 1, reason: '攒够了却没上报：\n${log.text}');
@@ -1012,7 +1057,10 @@ void main() {
     }
 
     // 续解签名本身不是坏字节，但窗口内它与后面的 OBU 风暴是同一个病。
-    burst('Missing Sequence Header', base.add(const Duration(milliseconds: 400)));
+    burst(
+      'Missing Sequence Header',
+      base.add(const Duration(milliseconds: 400)),
+    );
     expect(
       log.has('回前台续播仍在刷解码报错'),
       isTrue,
@@ -1136,10 +1184,15 @@ void main() {
       pc = PlPlayerController.getInstance()
         // 拿 reload 当"从头开始"：任何一次真实装载都会这样归零三条判据。
         // `dataSource` 是 `late`，不摆好这里会抛。
-        ..dataSource = NetworkSource(videoSource: _baselineUrl, audioSource: null)
+        ..dataSource = NetworkSource(
+          videoSource: _baselineUrl,
+          audioSource: null,
+        )
         ..refreshPlayer()
-        ..buffer['demuxer-hysteresis-secs'] = '10' // 饥饿线 6.0s → 判据启用
-        ..buffer['cache-secs'] = '30' // 失真线 30 × 3 = 90s
+        ..buffer['demuxer-hysteresis-secs'] =
+            '10' // 饥饿线 6.0s → 判据启用
+        ..buffer['cache-secs'] =
+            '30' // 失真线 30 × 3 = 90s
         ..duration.value = 3600
         ..position.value = 100
         ..buffered.value = 100
@@ -1208,7 +1261,11 @@ void main() {
       for (var i = 1; i < 3; i++) {
         pc.debugSampleStarve(_sampleAt(i));
       }
-      expect(starve, 0, reason: '还没攒够 $_kStarveSecondsExpect 拍就出声了：\n${log.text}');
+      expect(
+        starve,
+        0,
+        reason: '还没攒够 $_kStarveSecondsExpect 拍就出声了：\n${log.text}',
+      );
       pc.debugSampleStarve(_sampleAt(3));
 
       expect(starve, 1, reason: '低水位那一支的出口被这次改动带走了：\n${log.text}');
@@ -1301,7 +1358,8 @@ void main() {
       expect(
         log.has('-> 不切换'),
         isTrue,
-        reason: '这一轮本该判成不切换（基线健康、候选不快）—— 裁定变了就不是这条用例在测的东西了：'
+        reason:
+            '这一轮本该判成不切换（基线健康、候选不快）—— 裁定变了就不是这条用例在测的东西了：'
             '\n${log.text}',
       );
       expect(
@@ -1690,7 +1748,8 @@ void main() {
       expect(
         log.has('无视频轨:'),
         isFalse,
-        reason: '位置冻住时强指纹不成立，第 3 拍不该报（那会说明"位置推进"没算进去）：'
+        reason:
+            '位置冻住时强指纹不成立，第 3 拍不该报（那会说明"位置推进"没算进去）：'
             '\n${log.text}',
       );
 
@@ -1761,7 +1820,8 @@ void main() {
         expect(
           log.has('无视频轨:'),
           isFalse,
-          reason: '${entry.key}：旧窗口攒的时间被算进新一轮了（重开门那一拍就报）：'
+          reason:
+              '${entry.key}：旧窗口攒的时间被算进新一轮了（重开门那一拍就报）：'
               '\n${log.text}',
         );
       }
@@ -1840,6 +1900,74 @@ void main() {
       log.has('基线探测没拿到样本，但播放器没在挨饿'),
       isFalse,
       reason: '挨饿态下被新闸门拦下了 —— 真救援被掐：\n${log.text}',
+    );
+  });
+
+  test('后台判定出换源也别重载播放器，回前台才补做', () async {
+    // 真机 2026-10-21 21:20:37 的形状：预检在回主页 2 秒后才判定要换源，换源一
+    // 重载播放器，21:20:38.4 音频输出拆了重建、断音 1.3 秒，iOS 当场把锁屏/
+    // 灵动岛的「正在播放」交给了别人。后台没有画面可看，这一次必须等回前台再做。
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 0
+      ..isBuffering.value = true
+      ..buffer['demuxer-hysteresis-secs'] = '21.333'
+      ..buffer['cache-secs'] = '30';
+    hostA
+      ..debugForceCdnBackground = true
+      ..attachCdnSwitch();
+    _stall(hostA);
+
+    await _waitFor(() => log.has('在后台，推迟换到'));
+    // 这一轮已经收干净（busy 清掉）再多等一拍 —— 否则"没有重载"可能只是
+    // "还没来得及重载"。
+    await _waitFor(() => !hostA.debugCdnAutoBusy);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(
+      hostA.initCalls,
+      0,
+      reason: '后台换源会重载播放器、断音，必须等回前台：\n${log.text}',
+    );
+    expect(
+      log.has('第1次 ->'),
+      isFalse,
+      reason: '推迟了却又走了正常换源那一段：\n${log.text}',
+    );
+
+    hostA.debugForceCdnBackground = false;
+    unawaited(hostA.resumeDeferredCdnSwitch());
+    await _waitFor(() => hostA.initCalls == 1);
+    expect(
+      log.has('回前台，补做推迟的换源'),
+      isTrue,
+      reason: '回前台没把推迟的换源补上：\n${log.text}',
+    );
+  });
+
+  test('后台推迟的换源遇到换集就作废', () async {
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 0
+      ..isBuffering.value = true
+      ..buffer['demuxer-hysteresis-secs'] = '21.333'
+      ..buffer['cache-secs'] = '30';
+    hostA
+      ..debugForceCdnBackground = true
+      ..attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => log.has('在后台，推迟换到'));
+
+    // 换集：这条待办带的落点和镜像都属于上一集。
+    hostA
+      ..resetCdnAutoSwitch()
+      ..debugForceCdnBackground = false;
+    await hostA.resumeDeferredCdnSwitch();
+    expect(
+      hostA.initCalls,
+      0,
+      reason: '换了集就不该再补做上一集判定出的换源：\n${log.text}',
     );
   });
 }
@@ -2074,7 +2202,9 @@ class _FakeAdapter implements HttpClientAdapter {
       offset > 0 ? 206 : 200,
       headers: {
         if (offset > 0)
-          'content-range': ['bytes $offset-${offset + bytes - 1}/${cdn.objectSize}'],
+          'content-range': [
+            'bytes $offset-${offset + bytes - 1}/${cdn.objectSize}',
+          ],
       },
     );
   }

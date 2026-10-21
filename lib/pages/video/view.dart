@@ -220,6 +220,9 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     final isResume = state == .resumed;
     final ctr = videoDetailController.plPlayerController..visible = isResume;
     if (isResume) {
+      // 后台期间判定要换源的那一次推迟到了现在（后台换源会重载播放器、
+      // 断音 1~3 秒，iOS 会因此丢掉锁屏/灵动岛上的「正在播放」）。
+      videoDetailController.resumeDeferredCdnSwitch();
       if (!ctr.showDanmaku) {
         introController.startTimer();
         ctr.showDanmaku = true;
