@@ -413,10 +413,32 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 后台本来就没有画面，重建没有意义，推迟到回前台。
   bool _deferredDecoderRebuild = false;
 
+  /// 应用是不是真的退到后台了。
+  ///
+  /// 只有 `paused / hidden / detached` 算后台：`inactive` 是下拉控制中心、来电
+  /// 横幅这类"马上会回来"的状态，`null` 是生命周期事件还没到达 —— 两种都按前台
+  /// 处理。把 `null` 当后台会让推迟下来、却再也等不到 `resumed` 的补做。
+  ///
+  /// 与 [CdnSwitchMixin] 的 `_cdnInBackground` 同一口径（那边额外排除画中画，
+  /// 因为画中画里还有画面要看；解码器重建则与画面无关）。
+  bool get appInBackground => switch (WidgetsBinding.instance.lifecycleState) {
+    AppLifecycleState.paused ||
+    AppLifecycleState.hidden ||
+    AppLifecycleState.detached => true,
+    _ => false,
+  };
+
   /// 回前台后把推迟的重建补上。由播放器页的生命周期回调调用。
   void resumeDeferredDecoderRebuild() {
     if (!_deferredDecoderRebuild) return;
     _deferredDecoderRebuild = false;
+    // 装载在途（换源 / 换集 / 回前台补做的换源）时别插进去：那一轮重载本来就会
+    // 建一条新的视频链，再 `vid=no → vid=auto` 一遍是白拆一次（[playerInit] 刚
+    // 换上的 Media 会在 300ms 里失去视频轨）。让位给重载，它自己会有一条新链。
+    if (_processing) {
+      debugPrint('CDN 看门狗: 装载在途，跳过回前台重挂视频轨（新链会自己建起来）');
+      return;
+    }
     debugPrint('CDN 看门狗: 回前台，原地重挂视频轨（后台那段硬解会话已作废）');
     _reloadVideoTrack();
   }
@@ -503,6 +525,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 换成另一个视频/画质之后，"回前台续播"这个上下文也作废：新对象的头几秒
     // 报错该按它自己的镜像算，不能继承上一段续播的豁免。
     _foregroundResumedAt = null;
+    // 后台攒下的那次重建属于**上一个**视频：换集/换画质会新建整条播放链，
+    // 回前台再拿新对象去 `vid=no → vid=auto` 一遍，是白丢 300ms 视频轨。
+    _deferredDecoderRebuild = false;
   }
 
   /// 全屏方向
@@ -2273,7 +2298,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 后台不重建：重建会拆掉音频输出、断音 1~3 秒，iOS 会趁这一下把「正在播放」
     // 交给别的 App，声音回来卡片也回不来（2026-10-21 真机，见
     // [_deferredDecoderRebuild]）。后台没有画面，回前台再修。
-    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+    if (appInBackground) {
       if (!_deferredDecoderRebuild) {
         _deferredDecoderRebuild = true;
         debugPrint('CDN 看门狗: 硬解会话失效，但在后台 —— 推迟到回前台再重建');

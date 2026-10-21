@@ -21,8 +21,7 @@ import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
-import 'package:get/get_core/src/get_main.dart';
-import 'package:get/get_instance/src/extension_instance.dart';
+import 'package:get/get.dart';
 import 'package:path/path.dart' as path;
 
 Future<VideoPlayerServiceHandler> initAudioService() {
@@ -406,6 +405,11 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     _lastConfig = null;
   }
 
+  /// 关掉服务那一刻的系统状态。重新打开时先把它推回去：只 `setMediaItem`
+  /// 恢复的是一张没有播放态、没有控制的卡片，要等下一次真实的状态变化才会补上
+  /// （而那是暂停/播放才有的，可能几分钟都没有）。
+  PlaybackState? _suspendedState;
+
   /// 开关「后台音频服务」。
   ///
   /// 关闭时只撤掉系统播放器（锁屏/灵动岛/通知），不打断正在播放的声音，
@@ -422,6 +426,11 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       if (_item.isNotEmpty &&
           (PlPlayerController.instance != null || onPlay != null)) {
         setMediaItem(_item.last);
+        final suspended = _suspendedState;
+        _suspendedState = null;
+        if (suspended != null && suspended.processingState != .idle) {
+          playbackState.add(suspended);
+        }
       }
       return;
     }
@@ -429,6 +438,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     // audio_service 只在「非 idle → idle」时调用 stopService；Darwin 端由此
     // 把 nowPlayingInfo 置 nil 并收回遥控。单独 mediaItem.add(null) 没用，
     // audio_service 的 _observeMediaItem 会直接忽略 null。
+    _suspendedState = playbackState.value;
     if (playbackState.value.processingState == .idle) {
       playbackState.add(PlaybackState(processingState: .completed));
     }

@@ -585,6 +585,12 @@ class UgcIntroController extends CommonIntroController with ReloadMixin {
       }
     }
 
+    // 和 [nextPlay] 对齐：没有可播的条目就什么都别做。列表为空时
+    // `currentIndex` 是 -1，列表循环那条会把 `prevIndex` 算成 -1，
+    // 下一行 `episodes[-1]` 直接抛 RangeError（`skipToPrevious` 走
+    // `Future.sync`，于是变成一个没人接的异步错误）。
+    if (episodes.isEmpty) return false;
+
     final int currentIndex = episodes.indexWhere(
       (e) =>
           e.cid ==

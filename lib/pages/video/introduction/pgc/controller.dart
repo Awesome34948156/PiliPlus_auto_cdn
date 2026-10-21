@@ -345,6 +345,10 @@ class PgcIntroController extends CommonIntroController {
   @override
   bool prevPlay() {
     final episodes = pgcItem.episodes!;
+    // 和 [nextPlay] 的保护一致：没有可播的条目就什么都别做。列表为空时
+    // `currentIndex` 是 -1，列表循环那条会把 `prevIndex` 算成 -1，
+    // 随后 `episodes[-1]` 抛 RangeError。
+    if (episodes.isEmpty) return false;
     int currentIndex = episodes.indexWhere(
       (e) => e.cid == videoDetailCtr.cid.value,
     );
