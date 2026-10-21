@@ -1001,6 +1001,17 @@ mixin CdnSwitchMixin on GetxController {
       if (landed == null) {
         return;
       }
+      // 暂停态下位置根本不会前进，进度判据永远等不到 —— 那不是"没恢复"，是没
+      // 东西可观察。真机 2026-10-22 00:07：mpv 自己写着
+      // `playback restart complete @ 3.080000, audio=playing, video=playing
+      // (paused)`，半秒后却判「未恢复（回前台补做）」。新流已经装载、也没报
+      // 打不开，就按落地收尾；真有毛病，等用户按下播放时卡顿/饥饿那两档会接手。
+      if (!plPlayerController.playerStatus.isPlaying &&
+          !_openFailedFor(pending.service, switchedAt)) {
+        _cdnState.noteSuccess();
+        debugPrint('CDN 自动切换: 暂停中，新流已装载（无进度可观察），不判恢复');
+        return;
+      }
       if (await _awaitRecovery(
         generation,
         // 落点用 _switchTo 实际用的那个，不是后台记下的 `pending.resumeAt`：
@@ -2131,7 +2142,20 @@ mixin CdnSwitchMixin on GetxController {
     final timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (completer.isCompleted) return;
       final elapsed = DateTime.now().difference(start);
-      if (!_roundLive(generation) || elapsed >= window) {
+      if (!_roundLive(generation)) {
+        // 作废轮和被顶掉都是"没结论"，不是镜像坏 —— 分开记，免得下次看到
+        // 「未恢复」又要从头猜是哪条路收的尾（2026-10-22 00:07 那次就是这样）。
+        debugPrint('CDN 自动切换: 恢复判定中止（本轮已作废或本页已不在台上）');
+        completer.complete(false);
+        return;
+      }
+      if (elapsed >= window) {
+        debugPrint(
+          decode
+              ? 'CDN 自动切换: ${service.desc} ${window.inSeconds}s 内没有干净窗口，判定未恢复'
+              : 'CDN 自动切换: ${service.desc} ${window.inSeconds}s 内位置没动'
+                    '（判据 ${CdnTuning.recoverProgress.inSeconds}s），判定未恢复',
+        );
         completer.complete(false);
         return;
       }

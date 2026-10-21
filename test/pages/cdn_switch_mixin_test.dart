@@ -1988,6 +1988,48 @@ void main() {
     );
   });
 
+  test('暂停态补做换源：位置不会前进，不能判"未恢复"', () async {
+    // 真机 2026-10-22 00:07:29：回前台补做推迟的换源，播放器一直是暂停的
+    // （mpv 自己写着 `playback restart complete @ 3.080000 ... (paused)`），
+    // 位置不动，进度判据永远等不到 —— 半秒后却打出「未恢复（回前台补做）」。
+    // 那不是换源失败，是没东西可观察。
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 0
+      ..isBuffering.value = true
+      ..buffer['demuxer-hysteresis-secs'] = '21.333'
+      ..buffer['cache-secs'] = '30';
+    hostA
+      ..debugForceCdnBackground = true
+      ..attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => log.has('在后台，推迟换到'));
+    await _waitFor(() => !hostA.debugCdnAutoBusy);
+
+    // 用户从头到尾没按播放：补做换源也不能把他拉起来。
+    PlPlayerController.getInstance().playerStatus = PlayerStatus.paused;
+    hostA.debugForceCdnBackground = false;
+    await hostA.resumeDeferredCdnSwitch();
+
+    expect(hostA.initCalls, 1, reason: log.text);
+    expect(
+      hostA.initAutoplay.last,
+      isFalse,
+      reason: '暂停态补做换源把播放拉起来了：\n${log.text}',
+    );
+    expect(
+      log.has('暂停中，新流已装载'),
+      isTrue,
+      reason: '暂停态没有进度可看，该按落地收尾：\n${log.text}',
+    );
+    expect(
+      log.has('未恢复'),
+      isFalse,
+      reason: '暂停态被判成换源失败：\n${log.text}',
+    );
+  });
+
   test('后台推迟的解码档仍要记下坏 host', () async {
     // 推迟只是把"换源"这个动作挪到回前台，"现在这条源给了坏字节"是**已经成立的
     // 事实**，与什么时候换无关。记账若留在推迟分支之后，后台判定的解码档一推迟就
