@@ -101,7 +101,13 @@ void main() {
     hostB = _CdnHost(cdn: cdn, url: _baselineUrl);
     // 解码账（_decodeErrors / _decodeErrorUntil …）是单例字段，跨用例只增不减；
     // T1 不 attach host（走不到 attachCdnSwitch 里的复位），所以这里显式清零。
-    PlPlayerController.getInstance().resetDecodeErrorAccounting();
+    // `resetDecodeErrorAccounting` 顺带清「回前台续播窗口」。
+    PlPlayerController.getInstance()
+      ..resetDecodeErrorAccounting()
+      // 「打不开」证词同样是单例字段：假 playerInit 不走 setDataSource，
+      // 没有别的复位点。
+      ..lastOpenFailureAt = null
+      ..lastOpenFailure = null;
   });
 
   tearDown(() async {
@@ -977,6 +983,134 @@ void main() {
     expect(reports, 3, reason: '新一段里 20s 之内就重复了：\n${log.text}');
     pc.debugSampleStarve(at(48));
     expect(reports, 4, reason: '新一段里越过 20s 没补报：\n${log.text}');
+  });
+
+  test('回前台续播的解码报错算本机账，不算镜像的坏字节（log 21 20:47 复放）', () {
+    // 现场：退后台 4m48s，回前台 0.35s 后先来 `Missing Sequence Header` +
+    // `Missing reference frame`，随后 68ms 内 153 行 libdav1d OBU 报错。那一发
+    // 被判成"当前镜像给坏字节"→ 强制换源，并把一条测速正常的 ali 拉黑了；
+    // 实际是 `reinitDecoderAfterBackground` 切 hwdec 清空参考帧池、从 GOP 中间
+    // 续解的正常产物。窗口内该做的是重建本机解码器。
+    final pc = PlPlayerController.getInstance()..resetDecodeErrorAccounting();
+    var reports = 0;
+    pc.onDecodeError = (_) {
+      reports++;
+      return true;
+    };
+    final base = DateTime.now();
+    pc.debugNoteForegroundResume(base);
+
+    // 12 条、10ms 间隔：稀疏档（6s/12 条）刚好凑满，会话档（3s/6 条）更早凑满；
+    // 去重窗 5ms 小于 10ms 间隔，每条都算数。
+    void burst(String text, DateTime end) {
+      for (var i = 0; i < 12; i++) {
+        pc.debugSampleDecodeError(
+          text,
+          end.subtract(Duration(milliseconds: 10 * (11 - i))),
+        );
+      }
+    }
+
+    // 续解签名本身不是坏字节，但窗口内它与后面的 OBU 风暴是同一个病。
+    burst('Missing Sequence Header', base.add(const Duration(milliseconds: 400)));
+    expect(
+      log.has('回前台续播仍在刷解码报错'),
+      isTrue,
+      reason: '续解族的报错没被认成本机解码链未接上：\n${log.text}',
+    );
+    expect(reports, 0, reason: '续解报错被当成镜像的坏字节上报了：\n${log.text}');
+
+    // 风暴主体：窗口内照旧不许走换源那条路。
+    burst('Invalid OBU length: 53116', base.add(const Duration(seconds: 1)));
+    expect(reports, 0, reason: '回前台窗口内的坏字节签名被拿去换源了：\n${log.text}');
+    expect(
+      pc.lastDecoderCorruptionAt,
+      isNull,
+      reason: '窗口内记了 lastDecoderCorruptionAt，换源恢复判据会把本机续解算到镜像头上',
+    );
+
+    // 窗口过后，真正的坏字节风暴照旧定罪 —— 豁免不能变成永久失明。
+    burst(
+      'Invalid NAL unit size (34817 > 5117).',
+      base.add(const Duration(seconds: 8)),
+    );
+    expect(reports, 1, reason: '窗口过后真坏字节也不上报了：\n${log.text}');
+    expect(
+      log.has('当前镜像给的字节解不出画面'),
+      isTrue,
+      reason: '窗口过后没走「换源」那条路：\n${log.text}',
+    );
+  });
+
+  test('换过去的新流打不开：立刻收尾本轮，不再等恢复窗、也不再补 seek', () async {
+    // 现场（log 21 20:47:35~44）：换到 ali 之后 stream 打不开，mpv 报
+    // `Failed to open https://upos-sz-mirrorali...` + `[fatal] No video or audio
+    // streams selected`。旧实现里 `_restoreResumePosition` 仍每 0.8s 补一发 seek
+    // （16 条 `error running command`），`_awaitRecovery(decode: true)` 还要等满
+    // 18s 才判未恢复。
+    final pc = PlPlayerController.getInstance()
+      // 把两条位置/余量判据摆成"看着像恢复"的样子：若实现没短路，它们会误判成功。
+      ..buffer['demuxer-hysteresis-secs'] = '30'
+      ..buffer['cache-secs'] = '30'
+      ..buffered.value = 60
+      ..position.value = 0;
+    hostA
+      ..holdInit = Completer<void>()
+      ..attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => hostA.initCalls == 1);
+    expect(log.has('开始找可用镜像'), isTrue, reason: '这一轮没起来：\n${log.text}');
+
+    hostA.holdInit!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    // 没带 URL 的 fatal 原文：真实日志里就是这样，页面只能按时刻认。
+    pc
+      ..lastOpenFailureAt = DateTime.now()
+      ..lastOpenFailure = 'No video or audio streams selected.';
+
+    // 不短路时：补落点 6.4s + 恢复窗 12s ≈ 18s。4s 足够区分。
+    await _waitFor(
+      () => log.has('未恢复，换下一个候选'),
+      timeout: const Duration(seconds: 4),
+    );
+    expect(
+      log.has('新流没打开，立即收尾本轮'),
+      isTrue,
+      reason: '没走「打不开 → 立即收尾」那条路：\n${log.text}',
+    );
+    expect(
+      log.has('补一次 seek'),
+      isFalse,
+      reason: '新流没打开还在往播放器上补 seek：\n${log.text}',
+    );
+  });
+
+  test('旧镜像晚到的 Failed to open 不算到新镜像头上（host 核对）', () async {
+    // 换源拆旧链时，上一条流可能晚一拍才吐出 `Failed to open <旧 host>`。只按
+    // 时刻判的话，换过去的新镜像一秒都还没试过就被判死 —— 这里让报错原文带着
+    // **基线**的 host，新镜像不是它，必须照常走完补落点。
+    final pc = PlPlayerController.getInstance()
+      ..buffer['demuxer-hysteresis-secs'] = '0'
+      ..position.value = 0;
+    hostA
+      ..holdInit = Completer<void>()
+      ..attachCdnSwitch();
+    _stall(hostA);
+    await _waitFor(() => hostA.initCalls == 1);
+
+    hostA.holdInit!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    pc
+      ..lastOpenFailureAt = DateTime.now()
+      ..lastOpenFailure =
+          'Failed to open https://$_baselineHost/upgcxcode/1/2/3/4.m4s';
+
+    await _waitFor(() => log.has('补一次 seek'));
+    expect(
+      log.has('新流没打开，立即收尾本轮'),
+      isFalse,
+      reason: '旧镜像的报错把刚换过去的新镜像判死了：\n${log.text}',
+    );
   });
 
   // 判据 3 的两支分流（2026-10-12 log 17 取证）。原来"前向余量趴在低位"和"余量

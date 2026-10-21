@@ -840,6 +840,22 @@ mixin CdnSwitchMixin on GetxController {
   bool _roundLive(int generation) =>
       !_roundVoided(generation) && _cdnIsAttached;
 
+  /// 换到 [service] 之后，播放器有没有报过「这个 Media 根本没打开」。
+  ///
+  /// 时刻之外还核一次 host（报错原文里带着 URL）：换源拆旧流时，上一条流晚到的
+  /// `Failed to open` 可能正好落在 [since] 之后，不核 host 就会把一条还没
+  /// 真正试过的新镜像判死。`No video or audio streams selected` 不带 URL，只能
+  /// 按时刻认 —— 它只在当前打开失败时出现，误伤面很小。
+  bool _openFailedFor(CDNService service, DateTime since) {
+    final player = plPlayerController;
+    final at = player.lastOpenFailureAt;
+    if (at == null || !at.isAfter(since)) return false;
+    final text = player.lastOpenFailure;
+    final host = service.host;
+    if (host == null || text == null || !text.contains('://')) return true;
+    return text.contains(host);
+  }
+
   /// 把本页挂到播放器的上报口上（见 [detachCdnSwitch]）。
   ///
   /// **幂等**：已经在挂载状态时直接返回。调用方之一是页面重新露面（`didPopNext`，
@@ -1118,8 +1134,24 @@ mixin CdnSwitchMixin on GetxController {
       }
 
       switched = true;
-      if (!await _switchTo(chosen, generation, resumeAt: stalledAt)) return;
-      if (await _awaitRecovery(generation, stalledAt, decode: force)) {
+      // 这一刻之前的「打不开」证词不算这一轮的：装载开始时播放器会清掉旧账，
+      // 这里只用时刻把"换过去之后"与"换过去之前"分开。
+      final switchedAt = DateTime.now();
+      if (!await _switchTo(
+        chosen,
+        generation,
+        resumeAt: stalledAt,
+        switchedAt: switchedAt,
+      )) {
+        return;
+      }
+      if (await _awaitRecovery(
+        generation,
+        stalledAt,
+        decode: force,
+        service: chosen,
+        since: switchedAt,
+      )) {
         _cdnState.noteSuccess();
         debugPrint('CDN 自动切换: 成功，已切到 ${chosen.desc}');
         _cdnToast(
@@ -1691,6 +1723,7 @@ mixin CdnSwitchMixin on GetxController {
     CDNService service,
     int generation, {
     required Duration resumeAt,
+    required DateTime switchedAt,
   }) async {
     // 测速期间用户可能已经换集/重置，此时这条 URL 属于上一轮的播放列表。
     if (generation != _cdnState.generation) return false;
@@ -1746,7 +1779,20 @@ mixin CdnSwitchMixin on GetxController {
 
     await playerInit(autoplay: wasPlaying);
     if (!_roundLive(generation)) return false;
-    await _restoreResumePosition(pos, generation);
+    if (_openFailedFor(service, switchedAt)) {
+      // 流都没打开，落点永远是 0：补 seek 只会换来一串 `error running command`。
+      // 这一轮照常返回 true，交给 [_awaitRecovery] 立刻收尾、换下一个候选。
+      debugPrint(
+        'CDN 自动切换: ${service.desc} 换过去之后新流没打开，跳过落点纠正',
+      );
+    } else {
+      await _restoreResumePosition(
+        pos,
+        generation,
+        service: service,
+        since: switchedAt,
+      );
+    }
     return _roundLive(generation);
   }
 
@@ -1759,12 +1805,25 @@ mixin CdnSwitchMixin on GetxController {
   /// 再重载、位置再丢一次 —— 越换越偏。
   ///
   /// 只在"落在后面"时纠正：用户自己往前拖的话位置会比 [target] 大，不动他。
-  Future<void> _restoreResumePosition(Duration target, int generation) async {
+  Future<void> _restoreResumePosition(
+    Duration target,
+    int generation, {
+    required CDNService service,
+    required DateTime since,
+  }) async {
     if (target <= Duration.zero) return;
     final player = plPlayerController;
     for (var i = 0; i < CdnTuning.resumeAttempts; i++) {
       await Future<void>.delayed(CdnTuning.resumePoll);
       if (!_roundLive(generation)) return;
+      // 新流根本没打开时位置永远是 0，补 seek 也发不出去（mpv 回
+      // `error running command`）。别再空转 6.4 秒。
+      if (_openFailedFor(service, since)) {
+        debugPrint(
+          'CDN 自动切换: ${service.desc} 新流没打开，停止补落点',
+        );
+        return;
+      }
       if (player.positionInMilliseconds >=
           (target - CdnTuning.resumeTolerance).inMilliseconds) {
         return;
@@ -1803,6 +1862,8 @@ mixin CdnSwitchMixin on GetxController {
     int generation,
     Duration from, {
     bool decode = false,
+    required CDNService service,
+    required DateTime since,
   }) {
     final player = plPlayerController;
     final completer = Completer<bool>();
@@ -1823,6 +1884,16 @@ mixin CdnSwitchMixin on GetxController {
       if (completer.isCompleted) return;
       final elapsed = DateTime.now().difference(start);
       if (!_roundLive(generation) || elapsed >= window) {
+        completer.complete(false);
+        return;
+      }
+      // 新流连打开都失败（`Failed to open` / 没有可选的流）：位置与余量不会再动，
+      // 等满恢复窗只是白等 —— 真机 20:47 那一轮足足多等了 18 秒才换下一个候选。
+      // 这是"这条镜像不行"的**直接**证词，不需要再观察。
+      if (_openFailedFor(service, since)) {
+        debugPrint(
+          'CDN 自动切换: ${service.desc} 新流没打开，立即收尾本轮',
+        );
         completer.complete(false);
         return;
       }

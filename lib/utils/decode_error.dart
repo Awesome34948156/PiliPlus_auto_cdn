@@ -100,6 +100,39 @@ const List<String> kDecoderSessionFailureSignatures = [
   'output image buffer is null',
 ];
 
+/// 「解码器从 GOP 中间/没有参考帧的状态开始解」的签名 —— **续解族**。
+///
+/// 它既不是 [kDecoderCorruptionSignatures]（字节未必坏），也不是
+/// [kDecoderSessionFailureSignatures]（会话未必被系统作废），而是在
+/// **回前台重建解码器之后**最常见的那一段：`reinitDecoderAfterBackground` 切
+/// hwdec 会清空参考帧池、再 seek 回原位，之后解码器先报这几条，紧接着才是成片的
+/// OBU / 解码报错。2026-10-20 20:47 真机：回前台 0.35s 后先来
+/// `Missing Sequence Header` + `Missing reference frame needed for
+/// show_existing_frame`，随后 68ms 内 153 行 libdav1d 报错。
+///
+/// **只在"回前台续播窗口"里认**（`PlPlayerController._inForegroundResumeWindow`），
+/// 不并进上面两张表：正常 seek 落到 GOP 中间、或镜像真的给了坏字节时，同样的字样
+/// 也可能出现，只有"刚刚重建过本机解码链"这个上下文能让它指向本机。
+const List<String> kDecoderContinuationSignatures = [
+  'missing sequence header',
+  'missing reference frame',
+];
+
+/// 预先转小写的签名表，理由同 [_kDecoderCorruptionSignaturesLower]。
+final List<String> _kDecoderContinuationSignaturesLower =
+    kDecoderContinuationSignatures
+        .map((s) => s.toLowerCase())
+        .toList(growable: false);
+
+/// 这一行是不是「从 GOP 中间/缺参考帧开始解」的续解信号。
+///
+/// ⚠️ 单独看它**没有定罪价值**（见 [kDecoderContinuationSignatures]），必须由
+/// 调用方用"刚重建过本机解码链"的窗口把它框住。
+bool isDecoderContinuationLog(String text) {
+  final lower = text.toLowerCase();
+  return _kDecoderContinuationSignaturesLower.any(lower.contains);
+}
+
 /// 预先转小写的签名表，理由同 [_kDecoderCorruptionSignaturesLower]。
 final List<String> _kDecoderSessionFailureSignaturesLower =
     kDecoderSessionFailureSignatures

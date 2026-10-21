@@ -4,6 +4,23 @@
 > 本报告是**只读勘察**产物，没有改动任何代码。文中所有行号以该提交为准；
 > 代码继续前进后会漂移，复查时优先按**符号名**检索，行号只作起点。
 
+> **状态更新（2026-10-21）**：下面是 `2ecb91f1d` 的快照。之后 Tier A/C 已经落地
+> 一批，以下条目**已经改掉**，照报告动手前先按符号名核对现状：
+>
+> | 报告条目 | 现状 |
+> |---|---|
+> | §2.1 两处匿名 `Timer(3s)` | 已收进 `_errorReloadTimer` 字段，赋值前与 `dispose()` 里都 `cancel()`（`f11e18d6a`） |
+> | §2.2 `volumeTimer` 未随 `dispose()` 取消 | 已补 `volumeTimer?.cancel()`（`f11e18d6a`） |
+> | §3.2 「必须同时改两个字段」的点 | 17 个状态字段已收进 `_CdnSwitchState`，成组写入收成 `beginRound` / `noteSuccess` 等语义方法（`5f03d6519`） |
+> | §3.2 疑似问题 1：`_cdnIsAttached` 只比 `onStall` | 改为 owner token：`cdnSwitchCallbacksOwnedBy(_cdnClaimToken)`，5 个回调原子挂载/撤下（`5f03d6519`） |
+> | §9 附录「两处重复的账本清零」 | 已合为 `_clearDecodeAccounting()`（`8fcaa00f5`） |
+> | §4 分层无护栏 | 已加 `tool/arch_check.dart` ratchet（SCC 内部边数 + 底层→pages 条数，`2f8eba268`） |
+> | §4「DI 应发生在单例内部」的实践缺口 | `DownloadManager` 的 `Dio` 已改构造函数注入（`6594e9c0e`） |
+>
+> **仍然成立**：两个 god object 都**没拆**（Tier B 推迟），§3.2 的
+> `_pickFastestCdn` 470 行、`_cdnAttachedOnce` 不重置、`_cdnAutoAttempts` 双计数
+> 都维持原判；§1 的体量数字只会更大。全文行号仍按 `2ecb91f1d`。
+
 ---
 
 ## 0. 一句话结论

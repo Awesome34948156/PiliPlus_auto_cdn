@@ -8,6 +8,15 @@
 `debugPrint('CDN 自动切换: ...')` 和 `lib/plugin/pl_player/controller.dart` 的
 `debugPrint('CDN 看门狗: ...')`）。
 
+> **字段名已随 Tier C 收敛（2026-10-20）**：原先散在 mixin 上的 `_cdnObjectSize` /
+> `_cdnNoSample` / `_cdnTriedAt` / `_cdnBadHosts` / `_cdnChampionMisses` /
+> `_cdnGeneration` / `_cdnAutoBusy` / `_cdnLastAttemptPos` / `_cdnQuickProbeAt` /
+> `_cdnPreflightSince` / `_cdnProbeTimer` 现在都在 `_CdnSwitchState` 上，读写作
+> `_cdnState.xxx`。`_cdnIsAttached` 仍在，但语义换了：不再是
+> `onStall == _onPlayerStall` 的回调同一性，而是
+> `plPlayerController.cdnSwitchCallbacksOwnedBy(_cdnClaimToken)` 的 owner token 归属。
+> 下文已按新名更新；带日期的真机记录只改名字，不改当时的观测值。
+
 > 状态（2026-10-11 更新，替换掉早先那句"尚未执行"）：
 >
 > - **已通过（真机）**：条目 **8**（相关视频旧页面定时器静音）、条目 **18**
@@ -170,8 +179,8 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 
 ### 1 — 回拖会永久关掉闸门（HIGH）
 
-前置：必须有一轮**"切了但没成功"**的账。`_cdnLastAttemptPos` 只在**切换那一刻**
-置非零（`cdn_switch_mixin.dart` 的 `_cdnLastAttemptPos = stalledAt`），而一轮
+前置：必须有一轮**"切了但没成功"**的账。`_cdnState.lastAttemptPos` 只在**切换那一刻**
+置非零（`cdn_switch_mixin.dart` 的 `_cdnState.lastAttemptPos = stalledAt`），而一轮
 **成功**会把它归零（同文件的 `成功，已切到` 那一行）—— 所以光看到 `第1次 ->`
 **不算数**，必须看到那一轮最终是 `… 未恢复，换下一个候选` → … → `放弃`。
 
@@ -188,7 +197,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 失败：**拖完之后再等多久都没有新的触发行**（不是"出现 `Δ 为负` 的行"，见下）。
 
 ⚠️ `CDN 自动切换: 距上次尝试只推进了 -Ns，忽略` 里 **Δ 为负是打不出来的**：
-代码先做 `if (position < _cdnLastAttemptPos) _cdnLastAttemptPos = Duration.zero`，
+代码先做 `if (position < _cdnState.lastAttemptPos) _cdnState.lastAttemptPos = Duration.zero`，
 紧接着的闸门又要求它非零 —— 两条合起来 Δ 只可能 ≥0，那行只在"位置只推进了 0~2 秒"
 时出现。拿它当本条的失败证据是清单早期版本的笔误（2026-10-11 修正）。
 
@@ -196,20 +205,20 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 
 ### 2 — 换画质 = 新的对象：重新探大小、不出现 416 循环、不毒化死镜像冷却（MEDIUM）
 
-前置：1080P 在播，`_cdnObjectSize` 是大对象长度。记住 `目标偏移 …/<大size> 字节`。
+前置：1080P 在播，`_cdnState.objectSize` 是大对象长度。记住 `目标偏移 …/<大size> 字节`。
 步骤：切画质 1080P→360P（`updatePlayer` → `resetCdnForNewObject`），然后制造卡顿。
 通过：下一轮打印的 `目标偏移 <off>/<新size> 字节` 用的是**新**size；候选行照常出现
 （`… | [<svc>] <r>MB/s …` 或 `无样本`），**不出现**
 `CDN 自动切换: 目标偏移 <off> 越界(416)，放弃本轮`；候选池也不空
-（不出现 `没有可测的候选镜像`）。416 那条 return 在 `_cdnNoSample` 记账**之前**，
+（不出现 `没有可测的候选镜像`）。416 那条 return 在 `_cdnState.noSample` 记账**之前**，
 所以没有镜像被锁 30 分钟。
 失败：整集每轮都以 `越界(416)，放弃本轮` 收尾，随后 `没有可测的候选镜像`
 （死镜像冷却 `CdnTuning.deadRetryAfter` = 30 分钟被毒化了）。
 
 ### 3 — 作废的那一轮不许清忙闸（MEDIUM）
 
-前置：制造一个能拖住的换源（限速下的慢卡顿），使 `_cdnAutoBusy == true` 并已出现 `第1次 ->`。
-步骤：那一轮还在跑时换画质（`resetCdnForNewObject` → `_cdnGeneration++`），再触发一次卡顿。
+前置：制造一个能拖住的换源（限速下的慢卡顿），使 `_cdnState.autoBusy == true` 并已出现 `第1次 ->`。
+步骤：那一轮还在跑时换画质（`resetCdnForNewObject` → `_cdnState.generation++`），再触发一次卡顿。
 通过：后一次触发被**认了** —— 打印触发行 + `第N次 ->`，且永远不出现
 `(busy=true …)` 的 `忽略…` 行。代际不匹配让旧轮的 `whenComplete` 跳过清忙，闸门归新一代。
 失败（少了条目 3）：两轮并发，出现两组交错的 `第N次 ->`。
@@ -270,8 +279,10 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 前置：播一个视频，看着探测节奏（起播后每 2s 一次预检，之后 `定期测速` 每 2 分钟）。
 步骤：从播放页点一个**相关视频**（会 push 第二个 `/videoV`，不关第一个）。
 让新视频起播；等过至少一个旧节奏窗口（≥2 分钟，且越过旧页面的下一次预检轮询）。
-通过：旧页面的定时器在下一拍自我取消 —— `_cdnIsAttached`（`onStall == _onPlayerStall`）
-为假，`_onCdnProbeTick` 取消 `_cdnProbeTimer` 后静默返回。此后**不再**出现
+通过：旧页面的定时器在下一拍自我取消 —— `_cdnIsAttached`
+（现在问的是播放器：`cdnSwitchCallbacksOwnedBy(_cdnClaimToken)`，即那组回调仍登记在本页
+的 owner token 名下；**不再是**旧的 `onStall == _onPlayerStall` 同一性判断）
+为假，`_onCdnProbeTick` 取消 `_cdnState.probeTimer` 后静默返回。此后**不再**出现
 属于前一个视频的 `CDN 自动切换: 预检 @Ns…` / `定期测速 @Ns…`；只剩新页面的节奏。
 失败：新视频在播之后，仍然冒出 `预检`/`定期测速`（或 `第N次 ->`）且播放器用**旧视频的 URL**
 重载 —— 表现为新视频莫名回跳/重载。
@@ -314,7 +325,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 
 ### 11 — 零字节镜像不该被重新排进候选（LOW）
 
-前置：让一个镜像进入 `_cdnNoSample`（某轮它一个字节没到 → `[<svc>] 无样本`）。
+前置：让一个镜像进入 `_cdnState.noSample`（某轮它一个字节没到 → `[<svc>] 无样本`）。
 步骤：同一集里立刻再来一轮（再制造一次卡顿）。
 通过：零字节镜像在放宽的第二遍里被跳过 —— 不出现在下一轮的样本行里；
 只在第 1、2 遍都填不满窗口时才走第 3 遍「全都不管」。有可用候选时不该出现
@@ -322,13 +333,13 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 失败：零字节镜像每轮都被重新排进去，每次白搭两个 3s 超时
 （`CdnTuning.deadRetryAfter` = 30 分钟就是为了防这个）。
 
-### 12 — 换集时 `_cdnQuickProbeAt` 要归零（LOW）
+### 12 — 换集时 `_cdnState.quickProbeAt` 要归零（LOW）
 
-前置：触发一次小卡顿探测，让 `_cdnQuickProbeAt` 打上时间戳（出现 `小卡顿 @Ns…`）。
+前置：触发一次小卡顿探测，让 `_cdnState.quickProbeAt` 打上时间戳（出现 `小卡顿 @Ns…`）。
 步骤：30s 内（`CdnTuning.rebufferCooldown`）换到下一集，再制造一次余量归零。
 通过：新一集的小卡顿打印
 `CDN 自动切换: 小卡顿 @Ns，余量刚归零，后台快速测一轮（快速档 NNNkB × 3，不看缓冲水位）`
-—— 节流被 `resetCdnAutoSwitch` 清了（`_cdnQuickProbeAt = null`）。
+—— 节流被 `resetCdnAutoSwitch` 清了（`_cdnState.quickProbeAt = null`）。
 失败：打印的是 `CDN 自动切换: 小卡顿冷却中（距上次 Ns），只记不测 @Ns`，N < 30 且指的是
 **上一集** —— 新一集开头 30s 的小卡顿全被压住。
 
@@ -501,7 +512,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 >
 > ⚠️ 同一份日志里 `23:03:45.697` 有一轮 `预检 @353s`，**它不是重建带起来的**
 > （早 0.64 s）。机制见条目 8 的 ⚠️ 之外另有一条：`CdnTuning.preflightDeadline`（10s）
-> 到期前你退了后台，iOS 冻住定时器，`_cdnPreflightSince` 就悬着 —— 584 秒后回前台
+> 到期前你退了后台，iOS 冻住定时器，`_cdnState.preflightSince` 就悬着 —— 584 秒后回前台
 > 第一拍 `now - since` 早就过线，于是**补做**了那一次预检。它值钱的前提是"位置还在
 > 起点、换源看不出闪"（见 `_onCdnProbeTick()`），在 **353 秒**处开火时这个前提
 > 已经没了：这时换源就是一次实打实的重载。这一局没造成伤害（基线 4.42MB/s 赢了，
@@ -577,7 +588,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 6s / 快档 `quickMicros` 3s，`cdn_speed_test.dart:30`/`:40`）**之后**才被拿去记账 ——
 也就是相对"读数真正落地的时刻"偏早约几秒（最多探大小 3s + 测速 6s）。受影响的是它喂的
 那几处时间窗：`_cdnRecentlyTried` 的 3 分钟 / 30 分钟（`_pickFastestCdn()`，窗口 `CdnTuning.retryAfter`
-/ `CdnTuning.deadRetryAfter`，见 `cdn_tuning.dart`）、`_cdnTriedAt[service] = now` 的 3 分钟冷却
+/ `CdnTuning.deadRetryAfter`，见 `cdn_tuning.dart`）、`_cdnState.triedAt[service] = now` 的 3 分钟冷却
 （`_pickFastestCdn()`）、`_cdnChampion` 的 6 小时过期（`_pickFastestCdn()` 里对它的调用，窗口 `CdnTuning.recordExpiry`，见 `cdn_tuning.dart`）、
 `_recordCdnSample` 的 30 分钟覆盖与 6 小时过期（`_pickFastestCdn()` 里那次调用，`CdnTuning.recordReset` 见 `cdn_tuning.dart`）。
 **对着这几档窗口，偏早几秒不产生行为差异**（窗口比误差大两三个数量级），所以它是备注、
@@ -593,7 +604,7 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
 —— 代理限速/闪断，或钉一条"测速一读就断"的镜像。最容易撞上的触发是**预检**
 （`预检 @Ns（新视频，在 size×15% 处测一轮，不看缓冲）`）：它是唯一**不看缓冲水位**的触发 ——
 别的触发都得等缓冲先掉下去，那时播放器本来就饿着，落不到本条要考的情形上。它自己等的是
-"缓冲补满（≥21.333s）**或**攒够 10 秒 deadline"（`_onCdnProbeTick()`；`_cdnPreflightSince`
+"缓冲补满（≥21.333s）**或**攒够 10 秒 deadline"（`_onCdnProbeTick()`；`_cdnState.preflightSince`
 只在 `restartCdnProbe(armPreflight: true)` 时清空）。log 18 那局 `since` 从 `01:22:55` 就在攒、
 `01:23:12.942` 只是"选流"重载（不是 `armPreflight`），**所以那次预检大概率是 deadline 先到、
 缓冲还没补满就开测的** —— 不要读成"它故意等缓冲补满才测"。
@@ -1092,7 +1103,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
 
 - **条目 2 的补洞（HIGH）**：一轮测速中间有两次数秒级的 await（探大小、并发测速），期间
   换画质/换集会把这轮作废，但作废的那一轮**仍在往下写** —— 最毒的是把**旧对象**的字节总长
-  写回 `_cdnObjectSize`。它是一次性的（只有 `size == null` 才探），被填回去就整集不再探第二次，
+  写回 `_cdnState.objectSize`。它是一次性的（只有 `size == null` 才探），被填回去就整集不再探第二次，
   此后每轮都拿旧长度算偏移，落到短一截的新对象上必得 416 → `unmeasurable` → 自动换源整集失效。
   查法：换画质那一下之后，`目标偏移 …/<size>` 里的 `size` 必须是**新画质**的长度；若一直沿用
   旧值（或此后每轮都 `越界(416)，放弃本轮`），就是这个洞。现在两处 await 之后都有
@@ -1129,8 +1140,8 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   在回拨后成负数 → 此后每条报错都被当成同一包的副本吞掉，而淘汰条件对未来时刻也不成立
   → 记录清不掉。和条目 16（`recordTooOld`）是同一件事，按同样口径修：负差值算新的，
   落在未来的旧记录清掉。单测 `test/utils/decode_error_test.dart` 里钉住了。
-- **`_cdnTriedAt` 记在作废判断之前（LOW）**：候选冷却在测速**之前**写入，于是作废的那一
-  轮仍会给新对象留下 3 分钟冷却（`_cdnTriedAt` 是刻意为换画质保留的）。已挪到两道作废
+- **`_cdnState.triedAt` 记在作废判断之前（LOW）**：候选冷却在测速**之前**写入，于是作废的那一
+  轮仍会给新对象留下 3 分钟冷却（`_cdnState.triedAt` 是刻意为换画质保留的）。已挪到两道作废
   判断之后。影响本来被三遍候选循环的第三遍（忽略冷却）挡掉大半，所以只是让注释里那句
   "一个字节都不许提交"变成真话。
 - **`disableAudioCDN` 在换源时被忽略（MEDIUM，**既有**，不是这次改出来的）**：音频那条
@@ -1197,18 +1208,18 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`_pickFastestCdn()` 里两处），
   **没有 `_cdnIsAttached`** —— 所以被顶掉多久它都活着。用户 pop 回来 → `didPopNext` 调
   旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:495`），它把 `onStall` 等回调**同步**
-  装回去，`_cdnIsAttached` **立刻又为真**，而 `_cdnGeneration` 从头到尾没动过 ——
+  装回去，`_cdnIsAttached` **立刻又为真**，而 `_cdnState.generation` 从头到尾没动过 ——
   `_roundLive` 于是重新为真。从这一刻到旧页自己的 `playerInit`
   （`view.dart:522`，**没有 await**）把 `setDataSource` 跑完之间（亚秒~几秒），播放器上
   还挂着新页那份媒体。（pop 新页时 `PlPlayerController.dispose()` 在 `_playerCount > 1`
   时只把计数 2→1、**不卸载媒体**，所以那几秒确实还是新页的片。）
-  **修法**：`attachCdnSwitch` 在幂等闸之后 `_cdnGeneration++;`，**并且同时**
-  `_cdnAutoBusy = false;`。后半句不是配套美容，是必须的 —— 一轮收尾那句
-  `if (!isClosed && generation == _cdnGeneration) _cdnAutoBusy = false;`（`_onPlayerStall()` 的 `.whenComplete`）
+  **修法**：`attachCdnSwitch` 在幂等闸之后 `_cdnState.generation++;`，**并且同时**
+  `_cdnState.autoBusy = false;`。后半句不是配套美容，是必须的 —— 一轮收尾那句
+  `if (!isClosed && generation == _cdnState.generation) _cdnState.autoBusy = false;`（`_onPlayerStall()` 的 `.whenComplete`）
   只在代际相同时清 busy，光换代不清就把 busy **永久钉死在真**，此后所有卡顿/探测都被
   `busy=true` 忽略，而 `attachCdnSwitch` 幂等、再也不会进来救它 —— 这一页的自动换源就死透了。
-  **不复用** `resetCdnForNewObject()`：它还会清 `_cdnObjectSize` / `_cdnBadHosts` /
-  `_cdnChampionMisses`，那些对这个**没换过**的视频对象仍然有效（清 `_cdnBadHosts` 等于把
+  **不复用** `resetCdnForNewObject()`：它还会清 `_cdnState.objectSize` / `_cdnState.badHosts` /
+  `_cdnState.championMisses`，那些对这个**没换过**的视频对象仍然有效（清 `_cdnState.badHosts` 等于把
   已知坏的 host 重新放进来）。
   幂等闸正好把换代收窄到「只在真被顶掉过之后」：没被顶掉时 `_cdnIsAttached` 为真、直接早返回，
   不动代（普通关弹层/返回子页就是这条路）。
@@ -1216,7 +1227,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   「被顶掉又回来的那一页，旧一轮不许复活（重挂要作废在途轮）」。卡住旧页那轮的探大小
   请求 → 新页顶进来 → **旧页重新露面** → 放行 → 断言旧页那一轮一个采样都没发。
   修复前实测打出三条 `bytes=60000000-` 采样（基线 + cos/ali/hw 两个候选，整轮测速照跑）；
-  修复后一条不发。两半都单独验过：只删 `_cdnAutoBusy = false;`，第二条断言（重挂之后
+  修复后一条不发。两半都单独验过：只删 `_cdnState.autoBusy = false;`，第二条断言（重挂之后
   新一轮要能起来）红在 `忽略卡顿 @300s (busy=true …)` 上 —— 清忙不是配套美容。
   它和已有的「被顶掉的那一页连兜底重载都不该碰」只差**重新露面**这一步：不露面时
   那一轮本来就该停在 `_autoSwitchLoop()` 那道 `!_cdnIsAttached` 上（那条用例正是钉这个的）。
@@ -1227,6 +1238,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
 - 5、6、7、17 都需要一个**真的坏源**（喂坏字节的镜像/代理）。源码注释里的真实复现是：
   一条 1080P AV1 流，余量 ≈27s、位置一路推进、`hwdec videotoolbox` 正常，同时 mpv 在刷
   解码报错 —— 吞吐、缓冲、位置全是健康的，只有解码器日志看得见这件事。
-- 条目 8 的 `_cdnIsAttached` 靠回调同一性（`plPlayerController.onStall == _onPlayerStall`）；
+- 条目 8 的 `_cdnIsAttached` 靠**回调归属**（`plPlayerController.cdnSwitchCallbacksOwnedBy(
+  _cdnClaimToken)`：那五个回调是否仍登记在本页的 owner token 名下）而不是回调同一性；
   新旧两页都是 `/videoV`，没有页面路径可区分 —— 所以"通过"的证据是旧节奏**消失**，
   而不是某行"已分离"的日志。

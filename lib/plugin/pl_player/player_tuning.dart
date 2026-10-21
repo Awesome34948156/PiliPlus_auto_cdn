@@ -121,6 +121,20 @@ abstract final class PlayerTuning {
   /// 风暴期内 2 秒内必有新的一条续上。
   static const Duration sessionFailDeferBadBytes = Duration(seconds: 2);
 
+  /// 回前台续播后，多长一段窗口里的解码报错算「本机解码链没接上」而不是
+  /// 「镜像给了坏字节」。
+  ///
+  /// 病因是 `reinitDecoderAfterBackground` 自己：切 hwdec 会清空参考帧池，续播
+  /// 位置又在 GOP 中间，解码器于是先报 `Missing Sequence Header` /
+  /// `Missing reference frame`，接着把整段 OBU 都解不出来。2026-10-20 20:47 实测：
+  /// 回前台 0.35s 后 68ms 内 153 行 libdav1d 报错，按坏字节换了源、拉黑了一条
+  /// 健康的 ali。窗口内不再更新 `lastDecoderCorruptionAt`，这些报错改记到会话族，
+  /// 攒够就重建本机解码器（那之后画面确实能回来）。
+  ///
+  /// 取 5s：实测风暴在回前台后 1s 内结束，5s 已留 5 倍余量；再长就会把一条
+  /// **真的**在吐坏字节的镜像多放过几秒。窗口一过，坏字节签名照常定罪换源。
+  static const Duration foregroundResumeWindow = Duration(seconds: 5);
+
   /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
   /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
   /// 后停读，等掉回水位才续读，所以健康播放的锯齿在

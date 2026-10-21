@@ -395,10 +395,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 落在 [PlayerTuning.sessionFailWindow] 里的「本机解码会话废了」的报错时刻，窗口自己滑动
   /// 淘汰。与 [_decodeErrors] 分开记账：两族的窗口、门槛、以及**该做的事**都不同。
+  ///
+  /// 回前台续播的那一段（见 [_inForegroundResumeWindow]）也记在这里：它和硬解会话
+  /// 失效是同一个病（本机解码链需要重建），只是报错的字样不同。
   final List<DateTime> _sessionFailures = [];
 
   /// 重建解码器的冷却截止时刻。见 [PlayerTuning.sessionFailCooldown]。
   DateTime _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 回前台开始续播的时刻；窗口长度见 [PlayerTuning.foregroundResumeWindow]。
+  ///
+  /// 由 [reinitDecoderAfterBackground] 在**发命令之前**置上。窗口内解码器吐出的
+  /// 坏字节签名不算镜像的账：那是切 hwdec / 从 GOP 中间续解的正常产物
+  /// （`Missing Sequence Header` + `Missing reference frame`，紧随其后的是成片的
+  /// OBU 报错），字节本身是好的。2026-10-20 20:47 真机：回前台 0.35s 后 68ms 内
+  /// 153 行 libdav1d 报错，被当成"镜像喂坏字节"强制换源，还把一条健康的 ali 拉黑了。
+  DateTime? _foregroundResumedAt;
+
+  /// 这个 Media 最近一次「根本没打开」的证词（`Failed to open ...` /
+  /// `No video or audio streams selected`）及其原文。
+  ///
+  /// 与 [lastDecoderCorruptionAt] 是两件事：那个是"字节坏"，这个连流都没建起来 ——
+  /// 位置和余量永远不会动。[CdnSwitchMixin] 换源后靠它立刻收尾本轮：既不必等满
+  /// 恢复窗，也不再往一个没打开的播放器上补 seek（真机 20:47 换到 ali 之后
+  /// 连打 5 发补 seek，mpv 全回 `error running command`）。
+  ///
+  /// 每次装载（[setDataSource]）开头清空：上一条流的证词不能算到下一条头上。
+  DateTime? lastOpenFailureAt;
+  String? lastOpenFailure;
 
   /// 换集 / 换画质：换成了**另一个对象**，旧的解码账作废重计。
   ///
@@ -418,6 +442,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     lastDecoderCorruptionAt = null;
     _sessionFailures.clear();
     _sessionHealUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    // 换成另一个视频/画质之后，"回前台续播"这个上下文也作废：新对象的头几秒
+    // 报错该按它自己的镜像算，不能继承上一段续播的豁免。
+    _foregroundResumedAt = null;
   }
 
   /// 全屏方向
@@ -944,6 +971,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }) async {
     try {
       _processing = true;
+      // 新装载：上一条流的「打不开」证词作废。换源时页面拿装载开始时刻比
+      // [lastOpenFailureAt]，清得越早，旧流的晚到报错越不可能算到新镜像头上。
+      lastOpenFailureAt = null;
+      lastOpenFailure = null;
       // 装载会让 buffered 归零，显式重置看门狗：切换可能在 1 s 内结束，
       // ticker 来不及采样到 _processing。
       _resetStallWatchdog();
@@ -1248,6 +1279,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 直接续播会先来一波 `vd: Error while decoding frame (hardware decoding)!`
   /// 掉帧（画面抽动）。趁还在暂停态拨一下 hwdec，会话变新，续播才干净。
   Future<void> reinitDecoderAfterBackground() async {
+    // 先开窗再发命令：命令之后几百毫秒内就会冒出 `Missing Sequence Header` /
+    // `Missing reference frame` + 成片 OBU 报错（真机实测 0.35s），窗口必须在那之前
+    // 生效。软件解码（hw == 'no'）同样要开：从 GOP 中间续解与硬解会话无关。
+    _foregroundResumedAt = DateTime.now();
     final ctr = _videoPlayerController;
     final hw = hwdec;
     if (ctr == null || hw == null || hw == 'no') return;
@@ -1468,6 +1503,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 两边都采等于阈值被砍半。
         _sampleDecodeError(log.text);
         _sampleDecoderSessionFailure(log.text);
+        // 「打开了但一条流都没选中」是"这个 Media 根本没播起来"的另一种说法。
+        // mpv 把它报成 `[fatal] cplayer` 日志而不是 `stream.error` 事件，所以
+        // 只能从这里认。换源后靠它立刻收尾本轮（见 [lastOpenFailureAt]）。
+        if (log.level == 'fatal' &&
+            log.text.contains('No video or audio streams selected')) {
+          _noteOpenFailure(log.text);
+        }
         if (kDebugMode || consoleLogActive) {
           if (log.level == 'error' || log.level == 'fatal') {
             Utils.reportError(
@@ -1483,6 +1525,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 这一条在 release 里原本只走 reportError，日志文件里同样看不到 ——
         // 而它正是"流打不开"的直接证词，先落盘，再走原来的恢复逻辑。
         debugPrint('mpv error: $event');
+        // 记在 return 之前：文件源的 `Failed to open file` 也要留证。
+        if (event.startsWith("Failed to open ")) {
+          _noteOpenFailure(event);
+        }
         if (dataSource is FileSource &&
             event.startsWith("Failed to open file")) {
           return;
@@ -1930,8 +1976,23 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///   **不去重** —— 抓"几十毫秒里挤了几百条"那种短促爆发，也就是去重会把它们
   ///   整段数没的那一档（来由见 [PlayerTuning.decodeErrorDenseBurst]）。
   void _sampleDecodeError(String text, {DateTime? at}) {
-    if (!isDecoderCorruptionLog(text)) return;
     final now = at ?? DateTime.now();
+    // 回前台续播窗口：这一段报错是"本机解码链还没接上"，不是"镜像给了坏字节"。
+    // 两族的动作相反（换源 vs 重建解码器），窗口内一律让位给后者。
+    //
+    // **不能**更新 [lastDecoderCorruptionAt]：换源恢复判据拿它当"新镜像还在吐
+    // 坏字节"的证据，记上的话会把本机续解算到镜像头上，[CdnSwitchMixin] 要么
+    // 判定未恢复继续换，要么把一条健康镜像拉黑。
+    //
+    // 窗口内认两族：坏字节签名（风暴主体）和续解签名（头几行 `Missing Sequence
+    // Header` / `Missing reference frame`，它们本身不是坏字节）。
+    if (_inForegroundResumeWindow(now)) {
+      if (isDecoderCorruptionLog(text) || isDecoderContinuationLog(text)) {
+        _noteForegroundResumeFailure(now);
+      }
+      return;
+    }
+    if (!isDecoderCorruptionLog(text)) return;
     // 不受静默期限制的"最后一次坏字节"时刻：给换源后的干净窗口判据用。
     lastDecoderCorruptionAt = now;
     // 记账（含窗口淘汰与同包去重）在 [recordDecodeErrorHit] 里，是纯函数。
@@ -1982,6 +2043,51 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         !listener(videoPlayerController?.state.position ?? Duration.zero)) {
       _decodeErrorUntil = now.add(PlayerTuning.decodeErrorRetryBackoff);
     }
+  }
+
+  /// 这一次采样是不是落在回前台续播窗口里（见 [_foregroundResumedAt]）。
+  ///
+  /// [now] 早于窗口起点（测试用的假时钟）时不算：那种情况没法判断"过了多久"。
+  bool _inForegroundResumeWindow(DateTime now) {
+    final start = _foregroundResumedAt;
+    return start != null &&
+        !now.isBefore(start) &&
+        now.difference(start) < PlayerTuning.foregroundResumeWindow;
+  }
+
+  /// 记下一条"这个 Media 根本没打开"的证词。
+  ///
+  /// 只存时刻与原文，动作在页面那边：换源途中才需要立刻收尾，正常播放时
+  /// `stream.error` 原有的重载路径照旧（两条互不干扰）。
+  void _noteOpenFailure(String text, [DateTime? at]) {
+    lastOpenFailureAt = at ?? DateTime.now();
+    lastOpenFailure = text;
+  }
+
+  /// 回前台续播窗口里的解码报错：记进**会话族**，攒够就重建本机解码器。
+  ///
+  /// 与 [_sampleDecoderSessionFailure] 共用账本和冷却，但**不走它那几道闸门**
+  /// （`isBuffering` / `bufferedAhead <= 0` / `isSeeking`）：回前台第一拍这几样
+  /// 恰恰全是"不健康"的样子（实测 `重新缓冲 true`、余量归零），而那正是要抓的
+  /// 现场。闸门在这里放行是安全的 —— 窗口只有 [PlayerTuning.foregroundResumeWindow]
+  /// 那么长，且来源被限定为"刚重建过解码链"。
+  void _noteForegroundResumeFailure(DateTime now) {
+    if (!recordDecodeErrorHit(
+      _sessionFailures,
+      now,
+      window: PlayerTuning.sessionFailWindow,
+      burst: PlayerTuning.sessionFailBurst,
+      lineDedupe: PlayerTuning.decodeLineDedupe,
+    )) {
+      return;
+    }
+    if (now.isBefore(_sessionHealUntil)) return;
+    _sessionHealUntil = now.add(PlayerTuning.sessionFailCooldown);
+    debugPrint(
+      'CDN 看门狗: 回前台续播仍在刷解码报错（${PlayerTuning.sessionFailWindow.inSeconds}s 内 '
+      '${PlayerTuning.sessionFailBurst} 条），本机解码链没接上 —— 重建解码器',
+    );
+    refreshPlayer();
   }
 
   /// 硬解会话失效的采样：攒够 [PlayerTuning.sessionFailBurst] 条就**重建本机解码器**。
@@ -2283,6 +2389,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   void debugSampleDecodeError(String text, DateTime at) =>
       _sampleDecodeError(text, at: at);
+
+  /// 把"回前台续播窗口"的起点摆到指定时刻。
+  ///
+  /// 生产路径里它由 [reinitDecoderAfterBackground] 置上，而那条路径要在测试里
+  /// 真的走一遍 hwdec 命令；窗口判据本身只跟时刻有关，所以直接把起点摆出来。
+  @visibleForTesting
+  void debugNoteForegroundResume(DateTime at) => _foregroundResumedAt = at;
 
   /// 统计"缓冲归零"的上升沿 —— 即加载中转圈出现的次数。
   ///
