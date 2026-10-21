@@ -777,6 +777,9 @@ mixin CdnSwitchMixin on GetxController {
       what: what,
       quick: trigger == _CdnTrigger.rebuffer,
       force: trigger == _CdnTrigger.decode,
+      // 只有「测速顺手发现」这两档才等视频链热起来（见 [CdnTuning.postResumeSettle]）。
+      opportunistic:
+          trigger == _CdnTrigger.probe || trigger == _CdnTrigger.preflight,
     ).whenComplete(() {
       // 只清**本代**的闸。中途换集/换画质会 generation++，那一轮已经作废，而新的
       // 一轮（新代）可能已经把 busy 置真 —— 陈旧的这里不能把它清掉，否则会出现
@@ -997,6 +1000,32 @@ mixin CdnSwitchMixin on GetxController {
   @visibleForTesting
   bool? debugForceCdnBackground;
 
+  /// 测试用：把视频链冷静期压短，别让用例真的等满 [CdnTuning.postResumeSettle]。
+  @visibleForTesting
+  Duration? debugPostResumeSettle;
+
+  /// 视频链刚重建的那几秒里，解码器/渲染链还是冷的：这时候换源，新流的首帧
+  /// 要等它重新热起来（真机 22:10:47 实测 1.15s，稳态 mid-GOP 只要 0.55s），
+  /// 换源静音就从常态 ~1.8s 拖成 2.5s。让「测速顺手发现」的档等这一拍再换。
+  ///
+  /// 只延迟、不重测也不改落点：回来之后调用方自己复查这一轮是否还作废。
+  Future<void> _awaitVideoChainWarm() async {
+    final since = plPlayerController.videoChainRebuiltAt;
+    if (since == null) return;
+    final now = DateTime.now();
+    // 假时钟/时钟回拨时判断不了"过了多久"，不冒这个险。
+    if (now.isBefore(since)) return;
+    final elapsed = now.difference(since);
+    final wait =
+        (debugPostResumeSettle ?? CdnTuning.postResumeSettle) - elapsed;
+    if (wait <= Duration.zero) return;
+    debugPrint(
+      'CDN 自动切换: 视频链刚重建 ${elapsed.inMilliseconds}ms，'
+      '等 ${wait.inMilliseconds}ms 再换（避免新解码器冷启动）',
+    );
+    await Future<void>.delayed(wait);
+  }
+
   /// 页面销毁：只撤掉自己的回调，别把新页面的覆盖掉。
   void detachCdnSwitch() {
     // 先记下自己是不是现役页：下面把回调置空之后 _cdnIsAttached 就成了假，
@@ -1156,6 +1185,7 @@ mixin CdnSwitchMixin on GetxController {
     required String what,
     bool quick = false,
     bool force = false,
+    bool opportunistic = false,
   }) async {
     var switched = false;
     // 记录本轮测到过的最好候选速率，用来判断"镜像没问题，是别处卡"。
@@ -1235,6 +1265,19 @@ mixin CdnSwitchMixin on GetxController {
           'CDN 自动切换: 在后台，推迟换到 ${chosen.desc}（换源会重载播放器、断音）',
         );
         return;
+      }
+
+      // 「测速顺手发现更快」本来就等得起：视频链刚重建过（回前台重挂视频轨 /
+      // 重建硬解会话）时先让它热起来再换。真卡住的档不走这里，见
+      // [CdnTuning.postResumeSettle] 的实测拆解。
+      if (opportunistic) {
+        await _awaitVideoChainWarm();
+        if (_roundVoided(generation) ||
+            isClosed ||
+            isQuerying ||
+            !_cdnIsAttached) {
+          return;
+        }
       }
 
       debugPrint(

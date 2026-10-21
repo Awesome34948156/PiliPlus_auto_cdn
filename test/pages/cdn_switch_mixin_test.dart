@@ -1970,6 +1970,105 @@ void main() {
       reason: '换了集就不该再补做上一集判定出的换源：\n${log.text}',
     );
   });
+
+  test('视频链刚重建：预检档先等它热起来，等完照样把源换掉', () async {
+    // 真机 2026-10-21 22:10:47：回前台原地重挂视频轨才 1.3 秒，预检就换了源，
+    // 解码器/渲染链还是冷的 —— 出首帧从稳态 0.55s 拖到 1.15s，整段静音 2.5s
+    // （常态约 1.8s）。「测速顺手发现」本来就等得起：先等
+    // [CdnTuning.postResumeSettle] 再换（见 `_awaitVideoChainWarm`）。
+    hostA.attachCdnSwitch();
+    // 顺序要紧：attach 会复位解码账（连同"回前台"那个起点），摆冷链必须放在它后面。
+    PlPlayerController.getInstance()
+      ..debugNoteForegroundResume(DateTime.now())
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 60
+      ..buffer['demuxer-hysteresis-secs'] = '30'
+      ..buffer['cache-secs'] = '30';
+
+    // 预检那一拍在挂载后 2 秒到；冷静期压到 4 秒，实际只等约 2 秒，用例不用
+    // 真的等满 3 秒。
+    hostA.debugPostResumeSettle = const Duration(seconds: 4);
+
+    await _waitFor(
+      () => hostA.initCalls == 1,
+      timeout: const Duration(seconds: 20),
+    );
+    expect(
+      log.has('视频链刚重建'),
+      isTrue,
+      reason: '冷链上的预检直接换了源，没等视频链热起来：\n${log.text}',
+    );
+    final waitAt = log.lines.indexWhere((l) => l.contains('视频链刚重建'));
+    expect(log.lines[waitAt], contains('再换（避免新解码器冷启动）'));
+    expect(
+      log.lines.indexWhere((l) => l.contains('第1次 ->')),
+      greaterThan(waitAt),
+      reason: '先换了源、后打等待那行 —— 判据是反的：\n${log.text}',
+    );
+  });
+
+  test('视频链没刚重建（没有记录 / 很久以前）：不等待，立刻换', () async {
+    PlPlayerController.getInstance()
+      ..playerStatus = PlayerStatus.playing
+      ..position.value = 0
+      ..buffered.value = 60
+      ..buffer['demuxer-hysteresis-secs'] = '30'
+      ..buffer['cache-secs'] = '30';
+
+    // 第一轮：根本没有重建记录（attach 刚把窗口复位成空）。
+    hostA.attachCdnSwitch();
+    await _waitFor(
+      () => hostA.initCalls == 1,
+      timeout: const Duration(seconds: 20),
+    );
+    expect(
+      log.has('视频链刚重建'),
+      isFalse,
+      reason: '没有重建记录还等了 —— 白白延后一次换源：\n${log.text}',
+    );
+
+    // 第二轮：很久以前重建过，视频链早就热了。
+    log.clear();
+    hostB.attachCdnSwitch(); // 又会复位窗口，记录要摆在这之后
+    PlPlayerController.getInstance().debugNoteForegroundResume(
+      DateTime.now().subtract(const Duration(minutes: 10)),
+    );
+    await _waitFor(
+      () => hostB.initCalls == 1,
+      timeout: const Duration(seconds: 20),
+    );
+    expect(
+      log.has('视频链刚重建'),
+      isFalse,
+      reason: '重建是十分钟前的事了，不该还等：\n${log.text}',
+    );
+  });
+
+  test('卡顿档撞上冷链也不等：真卡住时多等就是白让用户看着卡', () async {
+    // 冷静期只给「测速顺手发现」两档（probe / preflight），其余照旧立刻换。
+    // 这条用例就是那个否定的否定：同样冷链，从卡顿口进来不许出现等待那行。
+    hostA.attachCdnSwitch();
+    PlPlayerController.getInstance()
+      ..debugNoteForegroundResume(DateTime.now())
+      ..playerStatus = PlayerStatus.playing;
+
+    _stall(hostA);
+    await _waitFor(
+      () => hostA.initCalls == 1,
+      timeout: const Duration(seconds: 20),
+    );
+    expect(
+      log.has('第1次 ->'),
+      isTrue,
+      reason: '这一轮没走到换源，用例前提不成立：\n${log.text}',
+    );
+    expect(
+      log.has('视频链刚重建'),
+      isFalse,
+      reason: '卡顿档也等了 —— 真卡住时这是白让用户看着卡：\n${log.text}',
+    );
+  });
 }
 
 /// 判据 3 的连续采样拍数（`controller.dart:PlayerTuning.starveSeconds`）。只用在失败原因里，

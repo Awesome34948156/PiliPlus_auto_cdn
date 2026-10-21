@@ -461,6 +461,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 153 行 libdav1d 报错，被当成"镜像喂坏字节"强制换源，还把一条健康的 ali 拉黑了。
   DateTime? _foregroundResumedAt;
 
+  /// 视频链最近一次重建的时刻（[reinitDecoderAfterBackground] / [_reloadVideoTrack]）。
+  ///
+  /// 换源侧用它避开「解码器刚起来、还是冷的」那一小段：2026-10-21 真机
+  /// 22:10:46.2 回前台重挂视频轨，47.5 预检就换源，新解码器冷启动出首帧花了
+  /// 1.15s（稳态 mid-GOP 约 0.55s），换源静音从常态 ~1.8s 拖到 2.5s。
+  /// 见 [CdnTuning.postResumeSettle]。换集/换画质时 [_clearDecodeAccounting]
+  /// 会清成 null —— 那时候是另一条视频，谈不上"刚重建"。
+  DateTime? get videoChainRebuiltAt => _foregroundResumedAt;
+
   /// 这个 Media 最近一次「根本没打开」的证词（`Failed to open ...` /
   /// `No video or audio streams selected`）及其原文。
   ///

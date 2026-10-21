@@ -94,6 +94,19 @@ abstract final class CdnTuning {
   /// 换源重载后，落点离目标多远之内算"还在原处"，不必补 seek。
   static const Duration resumeTolerance = Duration(seconds: 5);
 
+  /// 视频链刚重建（回前台重挂视频轨 / 重建硬解会话）后的冷静期：
+  /// **这段时间里不因为「测速顺手发现更快」去换源**，等视频链真的热起来。
+  ///
+  /// 2026-10-21 真机 22:10:47 现场拆解：换源本身常态约 1.8 秒（打开两个分段
+  /// 0.84s + 跳续播点 0.43s + 出首帧 0.55s），可那一次是回前台 1.3 秒就换源，
+  /// 解码器/渲染链都还是冷的 —— 出首帧花了 1.15 秒，整段静音拖成 2.5 秒。
+  /// 3 秒 = 重建后留出首帧 + 播稳的余量（同一局里重建后约 1.5 秒画面才回来，
+  /// 再留一倍）。只延迟、不重测，所以超一点也不会拖黄这一轮。
+  ///
+  /// **只管 probe / preflight 两档**：真卡住（stall/starve/rebuffer/decode/diverged）
+  /// 时多等就是白让用户看着卡，那些档照旧立刻换。
+  static const Duration postResumeSettle = Duration(seconds: 3);
+
   /// 落点检查的轮询间隔与最多补几次 seek。
   ///
   /// 8 × 800ms ≈ 6.4s 不是随手取的：重载后 duration 要过几秒才知道，而
