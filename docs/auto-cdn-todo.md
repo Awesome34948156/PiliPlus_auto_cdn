@@ -10,8 +10,9 @@
 > 评审 §2 已验七条、F13、两条跳过闸门、幕 1、`5d1e7eba8`、iCloud 三条、探针两条、L14 结案）。
 > 行号会随重构漂移，复查时优先按符号名检索。
 >
-> 日志从 iCloud `Downloads/ForpiliLog/pili-console.log` 取；**直连手机拿得到当前那份，
-> iCloud 只在退后台那一刻同步、常落后十几分钟**（命令见记忆 `auto-cdn-on-device-log-pull`）。
+> 日志：**在家就直连手机取当前那份**（`xcrun devicectl device copy from …`，命令与
+> AltSign 后缀见记忆 `auto-cdn-on-device-log-pull`）；iCloud 的
+> `Downloads/ForpiliLog/pili-console.log` 只在退后台那一刻同步、常落后十几分钟，作补充。
 
 ## 下一件（要写码）
 
