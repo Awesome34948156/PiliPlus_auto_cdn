@@ -21,6 +21,7 @@ import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/background_video_suspend.dart';
 import 'package:PiliPlus/plugin/pl_player/health/decode_ledger.dart';
 import 'package:PiliPlus/plugin/pl_player/health/no_video_track_detector.dart';
+import 'package:PiliPlus/plugin/pl_player/health/playback_watchdog.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/double_tap_type.dart';
@@ -40,7 +41,6 @@ import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/asset_utils.dart';
-import 'package:PiliPlus/utils/decode_error.dart';
 import 'package:PiliPlus/utils/device_utils.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/extension/box_ext.dart';
@@ -121,10 +121,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 判据见 [PlayerTuning.divergedFactor]。这是"只有声音、画面冻住"唯一可靠的信号 ——
   /// 那时位置由音频时钟推着走、[buffered] 被音频轨抬到上千秒、[isBuffering]
   /// 是假，判据 1、2 都看不见，判据 3 的"趴在低位"也只防了反的一侧。
-  bool get telemetryDiverged {
-    final limit = _divergedAheadSec;
-    return limit > 0 && bufferedAhead > limit;
-  }
+  bool get telemetryDiverged => _watchdog.telemetryDiverged;
 
   final RxInt duration = RxInt(0);
 
@@ -257,7 +254,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ValueChanged<Duration>? onTelemetryDiverged;
 
   /// 最敏感的一条：前向余量**一归零**就上报一次（每次归零只报一次，补回来
-  /// 才重新武装）。前三条判据都要等 —— [onStall] 等 8 秒冻结、[_sampleRebuffer]
+  /// 才重新武装）。前三条判据都要等 —— [onStall] 等 8 秒冻结、
+  /// [PlaybackWatchdog.sampleRebuffer]
   /// 攒够 [PlayerTuning.rebufferTrigger] 次、[onBufferStarve] 连续 [PlayerTuning.starveSeconds] 秒低于
   /// 阈值 —— 而"卡一下又接着播"这种小卡顿一条都凑不满，等凑满时用户已经看了
   /// 半分钟转圈。这里只报事实，节流与"要不要真去测速"由页面决定（测速会跟
@@ -279,7 +277,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///
   /// **返回值是回执**：`false` = 页面现在收不下这一发（有一个换源/换画质轮次
   /// 在途）。解码错误是**唯一一次性消费**的上报 —— 播放器在回调前就清空计数
-  /// 窗口并武装 30s 静默（见 [_sampleDecodeError]），所以页面回 `false` 时必须
+  /// 窗口并武装 30s 静默（见 [DecodeLedger.sampleCorruption]），所以页面回 `false` 时必须
   /// 保住它、稍后重发，否则这一发就永远丢了（2026-10-12 真机冻屏的成因）。
   /// 真机取证与背景见 `lib/pages/video/cdn_switch_mixin.dart` 里
   /// `_CdnTrigger.decode` 附近的注释。
@@ -358,19 +356,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Timer? _stallTicker;
   int _stallLastSecond = 0;
   int _stallFrozen = 0;
-  final List<DateTime> _rebufferEvents = [];
-  DateTime _rebufferSuppressUntil = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _wasStalled = false;
 
-  /// 余量是否已经归零过（[onRebuffer] 的上升沿去重）。
-  bool _wasEmpty = false;
-  int _starveSeconds = 0;
-
-  /// 当前这段饥饿的最后一次上报时刻；null = 没有正在上报的饥饿段。
+  /// 卡顿看门狗的账本与两条采样判据（缓冲归零、缓冲饥饿/遥测失真）。
   ///
-  /// 兼作去重状态：非空即"这段已经报过"，只有余量真的涨回水位才清空（见
-  /// [_sampleStarve]）。存时刻而不是 bool 是为了补报 —— 见 [PlayerTuning.starveRepeat]。
-  DateTime? _starveLastReportAt;
+  /// 2026-10-22 评审 Phase 5 / S3 整块搬出，见 [PlaybackWatchdog]。
+  /// ticker、8 秒冻结判据与心跳行仍在本文件（评审 S4 未做）。
+  late final PlaybackWatchdog _watchdog = PlaybackWatchdog(
+    _PlaybackWatchdogHostAdapter(this),
+  );
+
   DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 解码账本（两族报错的窗口、冷却、回前台两个时间窗）。
@@ -2062,8 +2056,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
               // 只取 [bufferedAhead] 这一条，**不复用** `|| telemetryDiverged`——
               // 这不是取舍，是等价：直播的 mpv 配置走 [liveBuffer]（只有
               // demuxer-max-bytes、没有 `cache-secs`），而 [telemetryDiverged] 读的
-              // 就是 `cache-secs`：拿不到 → 阈值 `_divergedAheadSec` 恒为 0 → 该
-              // getter 对直播**恒为 false**（`limit > 0` 短路，见其定义）。写全
+              // 就是 `cache-secs`：拿不到 → 阈值恒为 0 → 该
+              // getter 对直播**恒为 false**（`limit > 0` 短路，见
+              // [PlaybackWatchdog.telemetryDiverged]）。写全
               // `|| telemetryDiverged` 不改变结果，但会让读者以为这条路上也在防
               // "遥测失真"，故省略、只留真正起作用的那半。
               //
@@ -2524,9 +2519,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///
   /// 1. 位置连续 [PlayerTuning.stallSeconds] 秒没有推进，再以 [isBuffering] 作确认。
   ///    不能只看 [isBuffering] —— 普通重新缓冲也会让它为 true，会造成切换风暴。
-  /// 2. [_sampleRebuffer]：窗口内缓冲归零的上升沿达到 [PlayerTuning.rebufferTrigger] 次。
+  /// 2. [PlaybackWatchdog.sampleRebuffer]：窗口内缓冲归零的上升沿达到 [PlayerTuning.rebufferTrigger] 次。
   ///    判据 1 看不到反复小卡顿（位置一恢复就清零），由判据 2 补上。
-  /// 3. [_sampleStarve]：前向缓冲长期趴在低位。判据 1、2 都要求 buffered 归零，
+  /// 3. [PlaybackWatchdog.sampleStarve]：前向缓冲长期趴在低位。判据 1、2 都要求 buffered 归零，
   ///    而 mpv 有 cache-secs 打底、换源型卡顿时位置又由音频时钟推着走，
   ///    两者都见不到"余量在变少"——这条只看 [buffered]，是唯一的早期信号。
   ///
@@ -2553,7 +2548,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         _lastHeartbeat = now;
         debugPrint(
           'CDN 看门狗: 余量 ${bufferedAhead}s 阈值 '
-          '${_starveThresholdSec.toStringAsFixed(1)}s 位置 ${position.value}s '
+          '${_watchdog.starveThresholdSec.toStringAsFixed(1)}s 位置 ${position.value}s '
           '(cache-time ${buffered.value}s) 播放中 ${playerStatus.isPlaying} '
           '重新缓冲 ${isBuffering.value} seek中 ${isSeeking.value} '
           '换源中 $_processing '
@@ -2577,21 +2572,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _processing) {
         // seek 和换源本身就会让缓冲归零，静默一段，别把自己的动作记成卡顿。
         if (isSeeking.value || _processing) {
-          _armRebufferSuppress();
+          _watchdog.armSuppress();
         }
         _stallLastSecond = position.value;
         _stallFrozen = 0;
-        // 这里刻意不整套换成 [_disarmTriggers]：它连 [_wasEmpty] 一起清，
-        // 而暂停正好停在一次卡顿中间时，恢复后的第一次归零不该被当成新的一次。
-        // [_wasEmpty] 只在真正的装载边界和静默期起点重置。
-        _wasStalled = false;
-        _starveSeconds = 0;
-        // 换源后是全新一轮，允许再报一次。
-        _starveLastReportAt = null;
+        _watchdog.relaxTriggers();
         return;
       }
-      _sampleRebuffer(now);
-      _sampleStarve(now);
+      _watchdog
+        ..sampleRebuffer(now)
+        ..sampleStarve(now);
       if (position.value != _stallLastSecond) {
         _stallLastSecond = position.value;
         _stallFrozen = 0;
@@ -2613,168 +2603,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void _resetStallWatchdog() {
     _stallLastSecond = position.value;
     _stallFrozen = 0;
-    _rebufferEvents.clear();
-    _armRebufferSuppress();
-  }
-
-  /// 重新武装三条判据的去重状态，效果等同于刚装载。
-  ///
-  /// 静默期的含义是"这段时间里的归零一律不算数"：只要进入静默时不把"已归零/
-  /// 已上报"的记录一并清掉，静默结束后的第一次归零就会被读成"还没报过"。
-  /// 两个采样函数因此只在静默期内返回，武装统一收敛到这里。
-  void _disarmTriggers() {
-    _wasStalled = false;
-    _wasEmpty = false;
-    _starveSeconds = 0;
-    _starveLastReportAt = null;
-  }
-
-  /// 进入/推进静默期。任何一次装载（开播、换源、换 P、切换 CDN）以及 seek
-  /// 都会让缓冲归零，必须先把这段时间静音掉，否则等长冻结判据会把自己的动作
-  /// 读成卡顿。
-  void _armRebufferSuppress() {
-    _rebufferSuppressUntil = DateTime.now().add(PlayerTuning.rebufferSuppress);
-    _disarmTriggers();
-  }
-
-  /// 饥饿阈值：mpv 回填水位（`demuxer-hysteresis-secs`）的
-  /// [PlayerTuning.starveFloorFraction]。低于 [PlayerTuning.starveMinSeconds] 视为没有观测余量，
-  /// 返回 0 表示不启用。
-  ///
-  /// 取值要从 mpv 真正拿到的 [buffer] 里读，而不是用当前倍速重算：`buffer` 是
-  /// 首次装载时定下的 late final，[setPlaybackSpeed] 不会重建它，两者会不一致
-  /// （例如按 1x 装载后改成 2x，水位仍是按 1x 算的，而缓冲消耗速度已翻倍）。
-  double get _starveThresholdSec {
-    final floor = double.tryParse(buffer['demuxer-hysteresis-secs'] ?? '') ?? 0;
-    final threshold = floor * PlayerTuning.starveFloorFraction;
-    return threshold < PlayerTuning.starveMinSeconds ? 0 : threshold;
-  }
-
-  /// 是否已进入片尾 —— 剩余时长不足 [_starveThresholdSec]。
-  ///
-  /// 判据 2（[bufferedAhead] 归零的上升沿）和判据 3（缓冲饥饿）在片尾都
-  /// **必然**成立，跟网速多快无关：[bufferedAhead] 是
-  /// `demuxer-cache-time - position`，而 cache-time 不可能超过文件总长，所以
-  /// `bufferedAhead <= 剩余时长` 恒成立 —— 播放位置一进最后 `threshold` 秒，
-  /// 余量就必定掉到阈值以下并最终归零。片尾也无源可换（没有剩余数据要下）。
-  ///
-  /// 实测两次误报都严丝合缝卡在这个边界上：145.403s 的视频从 133s 起计数
-  /// （剩余 12.4s）误报 `缓冲饥饿`、@145s 误报 `余量归零`；95.712s 的视频
-  /// 分别在 83s（剩余 12.7s）和 @95s 各一次。
-  ///
-  /// 用 `<` 而不是 `<=`：position / duration 都是整秒，剩余 13s 时余量真的
-  /// 低于阈值仍是有效观测，只放过可证明为假的那一档。duration 为 0（直播 /
-  /// 时长未知）时返回 false —— 那类流没有片尾。
-  bool get _atFileTail {
-    final threshold = _starveThresholdSec;
-    if (threshold <= 0 || duration.value <= 0) return false;
-    return duration.value - position.value < threshold;
-  }
-
-  /// 失真阈值：mpv 缓存上限 `cache-secs` 的 [PlayerTuning.divergedFactor] 倍。读不到就
-  /// 不启用（返回 0）—— 直播走的是 [liveBuffer]，压根没有这个键，本地点播
-  /// 文件更是 `cache: no`，两者的 `demuxer-cache-time` 语义本来也不同，不该
-  /// 套这条判据。跟 [_starveThresholdSec] 用"返回 0 表示不启用"是同一套约定。
-  double get _divergedAheadSec {
-    final cache = double.tryParse(buffer['cache-secs'] ?? '') ?? 0;
-    return cache > 0 ? cache * PlayerTuning.divergedFactor : 0;
-  }
-
-  /// 判据 3：只盯 [bufferedAhead]，不看位置也不要求 [isBuffering]——换源型卡顿
-  /// 时位置一直在推进，core-idle / paused-for-cache 也未必为真。两头都要防：
-  /// 余量长期趴在低位是"供不上"，余量涨到 [telemetryDiverged] 是"遥测被音频
-  /// 拖走了"，后者正是"只有声音、画面冻住"。
-  ///
-  /// 每段饥饿只上报一次，直到缓冲真的补回 mpv 自己的水位才算结束；**但那一段
-  /// 还没结束时每 [PlayerTuning.starveRepeat] 补报一次**（理由是坏镜像让"结束"永不发生，
-  /// 见 [PlayerTuning.starveRepeat]）。
-  ///
-  /// **片尾必须放行**：`bufferedAhead` 的上界就是剩余时长，所以视频最后
-  /// `threshold` 秒里这条判据*必然*成立，跟网速多快无关（推导见 [_atFileTail]）。
-  void _sampleStarve(DateTime now) {
-    final threshold = _starveThresholdSec;
-    // 静默期内不采样：加载/换源/seek 之后 buffered 本来就是 0。去重状态在
-    // 进入静默的那一处就重新武装好了（见 [_armRebufferSuppress]）。
-    if (threshold <= 0 || now.isBefore(_rebufferSuppressUntil)) return;
-    // 片尾放行：推导见 [_atFileTail]。归零是为了不让这点残数被 seek 回中段
-    // 之后接着用。
-    if (_atFileTail) {
-      _starveSeconds = 0;
-      return;
-    }
-    if (bufferedAhead < threshold) {
-      if (++_starveSeconds < PlayerTuning.starveSeconds) return;
-      if (!_starveReportDue(now)) return;
-      final repeat = _starveLastReportAt != null;
-      _starveLastReportAt = now;
-      debugPrint(
-        repeat
-            ? 'CDN 缓冲饥饿: 仍在饥饿，再次上报（余量 ${bufferedAhead}s < '
-                  '${threshold.toStringAsFixed(1)}s）@${position.value}s'
-            : 'CDN 缓冲饥饿: 前方余量 ${bufferedAhead}s < '
-                  '${threshold.toStringAsFixed(1)}s (连续 ${PlayerTuning.starveSeconds} s) '
-                  '@${position.value}s',
-      );
-      onBufferStarve?.call(
-        videoPlayerController?.state.position ?? Duration.zero,
-      );
-      return;
-    }
-    _starveSeconds = 0;
-    // 余量涨到失真：音频在走、画面冻着。`demuxer-cache-time` 被音频轨抬离了
-    // 播放位置，余量因此超过缓存上限好几倍 —— 位置还在推进、[isBuffering]
-    // 也是假，判据 1、2 都看不见，只有这里能拦住。同样每段只报一次（可按
-    // [PlayerTuning.starveRepeat] 补报，跟上面那条共用一个去重状态）。
-    //
-    // 出口是 [onTelemetryDiverged]，**不是**上面那条低水位支走的 [onBufferStarve]：
-    // 两副面孔的恢复手段不同，理由见那个字段。
-    if (telemetryDiverged) {
-      if (!_starveReportDue(now)) return;
-      final repeat = _starveLastReportAt != null;
-      _starveLastReportAt = now;
-      debugPrint(
-        repeat
-            ? 'CDN 遥测失真: 仍在失真（余量 ${bufferedAhead}s）'
-                  '@${position.value}s'
-            : 'CDN 遥测失真: 余量 ${bufferedAhead}s 超过缓存上限 '
-                  '${_divergedAheadSec.toStringAsFixed(1)}s 的 '
-                  '${PlayerTuning.divergedFactor}x (音频在走，画面已冻) @${position.value}s',
-      );
-      onTelemetryDiverged?.call(
-        videoPlayerController?.state.position ?? Duration.zero,
-      );
-      return;
-    }
-    // 只有补回 mpv 自己的水位才算这段饥饿真的结束了。
-    if (bufferedAhead >= threshold / PlayerTuning.starveFloorFraction) {
-      if (_starveLastReportAt != null) {
-        debugPrint('CDN 缓冲饥饿: 已恢复 (${bufferedAhead}s)');
-      }
-      _starveLastReportAt = null;
-    }
-  }
-
-  /// 该不该就"还在挨饿"这件事再出声一次：没报过，或者距上次已过 [PlayerTuning.starveRepeat]。
-  ///
-  /// `now.isBefore(last)` 是系统时钟回拨（NTP 校时、用户改表）的护栏：回拨后差值
-  /// 恒为负，这段**持续饥饿**的补报会一直不满足，整段盲掉。同文件的
-  /// [recordDecodeErrorHit] 与页面侧的 `_awaitVideoChainWarm` 都有这条护栏。
-  bool _starveReportDue(DateTime now) {
-    final last = _starveLastReportAt;
-    return last == null ||
-        now.isBefore(last) ||
-        now.difference(last) >= PlayerTuning.starveRepeat;
+    _watchdog.reset();
   }
 
   /// 测试缝：判据 3 的一拍。
   ///
-  /// [_sampleStarve] 本身不需要播放器（只看 `now` 和 [buffered] / [position] /
-  /// [duration] 这几个公开字段），但驱动它的 1s ticker 在测试里跑不起来
+  /// [PlaybackWatchdog.sampleStarve] 本身不需要播放器（只看 `now` 和 buffered / position /
+  /// duration 这几个公开字段），但驱动它的 1s ticker 在测试里跑不起来
   /// （[_startStallTicker] 要真播放器，见 `_startListeners`）。所以把这一拍直接
   /// 暴露出来，让"持续饥饿必须补报"这条有测试盯着 —— 它是这一片的盲区里少数
   /// 能被钉住的东西。生产代码不走这里。
   @visibleForTesting
-  void debugSampleStarve(DateTime now) => _sampleStarve(now);
+  void debugSampleStarve(DateTime now) => _watchdog.sampleStarve(now);
 
   @visibleForTesting
   void debugSampleDecodeError(String text, DateTime at) =>
@@ -2812,52 +2652,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 会话族账本里还留着几条（[PlayerTuning.sessionFailWindow] 之内）。
   @visibleForTesting
   int get debugSessionFailureCount => _decodeLedger.sessionFailureCount;
-
-  /// 统计"缓冲归零"的上升沿 —— 即加载中转圈出现的次数。
-  ///
-  /// 必须数上升沿而不是数采样：`buffered` 每次 stream.buffer 推送都会重写，
-  /// 一秒内可能变几十次，数零值会把一次卡顿记成几十次。
-  void _sampleRebuffer(DateTime now) {
-    if (now.isBefore(_rebufferSuppressUntil)) return;
-    // 片尾放行：推导见 [_atFileTail]。这里余量归零是必然而非故障，不放过的话
-    // 每个视频的最后一秒都会误报一次"小卡顿"。_wasEmpty 不动 —— 片尾之外
-    // 余量一涨回就会把它清掉，向后 seek 之后自然重新武装。
-    if (_atFileTail) return;
-
-    // 最敏感的一条：余量归零的上升沿立刻上报，不等 isBuffering、不等攒够次数。
-    // 每一次归零只报一次，补回来才重新武装。
-    if (bufferedAhead == 0) {
-      if (!_wasEmpty) {
-        _wasEmpty = true;
-        debugPrint('CDN 余量归零 @${position.value}s，上报小卡顿');
-        onRebuffer?.call(
-          videoPlayerController?.state.position ?? Duration.zero,
-        );
-      }
-    } else {
-      _wasEmpty = false;
-    }
-
-    final stalled = isBuffering.value && bufferedAhead == 0;
-    if (stalled && !_wasStalled) {
-      _rebufferEvents.add(now);
-      // 未来时刻也要清：时钟回拨后它们与 `now` 的差值是负的，用 `>` 永远淘汰
-      // 不掉，回拨后的第三个上升沿会把旧账一起算进这一次卡顿。
-      _rebufferEvents.removeWhere(
-        (t) =>
-            t.isAfter(now) || now.difference(t) > PlayerTuning.rebufferWindow,
-      );
-      debugPrint(
-        'CDN 卡顿计数: ${_rebufferEvents.length}/${PlayerTuning.rebufferTrigger} '
-        '(窗口 ${PlayerTuning.rebufferWindow.inSeconds}s)',
-      );
-      if (_rebufferEvents.length >= PlayerTuning.rebufferTrigger) {
-        _rebufferEvents.clear();
-        onStall?.call(videoPlayerController?.state.position ?? Duration.zero);
-      }
-    }
-    _wasStalled = stalled;
-  }
 
   /// 移除事件监听
   void _removeListeners() {
@@ -3690,4 +3484,45 @@ class _DecodeLedgerHostAdapter implements DecodeLedgerHost {
 
   @override
   void remountVideoTrack() => unawaited(_c._reloadVideoTrack());
+}
+
+/// [PlaybackWatchdog] 的宿主适配器。
+///
+/// 只做一行转发：判据、阈值、顺序全部在 watchdog 里，这里禁止写条件 ——
+/// 适配器一旦开始"顺手加工"，搬出去的行为就和旧代码分家了。
+class _PlaybackWatchdogHostAdapter implements PlaybackWatchdogHost {
+  _PlaybackWatchdogHostAdapter(this._c);
+
+  final PlPlayerController _c;
+
+  @override
+  int get bufferedAhead => _c.bufferedAhead;
+
+  @override
+  int get positionSecs => _c.position.value;
+
+  @override
+  int get durationSecs => _c.duration.value;
+
+  @override
+  bool get isBuffering => _c.isBuffering.value;
+
+  @override
+  Duration get reportPosition =>
+      _c.videoPlayerController?.state.position ?? Duration.zero;
+
+  @override
+  String? mpvOption(String key) => _c.buffer[key];
+
+  @override
+  void reportStall(Duration at) => _c.onStall?.call(at);
+
+  @override
+  void reportBufferStarve(Duration at) => _c.onBufferStarve?.call(at);
+
+  @override
+  void reportTelemetryDiverged(Duration at) => _c.onTelemetryDiverged?.call(at);
+
+  @override
+  void reportRebuffer(Duration at) => _c.onRebuffer?.call(at);
 }
