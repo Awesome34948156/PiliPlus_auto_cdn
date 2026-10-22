@@ -2779,8 +2779,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 心跳放在闸门之前：闸门本身也可能是"什么都不发生"的原因之一，
       // 必须先看到它当时的取值。
       final now = DateTime.now();
-      if (now.difference(_lastHeartbeat).inSeconds >=
-          PlayerTuning.heartbeatSeconds) {
+      if (now.isBefore(_lastHeartbeat) ||
+          now.difference(_lastHeartbeat).inSeconds >=
+              PlayerTuning.heartbeatSeconds) {
         _lastHeartbeat = now;
         debugPrint(
           'CDN 看门狗: 余量 ${bufferedAhead}s 阈值 '
@@ -2986,9 +2987,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   /// 该不该就"还在挨饿"这件事再出声一次：没报过，或者距上次已过 [PlayerTuning.starveRepeat]。
+  ///
+  /// `now.isBefore(last)` 是系统时钟回拨（NTP 校时、用户改表）的护栏：回拨后差值
+  /// 恒为负，这段**持续饥饿**的补报会一直不满足，整段盲掉。同文件的
+  /// [recordDecodeErrorHit] 与页面侧的 `_awaitVideoChainWarm` 都有这条护栏。
   bool _starveReportDue(DateTime now) {
     final last = _starveLastReportAt;
-    return last == null || now.difference(last) >= PlayerTuning.starveRepeat;
+    return last == null ||
+        now.isBefore(last) ||
+        now.difference(last) >= PlayerTuning.starveRepeat;
   }
 
   /// 测试缝：判据 3 的一拍。
@@ -3040,8 +3047,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final stalled = isBuffering.value && bufferedAhead == 0;
     if (stalled && !_wasStalled) {
       _rebufferEvents.add(now);
+      // 未来时刻也要清：时钟回拨后它们与 `now` 的差值是负的，用 `>` 永远淘汰
+      // 不掉，回拨后的第三个上升沿会把旧账一起算进这一次卡顿。
       _rebufferEvents.removeWhere(
-        (t) => now.difference(t) > PlayerTuning.rebufferWindow,
+        (t) => t.isAfter(now) ||
+            now.difference(t) > PlayerTuning.rebufferWindow,
       );
       debugPrint(
         'CDN 卡顿计数: ${_rebufferEvents.length}/${PlayerTuning.rebufferTrigger} '
