@@ -16,6 +16,7 @@
 > | §9 附录「两处重复的账本清零」 | 已合为 `_clearDecodeAccounting()`（`8fcaa00f5`） |
 > | §4 分层无护栏 | 已加 `tool/arch_check.dart` ratchet（SCC 内部边数 + 底层→pages 条数，`2f8eba268`） |
 > | §4「DI 应发生在单例内部」的实践缺口 | `DownloadManager` 的 `Dio` 已改构造函数注入（`6594e9c0e`） |
+> | §5、§6 的全部计数 | 已漂移，以 **`8c4619916` 实测**为准：测试 **12 个文件 / 198 个 `test(` / 25 个 group**、`@visibleForTesting` **37 个**；`_kCdn*` 常量已搬进 `CdnTuning`（`lib/pages/video/cdn_tuning.dart`，25 个），播放器侧在 `PlayerTuning`（29 个），源码里 **0 个 `_kCdn*`** |
 >
 > **仍然成立**：两个 god object 都**没拆**（Tier B 推迟），§3.2 的
 > `_pickFastestCdn` 470 行、`_cdnAttachedOnce` 不重置、`_cdnAutoAttempts` 双计数
@@ -251,8 +252,8 @@
 
 | 层 | 数量 | 位置 |
 |---|---|---|
-| CDN 决策 | 24 个 `_kCdn*` | `cdn_switch_mixin.dart:204-324` |
-| 播放器看门狗 | 24 个 `_k*` | `pl_player/controller.dart:287-470` |
+| CDN 决策 | 25 个 `CdnTuning.*`（原 `_kCdn*`，已搬家） | `lib/pages/video/cdn_tuning.dart` |
+| 播放器看门狗 | 29 个 `PlayerTuning.*`（原 `_k*`，已搬家） | `lib/plugin/pl_player/player_tuning.dart` |
 | 测速 | 18 个 | `cdn_speed_test.dart:16-58` |
 | Pref 默认值 | 若干 | `storage_pref.dart`（1,123 行 / 249 个 getter） |
 

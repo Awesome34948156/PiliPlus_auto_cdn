@@ -1,6 +1,6 @@
 # 自动换源：真机手测清单
 
-这份清单对应 19 条判据修复（条目 19、20 是 2026-10-12 补的）。其中大部分**单测验不了** —— 要真机、真网络才看得出
+这份清单对应 21 条判据修复（条目 19、20 是 2026-10-12 补的，21 是 2026-10-13 补的）。其中大部分**单测验不了** —— 要真机、真网络才看得出
 来：回拖重开闸、换画质的 416 循环、解码风暴的干净窗口、旧页面探测定时器、
 暂停下换源。每条都写成「前置 → 手机上怎么做 → 哪行日志算通过 → 哪种现象是没修好」。
 
@@ -298,7 +298,7 @@ app**，直接去文件 App 取，或者当场用共享菜单发出来。
 > A 确实已经不挂在播放器上了。重挂的因果也是闭合的：`restartCdnProbe()` 只有两个
 > 调用点（`controller.dart:1327` 的 `onReset`，只有换 P/换集走得到；
 > `attachCdnSwitch()` 里），返回 A 时唯一可能是后者，
-> 而它在返回路径上的调用点只有 `view.dart:495`（`didPopNext`）。时间也对：
+> 而它在返回路径上的调用点只有 `view.dart:498`（`didPopNext`）。时间也对：
 > 返回 `22:13:33.844` → 预检 `22:13:36.188`，2.34 s，正是 `CdnTuning.preflightPoll`
 > 的 2 s 加上等缓冲那一拍。
 >
@@ -563,8 +563,8 @@ size/duration 未知（`needBps == 0`）时跳过这道守卫，行为与原来�
    （逐字，`_sampleDecoderSessionFailure()`；判定它的原始 mpv 行是
    `av1: Failed to decode frame (invalid session, -12903)` 与
    `av1: vt decoder cb: output image buffer is null: -12909, reconfig 1`，
-   签名表见 `lib/utils/decode_error.dart:94` 的 `kDecoderSessionFailureSignatures`，
-   `:97` `'invalid session'`、`:100` `'output image buffer is null'`）。
+   签名表见 `lib/utils/decode_error.dart:98` 的 `kDecoderSessionFailureSignatures`，
+   `:101` `'invalid session'`、`:104` `'output image buffer is null'`）。
 2. 重建之后**播放仍是暂停** —— 心跳行里 `播放中 false` 不变、`位置 Ns` 停在暂停那一刻
    不往前走；画面回到暂停的那一帧，不自己动。
 
@@ -1033,7 +1033,7 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
    - **量法**：拿 `docs/logs/` 下带时间戳的档案，按 `decode_error.dart` 的签名表
      （`kDecoderCorruptionSignatures`）grep 出相关行，按 **6 秒滑动窗**取峰值，并复算 5ms
      去重（`PlayerTuning.decodeLineDedupe`）。注意 `HW` 是大写、`Error while decoding frame` /
-     `HW accel end frame fail.` **不在**这份签名表里（刻意排除，见 `decode_error.dart:86-92`），
+     `HW accel end frame fail.` **不在**这份签名表里（刻意排除，见 `decode_error.dart:86-97`），
      `invalid session` / `output image buffer is null` 走的是**另一条**通道（会话失效）。
    - 逐份读数（`docs/logs/`，2026-10-12 实测）：
 
@@ -1207,10 +1207,10 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
   相关视频跳转 push 新页，既不 `onClose` 旧页、也不换代。旧页在途的那一轮在
   `_pickFastestCdn` 里等探测请求时，内部只有 `_roundVoided` 复查（`_pickFastestCdn()` 里两处），
   **没有 `_cdnIsAttached`** —— 所以被顶掉多久它都活着。用户 pop 回来 → `didPopNext` 调
-  旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:495`），它把 `onStall` 等回调**同步**
+  旧页的 `attachCdnSwitch`（`lib/pages/video/view.dart:498`），它把 `onStall` 等回调**同步**
   装回去，`_cdnIsAttached` **立刻又为真**，而 `_cdnState.generation` 从头到尾没动过 ——
   `_roundLive` 于是重新为真。从这一刻到旧页自己的 `playerInit`
-  （`view.dart:522`，**没有 await**）把 `setDataSource` 跑完之间（亚秒~几秒），播放器上
+  （`view.dart:525`，**没有 await**）把 `setDataSource` 跑完之间（亚秒~几秒），播放器上
   还挂着新页那份媒体。（pop 新页时 `PlPlayerController.dispose()` 在 `_playerCount > 1`
   时只把计数 2→1、**不卸载媒体**，所以那几秒确实还是新页的片。）
   **修法**：`attachCdnSwitch` 在幂等闸之后 `_cdnState.generation++;`，**并且同时**
