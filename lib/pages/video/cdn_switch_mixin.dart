@@ -908,6 +908,14 @@ mixin CdnSwitchMixin on GetxController {
   bool _roundLive(int generation) =>
       !_roundVoided(generation) && _cdnIsAttached;
 
+  /// 「这一轮还能不能提交状态」的完整判据：作废、正在拉新地址、本页不在台上。
+  ///
+  /// 三者的**处置相同**——一个字节都不许落、一次播放器调用都不许发——所以合成
+  /// 一处。原先这三条在混音器里手抄了四遍，其中两遍还多写了 `isClosed`
+  /// （[_roundVoided] 里已经有了）。
+  bool _roundAbandoned(int generation) =>
+      _roundVoided(generation) || isQuerying || !_cdnIsAttached;
+
   /// 换到 [service] 之后，播放器有没有报过「这个 Media 根本没打开」。
   ///
   /// 时刻之外还核一次 host（报错原文里带着 URL）：换源拆旧流时，上一条流晚到的
@@ -987,7 +995,6 @@ mixin CdnSwitchMixin on GetxController {
     // 直接写 autoBusy 会漏掉这层保护（以及 `_cdnAutoEligible` 那两道闸）。
     if (!_cdnAutoEligible || isQuerying) return;
     final generation = _cdnState.beginRound(VideoUtils.cdnService);
-    final switchedAt = DateTime.now();
     debugPrint('CDN 自动切换: 回前台，补做推迟的换源 -> ${pending.service.desc}');
     try {
       // 兜底再记一次"正在播的这条源是坏的"：常规路径在排队时就记了（见
@@ -999,13 +1006,13 @@ mixin CdnSwitchMixin on GetxController {
       // 路径上原样复现。解码错误档不等 —— 画面已经坏了，多等就是白让用户看着坏。
       if (!pending.decode) {
         await _awaitVideoChainWarm();
-        if (_roundVoided(generation) ||
-            isClosed ||
-            isQuerying ||
-            !_cdnIsAttached) {
-          return;
-        }
+        if (_roundAbandoned(generation)) return;
       }
+      // 换源那一刻才算起点：放在开头的话，等视频链热起来的那几秒会被算进
+      // `_awaitRecovery` 的恢复窗口 —— 窗口一开始就快过期，好好的换源会被判
+      // 「未恢复」；而且 [PLPlayerController.lastOpenFailureAt] 的核对基准提前，
+      // 上一条流在这几秒里晚到的「打不开」会被算到新镜像头上。
+      final switchedAt = DateTime.now();
       final landed = await _switchTo(
         pending.service,
         generation,
@@ -1291,7 +1298,7 @@ mixin CdnSwitchMixin on GetxController {
         quick: quick,
         force: force,
       );
-      if (_roundVoided(generation) || isQuerying || !_cdnIsAttached) return;
+      if (_roundAbandoned(generation)) return;
       if (round == null) break;
       // 这一轮的结果已经拿到了，先给冠军位记账，再决定要不要切换。
       _noteChampionOutcome(round);
@@ -1358,12 +1365,7 @@ mixin CdnSwitchMixin on GetxController {
       // [CdnTuning.postResumeSettle] 的实测拆解。
       if (opportunistic) {
         await _awaitVideoChainWarm();
-        if (_roundVoided(generation) ||
-            isClosed ||
-            isQuerying ||
-            !_cdnIsAttached) {
-          return;
-        }
+        if (_roundAbandoned(generation)) return;
       }
 
       debugPrint(
@@ -1409,6 +1411,12 @@ mixin CdnSwitchMixin on GetxController {
       if (force) _noteChosenBadHost(generation, chosen);
       debugPrint('CDN 自动切换: ${chosen.desc} 未恢复，换下一个候选');
     }
+
+    // 这一轮已经不在台上了（被相关视频顶掉 / 正在拉新地址）：下面的结论一句
+    // 都不算数 —— 它会拿**上一个视频**的地址去 `refreshPlayer()` 别人的播放器、
+    // 往用户眼前弹一条 toast。同样的判据，[_pickFastestCdn] 返回 null 时也要走
+    // 到这里，所以必须补这一道。
+    if (_roundAbandoned(generation)) return;
 
     // 画面冻着、音频还在走的时候，上面那些"没找到更快的镜像"其实答非所问：
     // 用户已经看不到画面了，换不换 CDN 是次要的。测速没能给出更好的源，那就把
@@ -1682,7 +1690,12 @@ mixin CdnSwitchMixin on GetxController {
     // 测速又花了几秒，再复查一次：这一轮的读数属于**当时那个对象**。作废了就
     // 连速度记录也不该留下 —— 它会喂给下一轮的冠军位，而冠军位是"优先被信任"
     // 的候选（见 [_cdnChampion]）。
-    if (_roundVoided(generation)) return null;
+    //
+    // 这里必须用 [_roundAbandoned] 而不是 [_roundVoided]：下面写的是**全局**的
+    // `Pref.cdnMirrorRotation`。相关视频跳转后本页已被顶掉但代际没变，只查
+    // 代际就会让一个不在台上的旧页去改整机的轮换相位 —— 台上那一页的候选次序
+    // 被它顺手推走。
+    if (_roundAbandoned(generation)) return null;
 
     // 轮换相位只能推进到这里为止。推进量必须跟随**实际从轮换取走的个数**，不能
     // 写死 `limit`：冠军占了位子时每轮只从轮换取 1 个，相位若仍推进 2，下标就永远
