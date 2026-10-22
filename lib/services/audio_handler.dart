@@ -20,6 +20,7 @@ import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/image_utils.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
+import 'package:PiliPlus/services/service_locator.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
@@ -125,6 +126,9 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       _graceTimer?.cancel();
       _graceTimer = null;
       enableBackgroundPlay = true;
+      // 宽限期间开的会话守卫到此为止，接下去由真实播放态（stream.playing）
+      // 重新认领，别让它残留成永久定时器。
+      audioSessionHandler?.stopNowPlayingGuard(this);
       PlPlayerController.instance?.activateBackgroundPlayFromGrace();
     }
     return onPlay?.call() ??
@@ -252,9 +256,23 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     }
     debugPrint('宽限卡: 亮 8 秒暂停卡（position ${position.inSeconds}s）');
     _graceActive = true;
+    // 宽限窗口内盯住音频会话：mpv 起音频输出时会把会话改回混音、退后台暂停后
+    // iOS 也可能把会话 deactivate，任一下都会让系统卡片整个消失。守卫每秒把
+    // 会话重新钉成独占 + active，8 秒内卡片才稳得住。
+    audioSessionHandler?.startNowPlayingGuard(this);
     _item.add(item);
     setMediaItem(item);
     _lastPos = position;
+    // 先推一次「播放中」：原生 AudioServicePlugin 只在 playing==true 时
+    // activateCommandCenter，冷启动的暂停卡没有遥控中心、系统不认「正在播放」。
+    // 紧接着推「暂停」把状态掰正；中间那个 true 只活一个微任务，不会被看到。
+    _updateState(
+      AudioProcessingState.ready,
+      true,
+      item.isLive ?? false,
+      position: position,
+      speed: 1.0,
+    );
     _updateState(
       AudioProcessingState.ready,
       false,
@@ -481,6 +499,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     _graceTimer = null;
     if (!_graceActive) return;
     _graceActive = false;
+    // 宽限窗结束（8 秒到点 / 回前台），会话守卫不再需要。
+    audioSessionHandler?.stopNowPlayingGuard(this);
     if (enableBackgroundPlay) return;
     _withdrawCard();
     _item.clear();
