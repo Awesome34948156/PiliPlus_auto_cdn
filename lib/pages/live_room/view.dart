@@ -173,14 +173,19 @@ class _LiveRoomPageState extends State<LiveRoomPage>
   @override
   void dispose() {
     removeObserverMobile(this);
-    videoPlayerServiceHandler?.onVideoDetailDispose(heroTag);
     if (Platform.isAndroid && !plPlayerController.setSystemBrightness) {
       ScreenBrightnessPlatform.instance.resetApplicationScreenBrightness();
     }
-    PlPlayerController.setPlayCallBack(null);
-    plPlayerController
-      ..removeStatusLister(playerListener)
-      ..dispose();
+    // close-all 已经在 onCloseAll() 里同步跑完 dispose；旧对象再进来时
+    // 单例可能已经换人，静态回调不能替新实例清掉。
+    if (!plPlayerController.isCloseAll &&
+        identical(PlPlayerController.instance, plPlayerController)) {
+      videoPlayerServiceHandler?.onVideoDetailDispose(heroTag);
+      PlPlayerController.setPlayCallBack(null);
+      plPlayerController
+        ..removeStatusLister(playerListener)
+        ..dispose();
+    }
     for (final e in LiveContributionRankType.values) {
       Get.delete<ContributionRankController>(
         tag: '${_liveRoomController.roomId}${e.name}',

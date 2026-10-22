@@ -2421,6 +2421,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   @visibleForTesting
   set debugPlayerCount(int value) => _playerCount = value;
 
+  /// 僵尸单例回归测试要能直接观察"完整拆解已跑过"。
+  @visibleForTesting
+  bool get debugDisposed => _disposed;
+
   @visibleForTesting
   set debugRebuildingRenderContext(bool value) =>
       _rebuildingRenderContext = value;
@@ -3285,6 +3289,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   bool _isCloseAll = false;
   bool get isCloseAll => _isCloseAll;
 
+  /// 完整拆解是否已经跑过。只置真、不重置：满拆后 `_instance` 会被置空，
+  /// 下一个页面拿到的是新对象；旧页面迟到的 `dispose()` 必须原地返回。
+  bool _disposed = false;
+
   Future<void>? resetScreenRotation() {
     if (horizontalScreen) {
       return fullMode();
@@ -3301,6 +3309,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void dispose() {
+    // 旧页面（尤其直播间）可能持有已拆对象的引用。迟到的 dispose
+    // 既不能重置当前页的屏幕方向，也不能动当前单例的静态状态。
+    if (_disposed) return;
     // 每次减1，最后销毁
     resetScreenRotation();
     cancelLongPressTimer();
@@ -3311,6 +3322,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       return;
     }
 
+    // 从这里开始才是完整拆解；上面的部分拆解永远不置这个标记。
+    _disposed = true;
     _playerCount = 0;
     _bgVideoSuspendTimer?.cancel();
     _bgVideoSuspendTimer = null;
@@ -3369,7 +3382,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _videoPlayerController?.dispose();
     _videoPlayerController = null;
     _videoController = null;
-    _instance = null;
+    // 只有当前实例才能摘掉自己；旧实例走到这里说明单例已换人，不能误清。
+    if (identical(_instance, this)) {
+      _instance = null;
+    }
     videoPlayerServiceHandler?.clear();
     audioSessionHandler?.stopNowPlayingGuard(this);
 
