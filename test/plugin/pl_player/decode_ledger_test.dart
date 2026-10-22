@@ -165,6 +165,117 @@ void main() {
     });
   });
 
+  group('冷却期内再次失效：先重挂、还刷再重开（log 16 / 2026-10-13 04:26）', () {
+    /// 冷却期内的第二场风暴起点：距第一场 7 秒（真机那次是重建后 7 秒）。
+    const secondStorm = Duration(seconds: 7);
+
+    test('冷却期外第一次风暴照旧重开 Media', () {
+      final host = _FakeHost();
+      final ledger = DecodeLedger(host);
+      feed(ledger, _seed, count: PlayerTuning.sessionFailBurst, corruption: false);
+      expect(host.refreshCount, 1);
+      expect(host.remountCount, 0);
+    });
+
+    test('冷却期内再失效：只重挂视频轨，不重开（省下一次断音）', () {
+      final host = _FakeHost();
+      final ledger = DecodeLedger(host);
+      feed(ledger, _seed, count: PlayerTuning.sessionFailBurst, corruption: false);
+      expect(host.refreshCount, 1);
+
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(secondStorm),
+        corruption: false,
+      );
+      expect(host.remountCount, 1, reason: '这一档就是补上原来那半截静默 return');
+      expect(host.refreshCount, 1, reason: '重挂比重开便宜，先试便宜的');
+    });
+
+    test('重挂后 3 秒静默期里仍刷：不叠第二个动作', () {
+      final host = _FakeHost();
+      final ledger = DecodeLedger(host);
+      feed(ledger, _seed, count: PlayerTuning.sessionFailBurst, corruption: false);
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(secondStorm),
+        corruption: false,
+      );
+      // 重挂落在 t0+7.05s；这里从 t0+7.5s 起刷，仍在 settle 窗内。
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(const Duration(milliseconds: 7500)),
+        corruption: false,
+      );
+      expect(host.remountCount, 1);
+      expect(host.refreshCount, 1);
+    });
+
+    test('重挂 3 秒后还在刷：升级成重开 Media', () {
+      final host = _FakeHost();
+      final ledger = DecodeLedger(host);
+      feed(ledger, _seed, count: PlayerTuning.sessionFailBurst, corruption: false);
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(secondStorm),
+        corruption: false,
+      );
+      // 3.5 秒后（settle 已过、还在 foregroundResumeWindow 里）再刷一场。
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(const Duration(milliseconds: 10500)),
+        corruption: false,
+      );
+      expect(host.refreshCount, 2, reason: '重挂治不了就升级，别让用户等满 30 秒');
+      expect(host.remountCount, 1);
+    });
+
+    test('画中画小窗在显示时让位：冷却期内不动手', () {
+      final host = _FakeHost();
+      final ledger = DecodeLedger(host);
+      feed(ledger, _seed, count: PlayerTuning.sessionFailBurst, corruption: false);
+      expect(host.refreshCount, 1);
+
+      host.pipActive = true;
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(secondStorm),
+        corruption: false,
+      );
+      expect(host.remountCount, 0, reason: '重挂会让小窗冻 300ms');
+      expect(host.refreshCount, 1);
+    });
+
+    test('冷却过期后回到常规动作（否定不是空的）', () {
+      final host = _FakeHost();
+      final ledger = DecodeLedger(host);
+      feed(ledger, _seed, count: PlayerTuning.sessionFailBurst, corruption: false);
+      feed(
+        ledger,
+        _seed,
+        count: PlayerTuning.sessionFailBurst,
+        from: t0.add(
+          PlayerTuning.sessionFailCooldown + const Duration(seconds: 1),
+        ),
+        corruption: false,
+      );
+      expect(host.refreshCount, 2);
+      expect(host.remountCount, 0);
+    });
+  });
+
   group('画中画在显示时让位（评审 §2.3）', () {
     test('回前台过渡窗里 PiP 小窗在显示：不重挂视频轨', () {
       final host = _FakeHost()

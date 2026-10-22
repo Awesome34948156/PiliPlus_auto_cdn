@@ -442,7 +442,53 @@ final class DecodeLedger {
       _host.remountVideoTrack();
       return;
     }
-    if (now.isBefore(_sessionHealUntil)) return;
+    // 冷却期内又失效：不再干等着看画面冻多久。
+    //
+    // 冷却本身是对的（风暴里连着重建只会一次次把链路拆掉），错的是让位之后
+    // **什么都不做**：2026-10-13 04:26 真机，重建后 7 秒系统又作废一次，被这
+    // 30 秒压掉，最终是 mpv 自己掉到软解才活过来 —— 不是 app 救的。这里补上和
+    // 上面过渡窗同形的梯子：先做最便宜的动作（只重挂视频轨，不碰音频、不动
+    // hwdec），3 秒后还在刷再升级成重开 Media。
+    if (now.isBefore(_sessionHealUntil)) {
+      // 重挂刚发出去、链还在冷启动：这期间的报错是产物，别再叠第二个动作。
+      if (_inVideoChainSettleWindow(now)) return;
+      // 画中画里还有画面要看：重挂会让小窗冻 300ms。
+      if (_host.pipActive) return;
+      // 距上一次动手（冷却起点）过了多久 —— 日志要回答的就是"冻了多久"。
+      // 必须在覆盖 [_sessionHealUntil] 之前算。
+      final elapsed = now.difference(
+        _sessionHealUntil.subtract(PlayerTuning.sessionFailCooldown),
+      );
+      final reason =
+          '${PlayerTuning.sessionFailWindow.inSeconds}s 内 '
+          '${PlayerTuning.sessionFailBurst} 条';
+      if (_since(
+        _foregroundResumedAt,
+        now,
+        PlayerTuning.foregroundResumeWindow,
+      )) {
+        // 这一轮已经重挂过一次还在刷 —— 重挂治不了，升级成重开 Media。
+        _sessionHealUntil = now.add(PlayerTuning.sessionFailCooldown);
+        debugPrint(
+          'CDN 看门狗: 冷却期内再次失效、重挂视频轨仍没接上（$reason，'
+          '距上次重建 ${elapsed.inSeconds}s，余量 ${_host.bufferedAhead}s）'
+          ' —— 重开 Media',
+        );
+        _host.refreshMedia();
+        return;
+      }
+      // 第一次：只重挂视频轨。重挂自己写的 `videoChainRebuiltAt` 就是这一发的
+      // 闩（见上面的静默期）—— 3 秒后还在刷就升级，别让用户对着冻画面等满
+      // 一个冷却。
+      _deferredRebuild = false;
+      markVideoChainRebuild(now);
+      debugPrint(
+        'CDN 看门狗: 冷却期内再次失效（$reason，距上次重建 ${elapsed.inSeconds}s，'
+        '余量 ${_host.bufferedAhead}s）—— 原地重挂视频轨（硬解不动）',
+      );
+      _host.remountVideoTrack();
+      return;
+    }
     _sessionHealUntil = now.add(PlayerTuning.sessionFailCooldown);
     debugPrint(
       'CDN 看门狗: 硬解会话失效（${PlayerTuning.sessionFailWindow.inSeconds}s 内 '
