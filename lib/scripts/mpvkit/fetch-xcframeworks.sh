@@ -33,10 +33,15 @@ while read -r url; do
   fi
 
   # Unpack only what is not already on disk, so re-running after a partial
-  # failure does not redo everything.
-  if [ ! -d "$XC/$dir" ]; then
-    echo "==> unpack $dir"
+  # failure does not redo everything. The stamp carries the version: keying the
+  # guard on the bare dir meant a release bump downloaded the new zip and then
+  # skipped the unpack (the dir already existed from the old release), so
+  # relink.sh silently linked the previous binaries.
+  if [ ! -d "$XC/$dir" ] || [ "$(cat "$XC/$dir/.mpvkit-version" 2>/dev/null)" != "$ver" ]; then
+    echo "==> unpack $dir ($ver)"
+    rm -rf "$XC/$dir"
     unzip -qo "$zip" -d "$XC"
+    printf '%s' "$ver" > "$XC/$dir/.mpvkit-version"
   fi
 done < "$HERE/xframeworks.txt"
 

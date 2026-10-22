@@ -136,7 +136,11 @@ if [ "$WITH_MATERIAL" = 1 ]; then
   echo
   echo "material_ui patches (cwd = <pub cache>/material_ui-*):"
   if [ "$CHECK" = 1 ]; then
-    d=$(matdir)
+    # `|| true`: under `set -euo pipefail` a bare `d=$(matdir)` aborts the script
+    # before the diagnostic below (matdir's `ls` exits 1 when the glob misses, and
+    # pipefail propagates it through the pipe to `tail`). The `-n` check is the
+    # real guard; the assignment must not be allowed to kill us first.
+    d=$(matdir || true)
     if [ -z "$d" ]; then
       echo "  no material_ui in $PUBCACHE -- run 'flutter pub get' first" >&2
       rc=1
@@ -149,7 +153,7 @@ if [ "$WITH_MATERIAL" = 1 ]; then
     echo "  ! deleting $(matdir | xargs -n1 basename 2>/dev/null | tr '\n' ' ')" >&2
     rm -rf "$PUBCACHE"/hosted/pub.dev/material_ui-*
     ( cd "$REPO" && "$FLUTTER_ROOT/bin/flutter" pub get ) || exit 1
-    d=$(matdir)
+    d=$(matdir || true)
     [ -n "$d" ] || { echo "  material_ui still missing after pub get" >&2; exit 1; }
     apply_group "$d" "${MATERIAL_PATCHES[@]}" || rc=1
   fi
