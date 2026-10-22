@@ -336,8 +336,8 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
     // A dismissal mid-transfer still yields a non-null result, so guard here
     // rather than at the call site.
     if (_disposed || !mounted) return;
-    final speed = (downloaded / duration).toStringAsPrecision(3);
-    _cdnResList[index].value = '${speed}MB/s';
+    _cdnResList[index].value =
+        CdnSpeedTest.formatSpeed(downloaded, duration);
   }
 
   void _handleSpeedTestError(dynamic error, int index) {

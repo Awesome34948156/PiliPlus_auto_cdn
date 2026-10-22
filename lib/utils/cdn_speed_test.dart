@@ -83,6 +83,14 @@ abstract final class CdnSpeedTest {
       .where((e) => e.host != null && !CDNService.knownDead.contains(e))
       .toList(growable: false);
 
+  /// 把 `bytes / micros` 渲染成用户看到的那串速度。
+  ///
+  /// 单位换算和 [requiredMBps] 的注释是同一件事：1 byte/µs 正好是 1 MB/s。
+  /// **精度（`toStringAsPrecision(3)`）是界面的一部分** —— 设置页那栏和换源
+  /// toast 上的数字必须长得一样，所以只能有一处实现。
+  static String formatSpeed(int bytes, int micros) =>
+      '${(bytes / micros).toStringAsPrecision(3)}MB/s';
+
   /// What it takes to play [size] bytes spread over [durationMs], expressed in
   /// **MB/s** — the same unit a measured sample reads as, since every caller
   /// computes a rate as `bytes / micros` and 1 byte/µs is exactly 1 MB/s.

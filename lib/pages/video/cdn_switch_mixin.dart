@@ -676,7 +676,7 @@ mixin CdnSwitchMixin on GetxController {
 
   /// 下面这些诊断刻意不套 kDebugMode：release 包只走手机测试，套了就看不到。
   static String _fmtSpeed(int bytes, int micros) =>
-      '${(bytes / micros).toStringAsPrecision(3)}MB/s';
+      CdnSpeedTest.formatSpeed(bytes, micros);
 
   /// 换画质：**换了对象**。字节总长、坏 host、位置闸门、在途快照都作废重来。
   ///
