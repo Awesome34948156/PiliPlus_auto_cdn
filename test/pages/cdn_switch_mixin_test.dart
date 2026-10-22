@@ -1087,7 +1087,7 @@ void main() {
     expect(reports, 4, reason: '新一段里越过 20s 没补报：\n${log.text}');
   });
 
-  test('回前台续播的解码报错算本机账，不算镜像的坏字节（log 21 20:47 复放）', () {
+  test('回前台续播的解码报错算本机账，不算镜像的坏字节（2026-10-20 20:47 复放）', () {
     // 现场：退后台 4m48s，回前台 0.35s 后先来 `Missing Sequence Header` +
     // `Missing reference frame`，随后 68ms 内 153 行 libdav1d OBU 报错。那一发
     // 被判成"当前镜像给坏字节"→ 强制换源，并把一条测速正常的 ali 拉黑了；
@@ -1147,8 +1147,208 @@ void main() {
     );
   });
 
+  group('后台往返的会话回声（log 21 12:18 现场）', () {
+    // 播放中秒退秒回 ~1 秒，iOS 把 VideoToolbox 会话作废；这类现场 mpv
+    // **只吐回声、不吐种子**（实测 2.06 秒 65 行、零 `invalid session`）。
+    // 旧判据要种子开窗才认回声，于是一条都数不到 —— 画面冻到 mpv 自己缓过来。
+    const echo = 'vd: Error while decoding frame (hardware decoding)!';
+
+    /// 把看门狗摆成"这条流健康、有画面"；后台 / 回前台的时刻由各用例自己摆。
+    PlPlayerController healthy() {
+      final pc = PlPlayerController.getInstance()
+        ..resetDecodeErrorAccounting()
+        ..debugHasVideoTrack = true
+        // `isBuffering` 在测试里的初值 / tearDown 都是 true（重新缓冲），不摆掉
+        // 会被闸门挡住。过渡窗里那道闸本来也放行了，这里摆掉是为了让窗外的
+        // 用例走的是"正常健康"的样子。
+        ..isBuffering.value = false
+        ..position.value = 0
+        ..buffered.value = 60
+        ..debugForceAppInBackground = false
+        ..debugNoteBackgroundStart(null)
+        ..debugNoteBackgroundExit(null);
+      addTearDown(() {
+        pc
+          ..debugHasVideoTrack = null
+          ..debugForceAppInBackground = null
+          ..debugNoteBackgroundStart(null)
+          ..debugNoteBackgroundExit(null)
+          // 这个字段的文件级初值 / tearDown 都是 true（见「无视频轨」那组），
+          // 别把这里的 false 漏给后面的用例 —— `_playerInTrouble` 直接读它。
+          ..isBuffering.value = true;
+      });
+      return pc;
+    }
+
+    /// 间隔 10ms 的 [count] 条回声：去重窗 5ms 小于间隔，每条都算数。
+    void echoes(PlPlayerController pc, DateTime start, {int count = 6}) {
+      for (var i = 0; i < count; i++) {
+        pc.debugSampleDecoderSessionFailure(
+          echo,
+          start.add(Duration(milliseconds: 10 * i)),
+        );
+      }
+    }
+
+    test('后台里只吐回声也算数：攒够就推迟到回前台再重建', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      pc
+        ..debugNoteBackgroundStart(base)
+        ..debugForceAppInBackground = true;
+      echoes(pc, base);
+
+      expect(
+        log.has('硬解会话失效，但在后台'),
+        isTrue,
+        reason: '窗内 6 条回声没被认成会话失效 —— log 21 那局正是一个种子都没有：\n${log.text}',
+      );
+      expect(pc.debugDeferredDecoderRebuild, isTrue, reason: log.text);
+      // 后台不动手：重建会拆掉音频输出，iOS 会把「正在播放」交给别的 App。
+      expect(log.has('重建解码器'), isFalse, reason: log.text);
+      expect(log.has('原地重挂视频轨'), isFalse, reason: log.text);
+      expect(pc.videoChainRebuiltAt, isNull, reason: log.text);
+    });
+
+    test('回前台把推迟的那次重挂补上', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      pc
+        ..debugNoteBackgroundStart(base)
+        ..debugForceAppInBackground = true;
+      echoes(pc, base);
+      expect(pc.debugDeferredDecoderRebuild, isTrue, reason: log.text);
+
+      pc
+        ..debugForceAppInBackground = false
+        ..debugNoteBackgroundStart(null)
+        ..debugNoteBackgroundExit(base.add(const Duration(seconds: 2)))
+        ..resumeDeferredDecoderRebuild();
+
+      expect(
+        log.has('回前台，原地重挂视频轨（后台那段硬解会话已作废）'),
+        isTrue,
+        reason: log.text,
+      );
+      expect(pc.debugDeferredDecoderRebuild, isFalse, reason: log.text);
+    });
+
+    test('回前台后还在刷：最便宜的动作先上 —— 原地重挂视频轨', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      pc.debugNoteBackgroundExit(base.subtract(const Duration(seconds: 1)));
+      echoes(pc, base);
+
+      expect(log.has('后台往返后仍在刷解码报错'), isTrue, reason: log.text);
+      expect(log.has('原地重挂视频轨'), isTrue, reason: log.text);
+      expect(
+        log.has('重开 Media'),
+        isFalse,
+        reason: '第一次就升级成重开 Media 了 —— 断音 1~3 秒是最后手段：\n${log.text}',
+      );
+      expect(
+        pc.videoChainRebuiltAt,
+        isNotNull,
+        reason: '重挂的闩没置上，3 秒后就升级不了：\n${log.text}',
+      );
+      expect(
+        pc.debugSessionFailureCount,
+        0,
+        reason: '攒下的证据没被这次重挂消费掉：\n${log.text}',
+      );
+    });
+
+    test('过渡窗之外（6 秒后）同样的回声谁都不算', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      pc.debugNoteBackgroundExit(base.subtract(const Duration(seconds: 6)));
+      echoes(pc, base);
+
+      expect(log.has('后台往返后仍在刷解码报错'), isFalse, reason: log.text);
+      expect(log.has('硬解会话失效'), isFalse, reason: log.text);
+      expect(pc.debugSessionFailureCount, 0, reason: log.text);
+      expect(pc.videoChainRebuiltAt, isNull, reason: log.text);
+    });
+
+    test('刚重挂完的 3 秒里不叠第二个动作，过了这 3 秒升级成重开 Media', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      final rebuiltAt = base.subtract(const Duration(seconds: 1));
+      pc
+        ..debugNoteBackgroundExit(base.subtract(const Duration(seconds: 2)))
+        ..debugNoteForegroundResume(rebuiltAt);
+      echoes(pc, base);
+      expect(
+        log.has('后台往返后仍在刷解码报错'),
+        isFalse,
+        reason: '重挂刚发出去就叠了第二个动作（重挂自己还要 300ms 没视频）：\n${log.text}',
+      );
+
+      // 静默期一过还在刷：重挂治不了，升级成重开 Media —— 别让用户对着冻画面
+      // 等满 30 秒冷却。
+      echoes(pc, rebuiltAt.add(const Duration(seconds: 3)));
+      expect(log.has('重开 Media'), isTrue, reason: log.text);
+    });
+
+    test('带坏字节证据时让位给换源那条路', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      pc
+        ..debugNoteBackgroundExit(base.subtract(const Duration(seconds: 1)))
+        ..debugSampleDecodeError('Invalid NAL unit size (34817 > 5117).', base);
+      echoes(pc, base.add(const Duration(milliseconds: 10)));
+
+      expect(
+        pc.lastDecoderCorruptionAt,
+        isNotNull,
+        reason: '坏字节那条路没记上，这个用例就没摆出"同时开工"的样子：\n${log.text}',
+      );
+      expect(log.has('后台往返后仍在刷解码报错'), isFalse, reason: log.text);
+      expect(log.has('硬解会话失效'), isFalse, reason: log.text);
+      expect(pc.videoChainRebuiltAt, isNull, reason: log.text);
+    });
+
+    test('没有后台往返时，种子照旧攒够就重建解码器（旧路不改）', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      for (var i = 0; i < 6; i++) {
+        pc.debugSampleDecoderSessionFailure(
+          'av1: Failed to decode frame (invalid session, -12903)',
+          base.add(Duration(milliseconds: 10 * i)),
+        );
+      }
+      expect(
+        log.has('本机解码器被系统作废 —— 重建解码器'),
+        isTrue,
+        reason: log.text,
+      );
+    });
+
+    test('重挂那一下把攒下的证据消费掉：一条续解报错不能立刻凑满门槛', () {
+      final pc = healthy();
+      final base = DateTime.now();
+      pc.debugNoteBackgroundExit(base.subtract(const Duration(seconds: 1)));
+      echoes(pc, base);
+      expect(log.has('原地重挂视频轨'), isTrue, reason: log.text);
+
+      // 重挂之后视频链从关键帧重开，头一条就是这类报错（走页面那条采样口）。
+      // 重挂前的 6 条回声若没被清掉，这一条会把门槛凑满 → 直接重开 Media。
+      pc.debugSampleDecodeError(
+        'Missing Sequence Header',
+        base.add(const Duration(milliseconds: 400)),
+      );
+      expect(
+        log.has('回前台续播仍在刷解码报错'),
+        isFalse,
+        reason: '重挂前那 6 条回声没被这次重挂消费掉：\n${log.text}',
+      );
+      expect(pc.debugSessionFailureCount, 1, reason: log.text);
+    });
+  });
+
   test('换过去的新流打不开：立刻收尾本轮，不再等恢复窗、也不再补 seek', () async {
-    // 现场（log 21 20:47:35~44）：换到 ali 之后 stream 打不开，mpv 报
+    // 现场（2026-10-20 20:47:35~44，那份日志已找不回）：换到 ali 之后 stream
+    // 打不开，mpv 报
     // `Failed to open https://upos-sz-mirrorali...` + `[fatal] No video or audio
     // streams selected`。旧实现里 `_restoreResumePosition` 仍每 0.8s 补一发 seek
     // （16 条 `error running command`），`_awaitRecovery(decode: true)` 还要等满

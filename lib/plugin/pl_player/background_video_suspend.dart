@@ -1,6 +1,7 @@
 /// iOS 后台播放省电：进后台一段时间后把视频轨关掉（`file-local-options/vid=no`），
-/// 只留音频。这里只放**能不能关**的判据，动作与定时器在
-/// [PlPlayerController] 里（照 `reload_strategy.dart` 的分法：判据纯函数、可单测）。
+/// 只留音频。这里放**后台相关的判据**（能不能关、回前台补不补重建、算不算后台
+/// 过渡期），动作与定时器在 [PlPlayerController] 里（照 `reload_strategy.dart`
+/// 的分法：判据纯函数、可单测）。
 ///
 /// 为什么是关视频轨而不是别的：`vid=no` 之后 mpv 不再产帧，
 /// `VideoOutput.updateCallback` 也就不再被调用 —— 视频解码和 GPU 纹理渲染一起停，
@@ -49,6 +50,38 @@ bool shouldReinitDecoderOnResume({
     !isLive &&
     !onlyPlayAudio &&
     !pipActive;
+
+/// 现在是不是「后台解码过渡期」：后台会话进行中，或刚从一个**真实后台会话**回来。
+///
+/// 这个窗口只管一件事：让会话族**回声**单独也算数（见
+/// `PlayerTuning.sessionFailTransitionWindow`）。2026-10-22 12:18 真机，播放中
+/// 秒退秒回，iOS 作废 VideoToolbox 会话，mpv 只吐 65 行通用回声、零种子，
+/// 旧判据一条都数不到。
+///
+/// [backgroundStartedAt] 由 `_onBackgroundForVideoTrack` 在省电/画中画那几道门
+/// **之前**置上 —— 那几道门只决定"要不要关视频轨"，而会话作废与它们无关。
+/// 所以"在后台"必须以它为证：单看 [inBackground] 的话，测试注入
+/// （`debugForceAppInBackground`）和"根本没走过 iOS 生命周期"的状态也会开窗。
+///
+/// [backgroundExitedAt] 由 `_onForegroundForVideoTrack` 在
+/// `enteredBackground == true` 时置上；控制中心那种 `inactive → resumed` 往返
+/// 没有真进过后台，不会开窗。
+///
+/// 时钟回拨（`now` 早于 [backgroundExitedAt]）按"不在窗内"处理 —— 与
+/// `_inForegroundResumeWindow` 同口径：差值没法判断，宁可少算这一窗。
+bool inBackgroundTransitionWindow({
+  required bool inBackground,
+  required DateTime now,
+  required DateTime? backgroundStartedAt,
+  required DateTime? backgroundExitedAt,
+  required Duration afterResume,
+}) {
+  if (inBackground) return backgroundStartedAt != null;
+  if (backgroundExitedAt == null || now.isBefore(backgroundExitedAt)) {
+    return false;
+  }
+  return now.difference(backgroundExitedAt) < afterResume;
+}
 
 /// 为什么这一轮不能关视频轨。`null` 表示可以关。
 enum BackgroundVideoSuspendBlocker {

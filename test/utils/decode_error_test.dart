@@ -231,11 +231,13 @@ void main() {
       String text,
       Duration offset, {
       DateTime? echoUntil,
+      bool backgroundTransition = false,
     }) => classifyDecoderSessionLine(
       text,
       t0.add(offset),
       echoUntil: echoUntil,
       echoWindow: echoWindow,
+      backgroundTransition: backgroundTransition,
     );
 
     const seed = 'av1: Failed to decode frame (invalid session, -12903)';
@@ -245,6 +247,35 @@ void main() {
       final line = classify(echo, Duration.zero);
       expect(line.counts, isFalse);
       expect(line.echoUntil, isNull);
+    });
+
+    test('后台过渡窗内：没有种子，回声单独也算数', () {
+      // 2026-10-22 12:18 真机（log 21）：播放中秒退秒回 ~1 秒，iOS 把
+      // VideoToolbox 会话作废，mpv 在 2.06 秒里刷了 65 行这类回声、**零种子**。
+      // 只认种子的话一条都数不到。这个开关由调用方按"这一趟后台往返"给出。
+      final line = classify(echo, Duration.zero, backgroundTransition: true);
+      expect(line.counts, isTrue);
+      expect(line.echoUntil, isNull, reason: '回声不是种子，不该顺手开一扇窗');
+    });
+
+    test('后台过渡窗内，种子窗早就过期了回声照样算数', () {
+      final window = t0.add(echoWindow);
+      final line = classify(
+        echo,
+        echoWindow + const Duration(seconds: 1),
+        echoUntil: window,
+        backgroundTransition: true,
+      );
+      expect(line.counts, isTrue);
+      expect(line.echoUntil, window, reason: '过渡窗也不能给回声续期');
+    });
+
+    test('过渡窗关掉之后，回声回到"谁都不算"', () {
+      // 坏字节风暴刷的也是这两条；全局认会把动作从换源抢成重建本机解码器。
+      expect(
+        classify(echo, Duration.zero, backgroundTransition: false).counts,
+        isFalse,
+      );
     });
 
     test('种子算数，并把窗开到 3 秒后', () {

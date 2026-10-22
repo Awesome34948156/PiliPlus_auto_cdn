@@ -145,6 +145,15 @@ bool isDecoderSessionEchoLog(String text) {
 ///   回声是种子那一场的尾巴，不该靠自身把窗口无限拖长；
 /// - 其余：不算数。
 ///
+/// [backgroundTransition] 为真时，回声**单独**也算数（不要求种子开窗），但仍然
+/// **不续期** `echoUntil`。这是给「后台 / 回前台过渡窗」留的唯一一道口子：
+/// 2026-10-22 12:18 真机，播放中秒退秒回 ~1 秒，iOS 作废 VideoToolbox 会话，
+/// mpv 在 2.06 秒里刷了 65 行 `Error while decoding frame (hardware decoding)`、
+/// **零种子** —— 只认种子的话一条都数不到，画面闪完 2 秒才自愈。
+///
+/// **只在过渡窗内给 true，不放开全局**：坏字节风暴刷的也是这两条，全局认会把
+/// 动作从"换源"抢成"重建本机解码器"（见 [kDecoderSessionEchoSignatures]）。
+///
 /// 回声窗取与会话计数窗口（`PlayerTuning.sessionFailWindow`）同值：两者的作用都是
 /// 「把同一场病圈在一起」。时钟回拨时 `now` 早于 `echoUntil`，按"窗内"处理 ——
 /// 与 [recordDecodeErrorHit] 对回拨的处理一致（宁可多算这一窗，不让判据整体失效）。
@@ -153,13 +162,14 @@ bool isDecoderSessionEchoLog(String text) {
   DateTime now, {
   required DateTime? echoUntil,
   required Duration echoWindow,
+  bool backgroundTransition = false,
 }) {
   if (isDecoderSessionFailureLog(text)) {
     return (counts: true, echoUntil: now.add(echoWindow));
   }
   if (isDecoderSessionEchoLog(text) &&
-      echoUntil != null &&
-      !now.isAfter(echoUntil)) {
+      (backgroundTransition ||
+          (echoUntil != null && !now.isAfter(echoUntil)))) {
     return (counts: true, echoUntil: echoUntil);
   }
   return (counts: false, echoUntil: echoUntil);

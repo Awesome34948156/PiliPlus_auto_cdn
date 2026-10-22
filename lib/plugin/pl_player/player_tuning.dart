@@ -146,6 +146,28 @@ abstract final class PlayerTuning {
   /// **真的**在吐坏字节的镜像多放过几秒。窗口一过，坏字节签名照常定罪换源。
   static const Duration foregroundResumeWindow = Duration(seconds: 5);
 
+  /// 后台/回前台过渡窗：后台会话进行中，或从一个**真进过后台**的会话回来这么久
+  /// 之内，[isDecoderSessionEchoLog] 那两条回声**单独**也计入会话族。
+  ///
+  /// 2026-10-22 12:18 真机：播放中秒退秒回（划走约 1 秒），iOS 作废 VideoToolbox
+  /// 会话，mpv 刷了 **65 行** `vd: Error while decoding frame (hardware decoding)!`
+  /// （12:18:57.958 → 12:19:00.016），**零种子** —— [PlayerTuning.sessionFailEchoWindow]
+  /// 那种"1 颗种子 + 99 行回声"的兜底也开不了窗，计数为 0，画面一直冻到 mpv 自己
+  /// 缓过来（可见约 1.25 秒）。同一份日志 11:54 的同类现场刷了完整三件套，被
+  /// 「推迟到回前台 → 原地重挂视频轨」接住了 —— 缺的只是"只吐回声时也要认"。
+  ///
+  /// 取 5s：实测回声从进后台 0.13s 起、回前台后 1.2s 才停，5s 留 4 倍余量；
+  /// 与 [foregroundResumeWindow] 同值。**再长就会把真坏字节风暴多放过几秒**，
+  /// 而且过渡窗之外一律不认回声（见 `classifyDecoderSessionLine`）。
+  static const Duration sessionFailTransitionWindow = Duration(seconds: 5);
+
+  /// 视频链刚重挂完的静默期：这段时间里的会话报错是重挂的产物，不再叠第二个动作。
+  ///
+  /// 重挂本身有 300ms 无视频，冷启动出首帧实测最长 1.15s；3s 与
+  /// [noVideoWindow] 同一把尺（健康装载最晚 2.22s），所以健康链不会被它误挡，
+  /// 而"重挂没治好"的现场在 3s 之后才升级成重开 Media。
+  static const Duration sessionFailRebuildSettle = Duration(seconds: 3);
+
   /// iOS 后台播放时，关闭视频轨前的等待时间。
   ///
   /// 取 10 秒是用户拍的板：锁屏看通知、切一下 App 这类几秒的短切换不触发，

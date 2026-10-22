@@ -157,4 +157,91 @@ void main() {
     // （`_onForegroundForVideoTrack`）只在 `!_videoSuspendedForBackground` 分支
     // 才问它，那条路的 `vid=auto` refresh seek 已经重建了解码链。
   });
+
+  group('后台过渡窗', () {
+    // 这个窗只放行一件事：让会话族**回声**单独也算数。
+    // 2026-10-22 12:18 真机（log 21）：播放中秒退秒回 ~1 秒，mpv 只吐 65 行回声、
+    // 零种子，旧判据一条都数不到。
+    const window = Duration(seconds: 5);
+    final entered = DateTime(2026, 10, 22, 12, 18, 57, 824);
+
+    bool inWindow({
+      bool inBackground = false,
+      DateTime? backgroundStartedAt,
+      DateTime? backgroundExitedAt,
+      Duration after = Duration.zero,
+    }) => inBackgroundTransitionWindow(
+      inBackground: inBackground,
+      now: entered.add(after),
+      backgroundStartedAt: backgroundStartedAt,
+      backgroundExitedAt: backgroundExitedAt,
+      afterResume: window,
+    );
+
+    test('后台会话进行中：从进后台那一刻起就在窗内', () {
+      expect(inWindow(inBackground: true, backgroundStartedAt: entered), isTrue);
+      // 后台待多久都算 —— 等待时长由省电那条路自己管，跟这里无关。
+      expect(
+        inWindow(
+          inBackground: true,
+          backgroundStartedAt: entered,
+          after: const Duration(minutes: 3),
+        ),
+        isTrue,
+      );
+    });
+
+    test('"在后台"要以真进过后台为证', () {
+      // 测试注入的后台态、iOS 生命周期根本没走过的那一局都没有起点，
+      // 这时候开窗等于全局认回声 —— 坏字节风暴会被抢成重建本机解码器。
+      expect(inWindow(inBackground: true), isFalse);
+    });
+
+    test('回前台头 5 秒在窗内，边界不算', () {
+      final exit = DateTime(2026, 10, 22, 12, 18, 58, 770);
+      bool after(Duration d) => inBackgroundTransitionWindow(
+        inBackground: false,
+        now: exit.add(d),
+        backgroundStartedAt: entered,
+        backgroundExitedAt: exit,
+        afterResume: window,
+      );
+
+      expect(after(Duration.zero), isTrue);
+      expect(
+        after(const Duration(seconds: 1, milliseconds: 200)),
+        isTrue,
+        reason: '实测回声在回前台 1.2 秒后才停',
+      );
+      expect(after(window - const Duration(milliseconds: 1)), isTrue);
+      expect(after(window), isFalse);
+    });
+
+    test('没真进过后台（控制中心那种 inactive → resumed）不开窗', () {
+      expect(
+        inBackgroundTransitionWindow(
+          inBackground: false,
+          now: entered,
+          backgroundStartedAt: null,
+          backgroundExitedAt: null,
+          afterResume: window,
+        ),
+        isFalse,
+      );
+    });
+
+    test('时钟回拨按窗外处理', () {
+      final exit = DateTime(2026, 10, 22, 12, 18, 58, 770);
+      expect(
+        inBackgroundTransitionWindow(
+          inBackground: false,
+          now: exit.subtract(const Duration(seconds: 2)),
+          backgroundStartedAt: entered,
+          backgroundExitedAt: exit,
+          afterResume: window,
+        ),
+        isFalse,
+      );
+    });
+  });
 }
