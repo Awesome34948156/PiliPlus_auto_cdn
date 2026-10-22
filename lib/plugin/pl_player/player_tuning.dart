@@ -178,6 +178,9 @@ abstract final class PlayerTuning {
   /// 别往 0 改：那等于每次锁屏都关一次，而收益要在分钟尺度上才看得出来。
   static const Duration backgroundVideoSuspendDelay = Duration(seconds: 10);
 
+  /// 后台播放关着时，退后台留给「手动按播放续播」的暂停卡片存活时长。
+  static const Duration backgroundPlayGraceDuration = Duration(seconds: 8);
+
   /// 到点时装载 / seek / 重建在途时的重试间隔。
   static const Duration backgroundVideoSuspendRetry = Duration(seconds: 5);
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' show File, Platform;
 import 'dart:ui' show PlatformDispatcher;
 
@@ -14,6 +15,7 @@ import 'package:PiliPlus/pages/video/introduction/pgc/controller.dart';
 import 'package:PiliPlus/pages/video/introduction/ugc/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/plugin/pl_player/player_tuning.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/image_utils.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
@@ -97,6 +99,15 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       ? Pref.continuePlayInBackground
       : Pref.enableBackgroundPlay;
 
+  /// 后台播放关着时，也缓存当前媒体条目，供退后台 8 秒宽限卡片用。
+  MediaItem? _lastKnownMediaItem;
+
+  /// 宽限卡片是否亮着（后台播放关着、退后台后 8 秒内）。
+  bool _graceActive = false;
+  Timer? _graceTimer;
+
+  bool get _canPush => enableBackgroundPlay || _graceActive;
+
   Future<void>? Function()? onPlay;
   Future<void>? Function()? onPause;
   Future<void>? Function(Duration position)? onSeek;
@@ -109,6 +120,13 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
 
   @override
   Future<void> play() {
+    if (_graceActive) {
+      _graceActive = false;
+      _graceTimer?.cancel();
+      _graceTimer = null;
+      enableBackgroundPlay = true;
+      PlPlayerController.instance?.activateBackgroundPlayFromGrace();
+    }
     return onPlay?.call() ??
         PlPlayerController.playIfExists() ??
         Future.syncValue(null);
@@ -206,7 +224,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   }
 
   void setMediaItem(MediaItem newMediaItem) {
-    if (!enableBackgroundPlay) return;
+    if (!_canPush) return;
     // if (kDebugMode) {
     //   debugPrint("此时调用栈为：");
     //   debugPrint(newMediaItem);
@@ -214,6 +232,29 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     //   debugPrint(StackTrace.current.toString());
     // }
     if (!mediaItem.isClosed) mediaItem.add(newMediaItem);
+  }
+
+  /// 退后台 8 秒宽限：亮一张「暂停 + 播放键」的卡片，给用户手动续播的机会。
+  ///
+  /// 只在 iOS、后台播放关着、且还没亮过时生效。
+  void showGraceCard({required Duration position}) {
+    if (!Platform.isIOS) return;
+    if (enableBackgroundPlay || _graceActive) return;
+    final item = _lastKnownMediaItem;
+    if (item == null) return;
+    _graceActive = true;
+    _item.add(item);
+    setMediaItem(item);
+    _lastPos = position;
+    _updateState(
+      AudioProcessingState.ready,
+      false,
+      item.isLive ?? false,
+      position: position,
+      speed: 1.0,
+    );
+    _graceTimer?.cancel();
+    _graceTimer = Timer(PlayerTuning.backgroundPlayGraceDuration, _endGrace);
   }
 
   Duration? _lastPos;
@@ -226,7 +267,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     required double speed,
     String? debugLabel,
   }) {
-    if (!enableBackgroundPlay || _item.isEmpty) return;
+    if (!_canPush || _item.isEmpty) return;
 
     if (onPlay != null && debugLabel == 'onVideoPaused') return;
 
@@ -317,7 +358,6 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     String? artist,
     String? cover,
   }) {
-    if (!enableBackgroundPlay) return;
     // if (kDebugMode) {
     //   debugPrint('当前调用栈为：');
     //   debugPrint(StackTrace.current);
@@ -399,16 +439,39 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       default:
         return;
     }
-    _item.add(mediaItem);
-    setMediaItem(mediaItem);
-    // 换集后重新评估「上一集/下一集」是否可用。
-    _lastConfig = null;
+    _lastKnownMediaItem = mediaItem;
+    if (_canPush) {
+      _item.add(mediaItem);
+      setMediaItem(mediaItem);
+      // 换集后重新评估「上一集/下一集」是否可用。
+      _lastConfig = null;
+    }
   }
 
   /// 关掉服务那一刻的系统状态。重新打开时先把它推回去：只 `setMediaItem`
   /// 恢复的是一张没有播放态、没有控制的卡片，要等下一次真实的状态变化才会补上
   /// （而那是暂停/播放才有的，可能几分钟都没有）。
   PlaybackState? _suspendedState;
+
+  /// 把系统卡片收回去：audio_service 只在「非 idle → idle」时调 stopService，
+  /// Darwin 端由此把 nowPlayingInfo 置 nil 并收回遥控。
+  void _withdrawCard() {
+    if (playbackState.value.processingState == .idle) {
+      playbackState.add(PlaybackState(processingState: .completed));
+    }
+    playbackState.add(PlaybackState(processingState: .idle));
+  }
+
+  void _endGrace() {
+    _graceTimer = null;
+    if (!_graceActive) return;
+    _graceActive = false;
+    if (enableBackgroundPlay) return;
+    _withdrawCard();
+    _item.clear();
+    _lastConfig = null;
+    _lastPos = null;
+  }
 
   /// 开关「后台音频服务」。
   ///
@@ -439,10 +502,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     // 把 nowPlayingInfo 置 nil 并收回遥控。单独 mediaItem.add(null) 没用，
     // audio_service 的 _observeMediaItem 会直接忽略 null。
     _suspendedState = playbackState.value;
-    if (playbackState.value.processingState == .idle) {
-      playbackState.add(PlaybackState(processingState: .completed));
-    }
-    playbackState.add(PlaybackState(processingState: .idle));
+    _withdrawCard();
     enableBackgroundPlay = false;
     _lastConfig = null;
     _lastPos = null;

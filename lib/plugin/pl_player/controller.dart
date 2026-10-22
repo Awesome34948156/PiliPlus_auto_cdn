@@ -3477,6 +3477,24 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 退后台 8 秒宽限：亮一张暂停卡片（后台播放关着时）。
+  void showBackgroundGraceCard() {
+    if (!Platform.isIOS) return;
+    videoPlayerServiceHandler?.showGraceCard(
+      position: _videoPlayerController?.state.position ?? Duration.zero,
+    );
+  }
+
+  /// 宽限卡片上按了播放：临时打开后台播放（只改内存、不落盘），并补排一次
+  /// 10 秒关视频轨省电（退后台那一刻开关还关着、没排过）。
+  void activateBackgroundPlayFromGrace() {
+    if (!Platform.isIOS) return;
+    continuePlayInBackground.value = true;
+    if (appInBackground) {
+      _onBackgroundForVideoTrack();
+    }
+  }
+
   void setContinuePlayInBackground() {
     continuePlayInBackground.toggle();
     if (!tempPlayerConf) {
