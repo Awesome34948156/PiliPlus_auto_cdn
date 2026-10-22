@@ -119,6 +119,7 @@ void main() {
     bool resume({
       bool backgroundPlay = true,
       bool enteredBackground = true,
+      bool enteredWhilePlaying = false,
       bool playing = false,
       bool isLive = false,
       bool onlyPlayAudio = false,
@@ -126,6 +127,7 @@ void main() {
     }) => shouldReinitDecoderOnResume(
       backgroundPlay: backgroundPlay,
       enteredBackground: enteredBackground,
+      enteredWhilePlaying: enteredWhilePlaying,
       playing: playing,
       isLive: isLive,
       onlyPlayAudio: onlyPlayAudio,
@@ -144,8 +146,21 @@ void main() {
       expect(resume(enteredBackground: false), isFalse);
     });
 
-    test('后台播放关着不动：view 那条路已经在做同一件事，别重复', () {
-      expect(resume(backgroundPlay: false), isFalse);
+    test('后台播放关着、进后台时在播：view 那条路已经在做同一件事，别重复', () {
+      expect(
+        resume(backgroundPlay: false, enteredWhilePlaying: true),
+        isFalse,
+      );
+    });
+
+    test('后台播放关着、进后台时本来就暂停：没人会重建，由这里补', () {
+      // 2026-10-22 评审 §2.2：旧判据按**设置**判，这一整类配置（暂停着退后台、
+      // 「继续后台播放」关着）回前台零重建 —— 与 00:59 那场是同一族故障。
+      expect(resume(backgroundPlay: false), isTrue);
+    });
+
+    test('后台播放开着、后台期间被暂停：照样补', () {
+      expect(resume(enteredWhilePlaying: true), isTrue);
     });
 
     test('直播 / 听视频 / 画中画都不动', () {

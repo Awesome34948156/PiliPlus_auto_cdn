@@ -189,7 +189,13 @@ class _CdnSwitchState {
   /// （[_CdnSwitchMixin.resumeDeferredCdnSwitch]）。
   ///
   /// 带 [generation]：中途换集/换画质后这条就作废，不能再指挥播放器。
-  ({CDNService service, int generation, Duration resumeAt, bool decode})?
+  ({
+    CDNService service,
+    int generation,
+    Duration resumeAt,
+    bool decode,
+    bool diverged,
+  })?
   deferredSwitch;
 
   // ---------------------------------------------------------------------------
@@ -232,7 +238,8 @@ class _CdnSwitchState {
     autoBusy = false;
     autoAttempts = 0;
     // 换集/换画质是新的对象，坏字节的账也跟着作废：同一条边对另一个视频
-    // 完全可能是好的；冠军位的欠账也重新计。
+    // 完全可能是好的。冠军欠账**不**在这里清 —— 它是链路层账，跨集延续
+    // （见 [CdnHistoryBook.clearObjectScoped]）。
     history.clearObjectScoped();
     // 换集/换画质后对象变了，缓存的总长不再适用。
     objectSize = null;
@@ -252,7 +259,7 @@ class _CdnSwitchState {
   /// [quickProbeAt]，不清并发闸以外的动作状态。原先把整套 reset 无条件放在
   /// 换画质路径上，会顺手清掉放弃冷却，等于每次调画质都重新开闸。
   ///
-  /// 链路层的 [triedAt] / [noSample] 两处都保留（见 [resetEpisode]）。
+  /// 链路层的 [triedAt] / [noSample] / 冠军欠账三处都保留（见 [resetEpisode]）。
   ///
   /// 清 [autoBusy] 必须和 [_autoSwitchLoop] 的代际守卫配套：在途那一轮被
   /// generation++ 作废后，它的 whenComplete 不会再清 busy，所以只能在这里放闸，
@@ -691,6 +698,7 @@ mixin CdnSwitchMixin on GetxController {
       what: what,
       quick: trigger == _CdnTrigger.rebuffer,
       force: trigger == _CdnTrigger.decode,
+      diverged: trigger == _CdnTrigger.diverged,
       // 只有「测速顺手发现」这两档才等视频链热起来（见 [CdnTuning.postResumeSettle]）。
       opportunistic:
           trigger == _CdnTrigger.probe || trigger == _CdnTrigger.preflight,
@@ -910,6 +918,7 @@ mixin CdnSwitchMixin on GetxController {
         // 后台播了几分钟时实时位置远大于它，用旧值会让进度判据第一个事件就成立。
         landed,
         decode: pending.decode,
+        diverged: pending.diverged,
         service: pending.service,
         since: switchedAt,
       )) {
@@ -1139,6 +1148,7 @@ mixin CdnSwitchMixin on GetxController {
     required String what,
     bool quick = false,
     bool force = false,
+    bool diverged = false,
     bool opportunistic = false,
   }) async {
     var switched = false;
@@ -1224,6 +1234,7 @@ mixin CdnSwitchMixin on GetxController {
           generation: generation,
           resumeAt: stalledAt,
           decode: force,
+          diverged: diverged,
         );
         debugPrint(
           'CDN 自动切换: 在后台，推迟换到 ${chosen.desc}（换源会重载播放器、断音）',
@@ -1261,6 +1272,7 @@ mixin CdnSwitchMixin on GetxController {
         generation,
         landed,
         decode: force,
+        diverged: diverged,
         service: chosen,
         since: switchedAt,
       )) {
@@ -1974,10 +1986,17 @@ mixin CdnSwitchMixin on GetxController {
   /// [decode] 为真时（解码错误档触发的换源）上面两条判据都不可信：坏镜像的余量
   /// 填得满（它是**快**的），位置又被音频时钟推着走 —— 两条都会把"画面还冻着"
   /// 判成已恢复。这一档只看"换过去之后还吐不吐坏字节"。
+  ///
+  /// [diverged] 同理、且更严格：触发原因本身就是"位置在走、画面冻着"（遥测失真），
+  /// 于是位置判据恒真 —— 换过去一秒就宣布成功，把一次假成功记进 [noteSuccess]
+  /// （清掉尝试计数与放弃冷却）。这一档必须**等到恢复窗走完**才下结论：位置得真的
+  /// 推进过 [CdnTuning.recoverProgress]，而且那一刻余量仍没失真；中途任何一次再
+  /// 失真都当场判未恢复。余量回填那条捷径也不适用 —— 失真的镜像余量本来就大。
   Future<bool> _awaitRecovery(
     int generation,
     Duration from, {
     bool decode = false,
+    bool diverged = false,
     required CDNService service,
     required DateTime since,
   }) {
@@ -1986,7 +2005,12 @@ mixin CdnSwitchMixin on GetxController {
     final start = DateTime.now();
 
     void listener(Duration position) {
-      if (completer.isCompleted || decode || !_roundLive(generation)) return;
+      if (completer.isCompleted ||
+          decode ||
+          diverged ||
+          !_roundLive(generation)) {
+        return;
+      }
       if (position - from >= CdnTuning.recoverProgress) {
         completer.complete(true);
       }
@@ -2007,6 +2031,28 @@ mixin CdnSwitchMixin on GetxController {
         return;
       }
       if (elapsed >= window) {
+        if (diverged) {
+          // 位置必须真的推进过，且这一刻遥测**没有再次失真**（余量没被音频
+          // 重新抬离播放位置）—— 两条都成立才算画面回来了。
+          final progressed =
+              player.positionInMilliseconds >=
+              (from + CdnTuning.recoverProgress).inMilliseconds;
+          if (progressed && !player.telemetryDiverged) {
+            debugPrint(
+              'CDN 自动切换: ${service.desc} 画面已冻档换源后位置推进 '
+              '${CdnTuning.recoverProgress.inSeconds}s 且余量未再失真，判定已恢复',
+            );
+            completer.complete(true);
+          } else {
+            debugPrint(
+              'CDN 自动切换: ${service.desc} ${window.inSeconds}s 内画面仍冻着'
+              '（位置${progressed ? '在动' : '没动'}，余量${player.telemetryDiverged ? '仍失真' : '正常'}），'
+              '判定未恢复',
+            );
+            completer.complete(false);
+          }
+          return;
+        }
         debugPrint(
           decode
               ? 'CDN 自动切换: ${service.desc} ${window.inSeconds}s 内没有干净窗口，判定未恢复'
@@ -2022,6 +2068,16 @@ mixin CdnSwitchMixin on GetxController {
       if (_openFailedFor(service, since)) {
         debugPrint(
           'CDN 自动切换: ${service.desc} 新流没打开，立即收尾本轮',
+        );
+        completer.complete(false);
+        return;
+      }
+      // 画面已冻档：新镜像只要再报一次失真，就是"画面还是冻的"的直接证词，
+      // 不必等满恢复窗。装载会把 buffered 复位到起点（见 `_createVideoController`），
+      // 所以这一拍读到的不是旧镜像的残值。
+      if (diverged && player.telemetryDiverged) {
+        debugPrint(
+          'CDN 自动切换: ${service.desc} 换过去后余量再次失真（画面仍冻着），判定未恢复',
         );
         completer.complete(false);
         return;
@@ -2052,7 +2108,10 @@ mixin CdnSwitchMixin on GetxController {
         }
         return;
       }
-      final floor = _cdnBufferFloor;
+      // 余量回填这条捷径对"画面已冻"无效：失真的镜像余量本来就大（上千秒），
+      // 拿它当恢复证据正好会把"画面还冻着"判成已恢复。这一档只看上面的位置 +
+      // 未失真两条。
+      final floor = diverged ? null : _cdnBufferFloor;
       if (floor != null && player.bufferedAhead >= floor) {
         debugPrint(
           'CDN 自动切换: 前向余量回到 ${player.bufferedAhead}s（回填水位 '

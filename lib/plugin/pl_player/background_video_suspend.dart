@@ -36,20 +36,28 @@ bool isForegroundTransitionHidden(AppLifecycleState? previous) =>
 /// 只在**暂停态**补：暂停时没有音频输出，refresh seek 不产生 underrun，缓冲在用户
 /// 点播放前就补回来了。播放态退后台时 mpv 当场就会刷 `invalid session`（同一份日志
 /// 00:48:49，进后台 1.5 秒后），那种交给解码错误看门狗当场重建，不必在这里猜时长。
+///
+/// 判据按"**进后台那一刻在不在播**"（[enteredWhilePlaying]）分，而不是按设置：
+/// 「继续后台播放」关着时，播放中进后台那一趟由播放器视图负责（它先重建再续播），
+/// 这里必须让位；而**暂停着**进后台那一趟视图什么都不做（它没暂停过，所以没有
+/// "恢复播放"这个动作），由这里补 —— 2026-10-22 00:59 那场的配置就是这条漏掉的。
 bool shouldReinitDecoderOnResume({
   required bool backgroundPlay,
   required bool enteredBackground,
+  required bool enteredWhilePlaying,
   required bool playing,
   required bool isLive,
   required bool onlyPlayAudio,
   required bool pipActive,
 }) =>
-    backgroundPlay &&
     enteredBackground &&
     !playing &&
     !isLive &&
     !onlyPlayAudio &&
-    !pipActive;
+    !pipActive &&
+    // 后台播放在放：这条只可能在"后台期间被暂停"时成立（那时 playing 已经是假）。
+    // 关着：进后台时在播 ⇒ view 那条路负责，别重复重建。
+    (backgroundPlay || !enteredWhilePlaying);
 
 /// 现在是不是「后台解码过渡期」：后台会话进行中，或刚从一个**真实后台会话**回来。
 ///

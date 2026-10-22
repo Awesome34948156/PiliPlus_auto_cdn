@@ -388,6 +388,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// `hidden` → `paused`，两次都重新计时会把等待时间拖成两倍。
   DateTime? _backgroundEnteredAt;
 
+  /// 这一趟进后台的那一刻，播放器在不在播。
+  ///
+  /// 与 [_backgroundEnteredAt] 同拍、同在**所有门之前**记：判据
+  /// [shouldReinitDecoderOnResume] 要靠它区分两种"暂停着回前台"——
+  /// 「进后台时在播、后台播放关着」由播放器视图先重建再续播，这里让位；
+  /// 「进后台时本来就暂停」视图什么都不做，由这里补重建解码链。
+  ///
+  /// 取值源与 `view.dart` 那条路一致（`state.playing`），否则两边判据会在
+  /// 边界那一拍给出相反答案，同一趟重建两次。
+  bool _backgroundEnteredWhilePlaying = false;
+
   /// 最近一次**真进过后台**的会话是什么时候回到前台的。
   ///
   /// 与 [_foregroundResumedAt] 不是一回事：那个只在视频链真的重建时置上，而
@@ -473,9 +484,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 后台省电的生命周期入口。由播放器视图在 PiP early return **之前**调用。
   ///
-  /// 画中画由播放器自己排除（[IOSPipHelper.needsUpdate]）：PiP 激活时
+  /// 画中画由播放器自己排除（[IOSPipHelper.isActive]）：PiP 激活时
   /// `AppLifecycleState` 同样是 `paused`，光看生命周期分不出「真后台」和
   /// 「画中画」——而后者画面还在看，关掉视频轨等于把小窗冻住。
+  ///
+  /// 这里判 `isActive` 而**不是** `needsUpdate`：后者还含"自动进入画中画"
+  /// 的意图位（`_autoEnter`），它整个会话都为真。开了自动 PiP 但这一次没起来
+  /// （不可用 / 被系统拒绝）时，用 `needsUpdate` 会让 10 秒关轨与回前台补重建
+  /// **双双永久静默失效**，日志里只留一句"跳过（画中画需要画面）"。
   void handleAppLifecycleForVideoTrack(AppLifecycleState state) {
     if (!Platform.isIOS) return;
     // 诊断：真机上「回调到没到、三个开关各是什么值」只能靠这一行回答。
@@ -523,13 +539,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 省电开关关着、或画中画在播时，VideoToolbox 的会话照样会被系统作废，只是
     // 没有那条 `vid=auto` 的 refresh seek 顺带重建它。
     final now = DateTime.now();
-    _backgroundEnteredAt ??= now;
+    if (_backgroundEnteredAt == null) {
+      _backgroundEnteredAt = now;
+      _backgroundEnteredWhilePlaying =
+          _videoPlayerController?.state.playing ?? false;
+    }
 
     if (!_backgroundVideoSuspendEnabled) {
       debugPrint('后台省电: 跳过（功能或后台播放已关闭）');
       return;
     }
-    if (IOSPipHelper.needsUpdate) {
+    if (IOSPipHelper.isActive) {
       debugPrint('后台省电: 跳过（画中画需要画面）');
       return;
     }
@@ -561,6 +581,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final hadPending = _bgVideoSuspendTimer != null || _bgVideoSuspendDue;
     // 先把「这一趟进过后台」取出来 —— 下面就要把起点清掉。
     final enteredBackground = _backgroundEnteredAt != null;
+    final enteredWhilePlaying = _backgroundEnteredWhilePlaying;
     // 过渡窗从**回前台这一刻**起算（见 [inBackgroundTransitionWindow]）。只认真
     // 进过后台的往返：控制中心那种 `inactive → resumed` 没有起点，不开窗。
     if (enteredBackground) _backgroundExitedAt = DateTime.now();
@@ -568,12 +589,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _bgVideoSuspendTimer = null;
     _bgVideoSuspendDue = false;
     _backgroundEnteredAt = null;
+    _backgroundEnteredWhilePlaying = false;
     if (hadPending) {
       debugPrint('后台省电: 未到点就回前台，取消');
     }
 
     if (!_videoSuspendedForBackground) {
-      _maybeRebuildDecoderAfterBackground(enteredBackground: enteredBackground);
+      _maybeRebuildDecoderAfterBackground(
+        enteredBackground: enteredBackground,
+        enteredWhilePlaying: enteredWhilePlaying,
+      );
       return;
     }
     _videoSuspendedForBackground = false;
@@ -599,14 +624,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   ///
   /// 动作复用 [reinitDecoderAfterBackground]（`hwdec=no → 偏好 → seek 回原位`），
   /// 注释写的就是"趁还在暂停态拨一下 hwdec"。
-  void _maybeRebuildDecoderAfterBackground({required bool enteredBackground}) {
+  void _maybeRebuildDecoderAfterBackground({
+    required bool enteredBackground,
+    required bool enteredWhilePlaying,
+  }) {
     if (!shouldReinitDecoderOnResume(
       backgroundPlay: _backgroundPlayEnabled,
       enteredBackground: enteredBackground,
+      enteredWhilePlaying: enteredWhilePlaying,
       playing: playerStatus.isPlaying,
       isLive: isLive,
       onlyPlayAudio: onlyPlayAudio.value,
-      pipActive: IOSPipHelper.needsUpdate,
+      pipActive: IOSPipHelper.isActive,
     )) {
       return;
     }
@@ -644,7 +673,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       debugPrint('后台省电: 到点但已回前台，跳过');
       return;
     }
-    if (IOSPipHelper.needsUpdate) {
+    if (IOSPipHelper.isActive) {
       debugPrint('后台省电: 到点但画中画在播，跳过');
       return;
     }
@@ -776,7 +805,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void _rearmBackgroundVideoSuspendAfterLoad() {
     _videoSuspendedForBackground = false;
     if (!_backgroundVideoSuspendEnabled) return;
-    if (!_appInBackground || IOSPipHelper.needsUpdate) return;
+    if (!_appInBackground || IOSPipHelper.isActive) return;
 
     // 已经超过等待时长的：新文件给 1 秒让首帧和播放状态稳定就关。
     final delay = _backgroundSuspendDelay(
@@ -1529,6 +1558,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 保证这一次装载**只建一个** [Player]：并发进来的第二、第三个装载者等同一个
+  /// Future（见 [_playerInitInFlight]）。成功后由**先醒来的那个**把结果装进
+  /// `_videoPlayerController`，其余的继续 open 自己的媒体 —— 语义与普通的连续
+  /// 装载相同，只是不再各建一个播放器。
+  Future<Player> _ensurePlayerInitialized() {
+    if (_playerInitInFlight case final inFlight?) return inFlight;
+    late final Future<Player> init;
+    init = _initPlayer().whenComplete(() {
+      if (identical(_playerInitInFlight, init)) _playerInitInFlight = null;
+    });
+    _playerInitInFlight = init;
+    return init;
+  }
+
   Future<Player> _initPlayer() async {
     assert(_videoPlayerController == null);
     // 旧渲染上下文可能还在拆（见 [_playerTeardown]）：不等它，我们这里的
@@ -1650,7 +1693,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     var player = _videoPlayerController;
 
     if (player == null) {
-      player = await _initPlayer();
+      player = await _ensurePlayerInitialized();
       if (_playerCount == 0) {
         _removeListeners();
         player.dispose();
@@ -1924,7 +1967,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           // 播放期间盯住音频会话（mpv 起音频输出时会把它改成混音，
           // iOS 就不认我们为「正在播放」）。挂在真实播放状态上，
           // 双击播放、续播、打断恢复这些不经过 play() 的路径也能覆盖到。
-          audioSessionHandler?.startNowPlayingGuard();
+          audioSessionHandler?.startNowPlayingGuard(this);
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
@@ -1939,7 +1982,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         } else {
           playerStatus = .paused;
           // 暂停后 mpv 不会再动会话，守卫可以歇着。
-          audioSessionHandler?.stopNowPlayingGuard();
+          audioSessionHandler?.stopNowPlayingGuard(this);
           _startWakeLockTimer();
           _disableAutoEnterPip();
           _updateIOSPip();
@@ -2165,6 +2208,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 开头等这一个 Future，原生那边的 Create 与 Dispose 才不会同时抢一个 handle。
   Future<void>? _playerTeardown;
 
+  /// 正在创建中的播放器（[Player.create] + `VideoController.create` 那一整段）。
+  ///
+  /// 挡的是**不以重建为前提**的两次装载撞在同一拍（例如预检判定与用户换集同时
+  /// 走到 `playerInit`）：两边都看到 `_videoPlayerController == null`，于是各建
+  /// 一个 [Player] —— 两路音频、原生句柄泄漏，`_startListeners` 的 assert 还会炸。
+  /// [_playerTeardown] 只覆盖"旧的在拆"那一段，这里是"新的在建"那一段，两段互补。
+  ///
+  /// 后来者复用同一次创建（而不是排队再建）：`_createVideoController` 的调用者
+  /// 各自接着 `open` 自己的媒体，那是本来就会发生的"两次装载"语义，只是不再
+  /// 多出一个播放器。
+  Future<Player>? _playerInitInFlight;
+
   /// 见 [_rebuildingRenderContext]。
   bool get rebuildingRenderContext => _rebuildingRenderContext;
 
@@ -2272,7 +2327,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 真在后台时也不动手：重建会拆音频输出、断音 1~3 秒，iOS 在这一下就把
     // 「正在播放」交出去（见 [DecodeLedger.deferredRebuild]）。画中画例外 ——
     // 那里还有画面要看，真黑屏仍然需要这条唯一的救援路。
-    if (_appInBackground && !(Platform.isIOS && IOSPipHelper.needsUpdate)) {
+    if (_appInBackground && !(Platform.isIOS && IOSPipHelper.isActive)) {
       return '在后台（重建会断音、丢正在播放）';
     }
     if (_noVideoRebuilds >= PlayerTuning.noVideoRebuildMax) {
@@ -2789,6 +2844,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     hasToasted = false;
     isSeeking.value = false;
+    // 用户 seek 之后缓冲**必然**归零，而 seek 目标往往还没缓冲过 —— 拖一次
+    // 就会冒一条 `余量归零 … 上报小卡顿`，mixin 那边当 `rebuffer` 开一轮；
+    // 短时间连拖几次能直接凑够 `rebufferTrigger` 换源。ticker 里那道
+    // `isSeeking` 抑制在松手那一刻就结束了，盖不住这一段，所以在这里重新武装：
+    // 与装载边界同一个静默期（[PlayerTuning.rebufferSuppress]），也顺手清掉
+    // "已归零"的去重状态，让缓冲真补上之后的第一次归零重新算数。
+    _watchdog.armSuppress();
     hideTaskControls();
   }
 
@@ -3198,6 +3260,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _videoSuspendedForBackground = false;
     _bgVideoSuspendDue = false;
     _backgroundEnteredAt = null;
+    _backgroundEnteredWhilePlaying = false;
     if (removeSafeArea) {
       showSystemBar();
     }
@@ -3251,7 +3314,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _videoController = null;
     _instance = null;
     videoPlayerServiceHandler?.clear();
-    audioSessionHandler?.stopNowPlayingGuard();
+    audioSessionHandler?.stopNowPlayingGuard(this);
 
     // iOS：会话一直留到播放器真正销毁，锁屏卡片才能在暂停后继续存在。
     // 音频页（听视频）用的是另一个 player，onPlay 非空时不能掐它的会话。
@@ -3467,13 +3530,16 @@ class _DecodeLedgerHostAdapter implements DecodeLedgerHost {
   bool get appInBackground => _c._appInBackground;
 
   @override
+  bool get isLive => _c.isLive;
+
+  @override
   DateTime? get backgroundEnteredAt => _c._backgroundEnteredAt;
 
   @override
   DateTime? get backgroundExitedAt => _c._backgroundExitedAt;
 
   @override
-  bool get pipNeedsUpdate => IOSPipHelper.needsUpdate;
+  bool get pipActive => IOSPipHelper.isActive;
 
   /// 没有页面挂回调时按"收下了"处理：旧代码 `listener == null` 时不缩冷却。
   @override

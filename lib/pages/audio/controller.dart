@@ -442,13 +442,13 @@ class AudioController extends GetxController
         if (playing) {
           animController.forward();
           _playerStatus = .playing;
-          audioSessionHandler?.startNowPlayingGuard();
+          audioSessionHandler?.startNowPlayingGuard(this);
           _stopStatusTimer();
           _updatePlaybackState();
         } else {
           animController.reverse();
           _playerStatus = .paused;
-          audioSessionHandler?.stopNowPlayingGuard();
+          audioSessionHandler?.stopNowPlayingGuard(this);
           _startStatusTimer();
         }
       }),
@@ -849,7 +849,7 @@ class AudioController extends GetxController
 
   @override
   void onClose() {
-    audioSessionHandler?.stopNowPlayingGuard();
+    audioSessionHandler?.stopNowPlayingGuard(this);
     _stopStatusTimer();
     shutdownTimerService
       ..onPause = null

@@ -32,12 +32,19 @@ abstract interface class DecodeLedgerHost {
   bool get hasVideoTrack;
   bool get appInBackground;
 
+  /// 直播流。推迟下来的重建走 `vid=no → auto`，在直播上等于"跳到最新"，
+  /// 与后台省电那条路一样必须排除（见 [_deferredRebuild]）。
+  bool get isLive;
+
   /// 后台会话起点 / 回前台时刻（`null` = 没有这一趟）。
   DateTime? get backgroundEnteredAt;
   DateTime? get backgroundExitedAt;
 
-  /// 画中画里还有画面要看：重挂视频轨会让小窗冻 300ms，账本据此让位。
-  bool get pipNeedsUpdate;
+  /// 画中画**小窗真的在显示**：重挂视频轨会让小窗冻 300ms，账本据此让位。
+  ///
+  /// 只认 `IOSPipHelper.isActive`，不认 `needsUpdate` —— 后者含"自动进入画中画"
+  /// 的意图位，整个会话都为真；开了自动 PiP 但这一次没起来时会白白让位。
+  bool get pipActive;
 
   /// 上报一次坏字节风暴；**返回页面收不收**（false = 在途轮次太忙）。
   bool reportDecodeError(Duration at);
@@ -289,6 +296,17 @@ final class DecodeLedger {
     )) {
       return;
     }
+    // 闸门（与 [sampleSession] 的四道不同：这里只挡会**动手**的那两种）：
+    //
+    // - 已经在后台：窗口有 [PlayerTuning.foregroundResumeWindow] 那么长，
+    //   用户完全可能回来瞄一眼又锁屏。重建会拆音频输出、断音 1~3 秒，iOS
+    //   就在这一下把「正在播放」交出去，声音回来卡片也回不来。
+    // - 装载在途：重建会和那一轮（换集 / 换源 / 回前台补做）抢播放器。
+    //
+    // 两处都**不烧冷却**：先记账不动手，等窗口里的下一条报错或装载结束。
+    // 旧版在这里先写 [_sessionHealUntil] 再动手，被挡住的那些情形会白烧
+    // 30 秒，等真需要救的时候反而被压住。
+    if (_host.appInBackground || _host.processing) return;
     if (now.isBefore(_sessionHealUntil)) return;
     _sessionHealUntil = now.add(PlayerTuning.sessionFailCooldown);
     debugPrint(
@@ -373,6 +391,13 @@ final class DecodeLedger {
     // 交给别的 App，声音回来卡片也回不来（2026-10-21 真机，见 [_deferredRebuild]）。
     // 后台没有画面，回前台再修。
     if (_host.appInBackground) {
+      // 直播不推迟：回前台那条 `vid=no → auto` 在直播上是"跳到最新"（refresh
+      // seek），与后台省电那条路排除直播（`BackgroundVideoSuspendBlocker.live`）
+      // 同一个理由。回前台后若还在刷，常规分支会用 `refreshMedia()` 重建。
+      if (_host.isLive) {
+        debugPrint('CDN 看门狗: 硬解会话失效，但在后台（直播不推迟重挂视频轨）');
+        return;
+      }
       if (!_deferredRebuild) {
         _deferredRebuild = true;
         debugPrint('CDN 看门狗: 硬解会话失效，但在后台 —— 推迟到回前台再重建');
@@ -387,7 +412,7 @@ final class DecodeLedger {
       // 静默期也用掉这一趟的唯一名额，所以下面**不设** [_sessionHealUntil]。
       if (_inVideoChainSettleWindow(now)) return;
       // 画中画里还有画面要看：重挂会让小窗冻 300ms。
-      if (_host.pipNeedsUpdate) return;
+      if (_host.pipActive) return;
       if (now.isBefore(_sessionHealUntil)) return;
       if (_since(
         _foregroundResumedAt,

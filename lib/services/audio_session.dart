@@ -14,6 +14,15 @@ class AudioSessionHandler {
   /// 播放期间盯住会话选项的定时器，见 [startNowPlayingGuard]。
   Timer? _mixGuard;
 
+  /// 当前持有守卫的宿主（视频控制器 / 音频页控制器）。
+  ///
+  /// 守卫是**进程级**的（[AudioSessionHandler] 在 service locator 里只有一个），
+  /// 而两个宿主会同时播放：视频在播 → 打开音频页（start 幂等）→ 视频暂停
+  /// （stop）。只有计数/名册才分得清"这是最后一个持有者，可以停"。按名字记而
+  /// 不是纯计数：某个宿主没 start 就 stop（例如页面没播过就 dispose）时，纯计数
+  /// 会把另一个宿主的守卫一起关掉。
+  final Set<Object> _guardHolders = {};
+
   /// 播放期间守住「独占」的音频会话。
   ///
   /// media_kit 内置的 mpv 在每次启动音频输出时都会把会话重设成
@@ -24,7 +33,8 @@ class AudioSessionHandler {
   ///
   /// 这里每秒看一眼实际选项，真被改坏了才重新配置 —— 只在需要时动手，
   /// 免得反复 setCategory 白白打断声音。
-  void startNowPlayingGuard() {
+  void startNowPlayingGuard(Object holder) {
+    _guardHolders.add(holder);
     if (!Platform.isIOS || _mixGuard != null) return;
     _mixGuard = Timer.periodic(
       const Duration(seconds: 1),
@@ -33,7 +43,12 @@ class AudioSessionHandler {
   }
 
   /// 暂停/销毁时停下。mpv 只在起音频输出那一刻改会话，暂停期间不用盯。
-  void stopNowPlayingGuard() {
+  ///
+  /// 只有**最后一个**持有者退出时才真的停：视频暂停时音频页可能还在播，
+  /// 停了守卫、mpv 一旦把会话改回混音，锁屏卡片就跟着消失。
+  void stopNowPlayingGuard(Object holder) {
+    _guardHolders.remove(holder);
+    if (_guardHolders.isNotEmpty) return;
     _mixGuard?.cancel();
     _mixGuard = null;
   }

@@ -6,7 +6,8 @@ import 'package:flutter/foundation.dart' show debugPrint;
 /// 自动换源的**链路层历史账**：谁测过、谁连不上、谁给过坏字节、谁占着冠军位。
 ///
 /// 这四本账与"这一集"无关 —— 换集、换画质都不换链路，账要跨集延续、靠时间戳
-/// 自然过期（见 [_CdnSwitchState] 的 `resetEpisode` / `resetForNewObject`）。
+/// 或结果自然过期/清零（见 `clearObjectScoped`）。只有 [badHosts] 是按对象记的
+/// （换个视频，同一条边完全可能是好的）。
 /// 所以它们不跟页面状态挤在一起，独立成一个类。
 ///
 /// 2026-10-22 评审 Phase 5 / 4.2 从 `_CdnSwitchState` 与 `CdnSwitchMixin` 搬出，
@@ -264,16 +265,19 @@ final class CdnHistoryBook {
     );
   }
 
-  /// 换集/换 P/换画质：**换了对象**。坏 host 与冠军欠账作废重来。
+  /// 换集/换 P/换画质：**换了对象**。坏 host 作废重来。
   ///
-  /// **保留** [triedAt] / [noSample]：慢（[CdnTuning.retryAfter]）和连不上
-  /// （[CdnTuning.deadRetryAfter]）是**链路层**状态，换集/换 P 不换链路，冷却
-  /// 应当跨集延续、靠时间戳自然过期。否则短视频连划时每集都清空，"冠军连不上
-  /// （一个字节都没到）"的账记不住，30 分钟冷却形同虚设 —— 冠军每集都白占一个
-  /// 候选位、还白赔一次超时。
+  /// **保留** [triedAt] / [noSample] / [championMisses] —— 三本都是**链路层**账，
+  /// 换集/换 P 不换链路，应当跨集延续、靠时间戳或结果自然过期/清零。否则短视频
+  /// 连划时每集都清空："冠军连不上（一个字节都没到）"的账记不住，30 分钟冷却
+  /// 形同虚设；冠军欠账也永远凑不到 [CdnTuning.championMisses]，降级分支
+  /// （`历史冠军 … 退出冠军位让给轮换`）一次都不会触发 —— 而短视频一集通常只跑
+  /// 一轮预检，它本来正是被"一集一轮"卡死的那条路。
+  ///
+  /// 降级不是永久的：[championMisses] 只由"被选中"清零（见 [noteOutcome]），
+  /// 而账本随页面存活，不会跨进程累积。
   void clearObjectScoped() {
     badHosts.clear();
-    championMisses.clear();
   }
 
   /// 换源后恢复：慢的冷却清掉 —— 这一轮已经证明有得换。
