@@ -399,11 +399,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 边界那一拍给出相反答案，同一趟重建两次。
   bool _backgroundEnteredWhilePlaying = false;
 
-  /// 最近一次**真进过后台**的会话是什么时候回到前台的。
+  /// 最近一次**真进过后台**的会话是什么时候开始往回走的。
   ///
   /// 与 [_foregroundResumedAt] 不是一回事：那个只在视频链真的重建时置上，而
   /// "播放中秒退秒回"这条路上没有任何东西重建（暂停态才有补重建），
   /// 但后台/回前台过渡窗照样要开 —— 见 [inBackgroundTransitionWindow]。
+  ///
+  /// 起算点是**离开后台那一刻**（回程的 `hidden` 或 `inactive`，见
+  /// [_cancelPendingBackgroundVideoSuspend]），不是 `resumed`：会话报错就落在
+  /// 中间这 0.3~0.5 秒里，等 `resumed` 再置就晚了。`resumed` 那里会再刷一次，
+  /// 把窗口顺延几百毫秒，方向是对的（多算不算少算）。
   DateTime? _backgroundExitedAt;
 
   /// 到点关视频轨的定时器（[PlayerTuning.backgroundVideoSuspendDelay]）。
@@ -531,6 +536,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       debugPrint('后台省电: 回前台过渡，取消定时器');
     }
     _bgVideoSuspendDue = false;
+    // 过渡窗从**离开后台这一刻**起算，不等 `resumed`。
+    //
+    // iOS 的回程是 `hidden → inactive → resumed`，而 VideoToolbox 的会话报错恰好
+    // 落在这 0.3~0.5 秒的空档里（2026-10-22 15:37 真机：43.285 回前台过渡、
+    // 43.396 就攒够 6 条）。若等到 `resumed` 才置 [_backgroundExitedAt]，那一下
+    // 既不算在后台、过渡窗又没开 ⇒ 一次后台往返被当成"前台第一次失效"，做了最贵的
+    // `重建解码器`（实测约 2 秒，还顺手开了 30 秒冷却）。
+    //
+    // 只在这趟**真进过后台**时置：控制中心那种 `inactive → resumed` 往返没有
+    // [_backgroundEnteredAt]，照旧不开窗（见 [inBackgroundTransitionWindow]）。
+    if (_backgroundEnteredAt != null) {
+      _backgroundExitedAt ??= DateTime.now();
+    }
   }
 
   void _onBackgroundForVideoTrack() {
@@ -1843,12 +1861,25 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // （Missing reference frame / Sequence Header 风暴，被看门狗误判成坏字节换源）。
       // seek 到当前位置强制 mpv 落到关键帧、重建参考帧，续播才干净。
       final pos = ctr.state.position.inMilliseconds / 1000.0;
+      // 暂停着回前台才走这条路（见 [shouldReinitDecoderOnResume]），所以这一趟几乎
+      // 总是暂停态；命根子是下面那句重新断言。
+      final wasPaused = !ctr.state.playing;
       final futures = [
         ctr.command(['set', 'hwdec', 'no']),
         ctr.command(['set', 'hwdec', hw]),
         ctr.command(['seek', pos.toStringAsFixed(3), 'absolute']),
       ];
       await Future.wait(futures);
+      // `set hwdec` 重建视频轨之后，mpv 会把暂停状态丢掉 —— 新链直接开跑，
+      // 而 app 侧（`playerStatus`）还以为在暂停。2026-10-22 15:50 真机：补重建
+      // 停在 447.981（`(paused)`），`starting audio playback` 紧接着出现，
+      // 6.6 秒后心跳仍报 `播放中 false`、位置已经走到 454；15:53 那趟同形，
+      // 多了一次 +19 秒的 seek。用 `ctr.pause()`（media_kit 的裸属性设置）而不是
+      // `pause()`：后者会连带改 `playerStatus` 和音频会话，而这两样本来就对。
+      if (wasPaused) {
+        await ctr.pause();
+        debugPrint('后台省电: 补重建后重新断言暂停（原位 ${pos.toStringAsFixed(3)}s）');
+      }
     } catch (_) {
       // 切 hwdec / seek 失败宁可带旧会话续播，也别把返回动作搞丢。
     }
@@ -2738,6 +2769,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_rebuildingRenderContext) {
       return;
     }
+    debugPrint('播放器 seek → ${position.inMilliseconds}ms（${_seekSource()}）');
     if (isSeek) {
       /// 拖动进度条调节时，不等待第一帧，防止抖动
       await _videoPlayerController?.stream.buffer.first;
@@ -2749,6 +2781,23 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     } catch (e) {
       if (kDebugMode) debugPrint('seek failed: $e');
     }
+  }
+
+  /// 谁发起的 seek —— 在这之前 app 侧所有 seek 都是静默的，mpv 只打
+  /// `hr-seek, skipping to X`，查不到是人拖的、补落点补的，还是凭空冒出来的
+  /// （2026-10-22 15:53 真机就凭空出现一次 +19 秒的 seek，无法归因）。
+  /// 取第一帧不在本文件、也不在框架里的调用点，够定案。
+  static String _seekSource() {
+    final frames = StackTrace.current.toString().split('\n');
+    for (final line in frames.skip(1)) {
+      final frame = line.trim();
+      if (frame.isEmpty) continue;
+      if (frame.contains('pl_player/controller.dart')) continue;
+      if (frame.startsWith('dart:')) continue;
+      if (frame.contains('package:flutter/')) continue;
+      return frame;
+    }
+    return '?';
   }
 
   /// 跳转至指定位置
