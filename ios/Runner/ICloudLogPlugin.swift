@@ -84,7 +84,9 @@ final class ICloudLogPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
         result(FlutterError(code: "ARGS", message: "stagingPath is required", details: nil))
         return
       }
-      upload(stagingPath: staging, result: result)
+      // 租约必须在这里（平台线程 = 主线程）拿：`beginBackgroundTask` 是
+      // `UIApplication` 的主线程 API，旧写法把它留在了 opQueue 里。
+      upload(stagingPath: staging, lease: BackgroundTaskLease(), result: result)
 
     default:
       result(FlutterMethodNotImplemented)
@@ -119,6 +121,21 @@ final class ICloudLogPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
     }
     presentedPicker = picker
     host.present(picker, animated: true)
+    // `present` 失败（宿主已在呈现别的 VC、或正处于呈现动画里）时 UIKit 只打一条
+    // 警告：两个 delegate 回调都不会来，于是 pendingPick / presentedPicker 永久
+    // 非空，此后每次调用都只回 `BUSY`。挂上一秒后复查：没被任何 VC 领走就自己
+    // 收尾，把状态和 FlutterResult 一起还回去。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+      guard let self, self.presentedPicker === picker,
+        picker.presentingViewController == nil,
+        !picker.isBeingPresented, !picker.isBeingDismissed
+      else { return }
+      self.presentedPicker = nil
+      let reply = self.pendingPick
+      self.pendingPick = nil
+      reply?(
+        FlutterError(code: "NO_SHOW", message: "picker failed to present", details: nil))
+    }
   }
 
   func documentPicker(
@@ -157,10 +174,14 @@ final class ICloudLogPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
         guard let self else { return }
         self.releaseHeld()
         self.heldURL = url // 已 startAccessing，持有到换绑
-        reply([
-          "bookmark": FlutterStandardTypedData(bytes: data),
-          "path": url.path,
-        ])
+        // `FlutterResult` 是平台线程（主线程）契约：在 opQueue 上回调会让引擎
+        // 侧断言/丢弃结果，Dart 的 await 就永久挂起。
+        DispatchQueue.main.async {
+          reply([
+            "bookmark": FlutterStandardTypedData(bytes: data),
+            "path": url.path,
+          ])
+        }
       }
     } catch {
       // 建书签没成，刚开的那个访问权就得还回去 —— 泄漏 `startAccessing`
@@ -282,8 +303,13 @@ final class ICloudLogPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
   /// **永远不重读 app 本地那份 `pili-console.log`** —— 它随时可能被
   /// `console_log.dart` 的轮换截断，读到的会是空文件。Dart 那边已经先在
   /// 写入串行链上拷好了 staging。
-  private func upload(stagingPath: String, result: @escaping FlutterResult) {
+  private func upload(
+    stagingPath: String,
+    lease: BackgroundTaskLease?,
+    result: @escaping FlutterResult
+  ) {
     opQueue.async { [weak self] in
+      defer { lease?.end() }
       guard let self else { return }
       guard let folder = self.heldURL else {
         DispatchQueue.main.async {
@@ -299,10 +325,8 @@ final class ICloudLogPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
         return
       }
 
-      // 退到后台后 iOS 几秒内就可能把我们挂起，写一半被切断比不写更糟。
-      let token = self.beginBackgroundTask()
-      defer { self.endBackgroundTask(token) }
-
+      // 后台任务租约由调用方在主线程拿好（见 [BackgroundTaskLease]），
+      // `defer { lease?.end() }` 在这一层结束时归还。
       let dest = folder.appendingPathComponent(ICloudLogPlugin.liveName)
       var coordError: NSError?
       var writeError: Error?
@@ -332,20 +356,42 @@ final class ICloudLogPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
     }
   }
 
-  private func beginBackgroundTask() -> UIBackgroundTaskIdentifier {
-    var token: UIBackgroundTaskIdentifier = .invalid
-    token = UIApplication.shared.beginBackgroundTask(withName: "icloud-log-upload") {
-      if token != .invalid {
-        UIApplication.shared.endBackgroundTask(token)
-        token = .invalid
+  // MARK: - 后台任务租约
+
+  /// 一次上传期间的"别把我挂起"租约。
+  ///
+  /// 旧写法有三个问题：`beginBackgroundTask` 在 opQueue（后台线程）上调用，
+  /// 是 `UIApplication` 的主线程 API；过期回调与 `defer` 并发读写同一个
+  /// `token` 变量；过期回调里 `end` 之后 `defer` 又 `end` 一次（令牌可能已被
+  /// 系统回收复用）。这里把开始/结束都收敛到主线程，令牌用锁保护、只允许
+  /// 结束一次。
+  private final class BackgroundTaskLease {
+    private let lock = NSLock()
+    private var token: UIBackgroundTaskIdentifier = .invalid
+
+    /// **只在主线程调用**（`handle` 的平台线程就是主线程）。
+    init() {
+      let started = UIApplication.shared.beginBackgroundTask(withName: "icloud-log-upload") {
+        [weak self] in
+        // 过期回调在主线程：系统要收回后台时间，立刻归还，别让 app 被杀。
+        self?.end()
+      }
+      if started != .invalid {
+        token = started
       }
     }
-    return token
-  }
 
-  private func endBackgroundTask(_ token: UIBackgroundTaskIdentifier) {
-    if token != .invalid {
-      UIApplication.shared.endBackgroundTask(token)
+    func end() {
+      lock.lock()
+      let t = token
+      token = .invalid
+      lock.unlock()
+      guard t != .invalid else { return }
+      if Thread.isMainThread {
+        UIApplication.shared.endBackgroundTask(t)
+      } else {
+        DispatchQueue.main.async { UIApplication.shared.endBackgroundTask(t) }
+      }
     }
   }
 
