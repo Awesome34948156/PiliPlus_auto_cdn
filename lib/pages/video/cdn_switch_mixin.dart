@@ -352,6 +352,10 @@ class _CdnSwitchState {
     // 一起清掉就等于让它们**永久**出局（成了 noSample 却永远没有一个到期时刻）。
     triedAt.removeWhere((service, _) => !noSample.contains(service));
     giveUpUntil = null;
+    // 已经换成功了，后台攒下的那次待办就没有意义了 —— 它指向的是**换源之前**
+    // 那一轮选出来的镜像。不清的话，回前台 [resumeDeferredCdnSwitch] 会照着
+    // 过期的结论再换一次（同一代际，代际闸拦不住它），把刚换好的好镜像又换走。
+    deferredSwitch = null;
   }
 
   /// 装一档"整集放弃"冷却。
@@ -640,10 +644,20 @@ mixin CdnSwitchMixin on GetxController {
   bool get _cdnAutoEligible {
     // 直播、本地文件、durl(edl://) 都不在范围内。
     if (isFileSource || plPlayerController.isLive) return false;
+    // 基线就是正在播的这条 URL，拿不到就没得比较（也说明还没开始播）。
+    //
+    // **必须排在 [data] 之前**：`data` 是 `late PlayUrlModel`，网络视频要等
+    // `queryVideoUrl` 的 HTTP 回来才赋值，而预检定时器在页面 `onInit` 就武装了。
+    // 先读 `data.dash` 等于让 2 秒后那一拍去踩 `LateInitializationError`
+    // —— 而 `videoUrl` 只在 `data` 赋值之后才可能非空，所以这个顺序反过来查
+    // 不会放过任何"有地址却还没数据"的情况。
+    if (videoUrl?.isNotEmpty != true) return false;
     if (data.dash == null) return false;
     if (!Pref.autoSwitchCdnOnStall) return false;
-    // 基线就是正在播的这条 URL，拿不到就没得比较（也说明还没开始播）。
-    if (videoUrl?.isNotEmpty != true) return false;
+    // 正在拉新地址：`videoUrl` 马上要换代，此刻测出来的是上一个对象的镜像表。
+    // 放在这里而不是各调用点：`_onPlayerStall` / 预检 / 回前台补做三条入口
+    // 都要这道闸，散着写迟早漏一条（`_onPlayerStall` 原先就漏了）。
+    if (isQuerying) return false;
     // 听视频 + 音频不跟随 CDN 时，所有候选返回同一个原始 URL，测速没有意义。
     if (plPlayerController.onlyPlayAudio.value && VideoUtils.disableAudioCDN) {
       return false;
