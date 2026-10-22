@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -70,6 +71,14 @@ Future<void> _queue = Future.value();
 
 /// 攒着还没写进文件的字节数，用来判上限。
 int _bytesWritten = 0;
+
+/// 一行日志落到文件里占多少**字节**。
+///
+/// 不能拿 `text.length` 顶替：[String.length] 数的是 UTF-16 code unit，而
+/// 这个仓的诊断日志几乎全是中文 —— 一个汉字在 UTF-8 里占 3 字节、在
+/// [String.length] 里只算 1。按 code unit 计数的话 8 MiB 的上限实际会写到
+/// 20 MiB 以上才轮换，iOS 上那份还要经 iCloud 同步出去。
+int _bytesOf(String text) => utf8.encode(text).length;
 
 /// 把日志送出这个沙盒的钩子（现在只有 iCloud，见
 /// `lib/utils/ios/icloud_log_sync.dart`）。传进来的路径是一份**快照**。
@@ -196,12 +205,12 @@ void _enqueue(String text) {
 Future<void> _write(String text) async {
   try {
     if (_sink == null) return; // 没装成功，或轮换失败：静默丢弃，不抛
-    if (_bytesWritten + text.length > _maxBytes) {
+    if (_bytesWritten + _bytesOf(text) > _maxBytes) {
       await _rotate();
       if (_sink == null) return; // 轮换也失败了
     }
     _sink!.write(text);
-    _bytesWritten += text.length;
+    _bytesWritten += _bytesOf(text);
   } catch (_) {
     // 见上：写失败不影响播放
   }
@@ -320,7 +329,7 @@ Future<void> _flushStep() async {
       // 这里刻意不再判上限：这批是**最近**的行，宁可贵一点（下一次 _write
       // 会顺手轮换回来），也不能因为超限而整批丢掉。
       sink.write(text);
-      _bytesWritten += text.length;
+      _bytesWritten += _bytesOf(text);
     }
     await sink.flush();
   } catch (_) {
