@@ -398,6 +398,29 @@ void main() {
     );
   });
 
+  test('基线换了 host 之后，API 首选镜像仍要进候选', () async {
+    // 用户把默认 CDN 设成 ali（或本集已经自动换过一次源）之后，`videoUrl` 带着
+    // ali 的 host，而 `VideoUtils.cdnUrlFor(urls, CDNService.baseUrl)` 永远返回
+    // `urls.first`（cos 那条）。
+    //
+    // 候选去重原先拿后者当"正在播的那条"比。两者不相等时，cos 这一格会被当成
+    // 自比而**永久**排除 —— 它永远测不到，也就永远不会被换回来。判据必须是
+    // 基线（`videoUrl` 本身），不是 API 列表的第一条。
+    hostA
+      ..videoUrl = 'https://${CDNService.ali.host}/upgcxcode/1/2/3/4.m4s'
+      ..attachCdnSwitch();
+    _stall(hostA);
+
+    await _waitFor(() => cdn.samples.isNotEmpty);
+    final measured = cdn.samples.map((r) => r.uri.host).toSet();
+    expect(measured, contains(CDNService.ali.host), reason: '基线一直都在测');
+    expect(
+      measured,
+      contains(_baselineHost),
+      reason: '基线已经不在 cos 上了，cos 就该作为候选被试到：$measured',
+    );
+  });
+
   test('被顶掉的那一页连兜底重载都不该碰', () async {
     // 尾段那道兜底（`_autoSwitchLoop` 收尾）：一轮没能换出结果、而画面已经冻住
     // （`telemetryDiverged`）时，重载当前源，让音视频两条流重新对齐时钟。它

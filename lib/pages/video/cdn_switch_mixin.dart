@@ -1492,7 +1492,6 @@ mixin CdnSwitchMixin on GetxController {
     // 当前生效的镜像要从 videoUrl 里解析 host —— 默认偏好是 backupUrl，它的
     // URL 里带的是真实 host，只看 Pref 会漏判。
     final currentHost = Uri.tryParse(baselineUrl)?.host;
-    final baseUrl = VideoUtils.cdnUrlFor(urls, CDNService.baseUrl);
 
     // 窗口就取 autoCandidatesMax = autoConcurrency - 1：基线要占掉一个并发位，
     // 剩下的才轮到候选，整轮必须挤进同一批。分两批的话，测基线的那几秒里缓冲
@@ -1510,13 +1509,16 @@ mixin CdnSwitchMixin on GetxController {
     // 只决定"优先被想到"，不决定"优先被信任"，所以记录过期也不会造成误切。
     final champion = _cdnChampion(now, currentHost);
     if (champion != null) {
-      // 与轮换路径同一条不变量（见下面那个 `url == baseUrl` 的 continue）：
+      // 与轮换路径同一条不变量（见下面那个 `url == baselineUrl` 的 continue）：
       // host 替换不起作用时，这个"候选"跟基线是同一个 URL，测了也是自比。
-      // 按代码推这条走不到（[_cdnChampion] 已经跳过 [currentHost]，而 [baseUrl]
-      // 与 [videoUrl] 出自同一个 [VideoUtils.cdnUrlFor]）—— 这是防御，不是修
-      // 一条已证实的故障。
+      //
+      // 比的是 [baselineUrl]（**正在播**的那条），不是 [baseUrl]（API 列表第一个）。
+      // 两者只有在用户从没改过默认 CDN、本集也没换过源时才相等；一旦
+      // `getCdnUrl` 按 `Pref.defaultCDNService` 重写过、或本集自动换过一次源，
+      // [baseUrl] 指向的就是一条没人播的地址，拿它去比会把真正在播的那个镜像
+      // 从候选里剔掉（它同时也是冠军和轮换里的一员）。
       final championUrl = VideoUtils.cdnUrlFor(urls, champion);
-      if (championUrl.isNotEmpty && championUrl != baseUrl) {
+      if (championUrl.isNotEmpty && championUrl != baselineUrl) {
         candidates.add(champion);
       }
     }
@@ -1558,8 +1560,13 @@ mixin CdnSwitchMixin on GetxController {
         }
         if (!pass.ignoreCooldown && _cdnRecentlyTried(service, now)) continue;
         // host 替换不起作用（mcdn-only / edl:// 合成项），换过去也是同一个 URL。
+        // 比的是**正在播**的那条 [baselineUrl]，不是 API 列表第一个 [baseUrl]：
+        // 用户改过默认 CDN、或本集自动换过一次源之后，`getCdnUrl` 出来的
+        // `videoUrl` 就带着别的 host，而 `cdnUrlFor(urls, CDNService.baseUrl)`
+        // 永远返回 `urls.first` —— 拿后者去比，等于**永久**把 API 首选镜像
+        // 排除在候选之外（测不到它，也就永远不会换回它）。
         final url = VideoUtils.cdnUrlFor(urls, service);
-        if (url.isEmpty || url == baseUrl) continue;
+        if (url.isEmpty || url == baselineUrl) continue;
         candidates.add(service);
         fromRotation++;
       }
