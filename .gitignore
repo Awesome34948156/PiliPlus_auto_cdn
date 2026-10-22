@@ -159,3 +159,9 @@ dist
 # 都是当初 git add -f 强加的）。补一条反规则放行 test/，其余原意不变。
 test*
 !test/
+# 只放行目录还不够：上面的 `test*` 匹配的是**文件名**，`test/test_helper.dart`、
+# `test/test_widget.dart` 这些照样被忽略（`git add` 静默无声，只有
+# `git check-ignore -v` 看得见）。`!test/**` 把目录里的文件重新收回来。
+!test/**
+!test/**/# `!test/**` 是**最后**匹配的规则，会把 `.DS_Store` 这类系统垃圾也从 test/ 里放回来。
+.DS_Store
