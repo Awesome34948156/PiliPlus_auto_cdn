@@ -12,6 +12,8 @@ library;
 
 import 'dart:ui' show AppLifecycleState;
 
+import 'package:PiliPlus/plugin/pl_player/player_tuning.dart';
+
 /// 回前台时 iOS 会先发一个 `hidden`：这一个是**过渡**，不是又一次进后台。
 ///
 /// Flutter 把生命周期摆成一条链：往后台走是 `inactive → hidden → paused`，
@@ -58,6 +60,23 @@ bool shouldReinitDecoderOnResume({
     // 后台播放在放：这条只可能在"后台期间被暂停"时成立（那时 playing 已经是假）。
     // 关着：进后台时在播 ⇒ view 那条路负责，别重复重建。
     (backgroundPlay || !enteredWhilePlaying);
+
+/// 暂停态补重建解码链之后，那次「重新断言暂停」有没有黏住。
+///
+/// 判据看**位置有没有自己往前走**，不看 `state.playing`：2026-10-22 15:50 真机，
+/// `set hwdec` 重建轨道之后 mpv 直接开始出声，media_kit 的 `playing` 属性却一次
+/// 都没再发事件 —— 6.6 秒后心跳仍报 `播放中 false`，位置已经从 447.981 走到 454。
+/// 换句话说库的状态在这种漂移里是瞎的，只有 `time-pos` 会动。
+///
+/// [appPlaying] 是 app 侧（`playerStatus`）的意图：用户或页面在窗口里主动播放了，
+/// 位置当然会走，那不是漂移。
+bool pauseDriftedAfterRealign({
+  required Duration startPosition,
+  required Duration position,
+  required bool appPlaying,
+}) =>
+    !appPlaying &&
+    position - startPosition > PlayerTuning.resumePauseRealignDrift;
 
 /// 现在是不是「后台解码过渡期」：后台会话进行中，或刚从一个**真实后台会话**回来。
 ///

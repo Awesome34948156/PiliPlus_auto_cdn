@@ -188,6 +188,26 @@ abstract final class PlayerTuning {
     milliseconds: 500,
   );
 
+  /// 暂停态补重建解码链之后，重新断言暂停的兜底窗口。
+  ///
+  /// `set hwdec` 重建轨道之后那一次 `ctr.pause()` 不总黏：2026-10-22 15:50 真机
+  /// 报 `restart complete (paused)` 之后 `starting audio playback` 照样出现，
+  /// 6.6 秒后心跳仍是 `播放中 false`、位置已前进 6 秒；17:45 那趟同形，最多放了
+  /// 8.9 秒。漂移在 0.3~0.5s 内就开始，2 秒够覆盖三到四次采样；也不能再长 ——
+  /// 窗口里用户点了播放就要立刻让位（见 `_resumePauseEpoch`）。
+  static const Duration resumePauseRealignWindow = Duration(seconds: 2);
+
+  /// 上面那扇窗的采样间隔。200ms 与漂移出现的时间尺度（几百毫秒）同量级，
+  /// 又比 1 秒心跳细，能赶在用户听出「明明暂停了还在放」之前按住。
+  static const Duration resumePauseRealignInterval = Duration(
+    milliseconds: 200,
+  );
+
+  /// 兜底窗里位置走过多少才算「播放器自己跑起来了」。
+  ///
+  /// 刚发过 `seek`，落点抖动在几十毫秒内；500ms 之外就不可能还是抖动。
+  static const Duration resumePauseRealignDrift = Duration(milliseconds: 500);
+
   /// 饥饿阈值取 mpv 回填水位的这个比例。水位是
   /// `demuxer-hysteresis-secs`（见 Pref.initBuffer）：mpv 补到 `cache-secs`
   /// 后停读，等掉回水位才续读，所以健康播放的锯齿在

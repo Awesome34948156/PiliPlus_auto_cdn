@@ -1461,3 +1461,24 @@ CDN 自动切换: 落点 0ms 落后于 <N>ms，补一次 seek
 - 剩余约 300–400 行（ticker / 闸门 / 就地重建引擎）与页面认领、渲染上下文、`dispose()`
   强耦合，再搬只会多一层转发。
 - `arch_check` 四项（538 / 2406 / 27 / 74）顶在基线，继续拆分不会改善指标。
+
+#### ⑤ 补重建后的 2 秒暂停兜底窗 —— 已实现，待真机复验
+
+- 位置：`reinitDecoderAfterBackground()` 里 `ctr.pause()` 断言之后；
+  `_armResumePauseRealign()` 每 200ms 采一次，共 2 秒
+  （`PlayerTuning.resumePauseRealignWindow` / `resumePauseRealignInterval`）。
+- **判据与原先拍的板有一处不同**：原方案看 `ctr.state.playing == true && 未播放`，
+  但 15:50 那趟证明 media_kit 的账本是瞎的 —— `set hwdec` 重建轨道后 mpv 当场出声，
+  `playing` 属性一次都没再发事件（6.6 秒后心跳仍 `播放中 false`），只有 `time-pos` 在走。
+  所以实际判据改成 **位置自己往前走 > 500ms 且 app 侧仍是暂停**
+  （`pauseDriftedAfterRealign()`，带 4 例单测）；`ctr.state.playing` 只写进日志当旁证。
+- 不误伤用户：`play()` / `pause()` 开头各 `_resumePauseEpoch++`，窗口一发现就收；
+  不能只靠 `playerStatus` 判断，因为 `play()` 要等裸播放器起跑回来才翻状态。
+- 只挂窗的条件：`wasPaused && !playerStatus.isPlaying`（view 的后台续播路径马上要
+  play，不该被当成漂移）。
+- 命中日志：`后台省电: 补重建后暂停漂了（位置 X → Ys，app 侧 …、库 playing …），再断言一次`。
+- `dispose()` 同步取消定时器；实例换了 / 页面拆了 / 用户动过播放都立刻收窗。
+- 为什么要有这扇窗（原拍的板逐字保留）：「18 趟 17 成 1 败，但断言不总黏 —— 17:45
+  那趟 restart 报了 `(paused)` 却实际又放了 **8.9 秒**；17:54 还有一种『换流带
+  `play=true` 回来』的形态。这个窗口一头治漂移、一头治换流误带。」
+- 未验：真机能否按预期按住 17:45 那种「断言报 `(paused)` 却放了 8.9 秒」的漂移。

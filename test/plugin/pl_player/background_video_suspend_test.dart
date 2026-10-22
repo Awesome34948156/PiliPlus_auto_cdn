@@ -259,4 +259,56 @@ void main() {
       );
     });
   });
+
+  /// 补重建后那 2 秒兜底窗的判据。真实形态见
+  /// `PlayerTuning.resumePauseRealignWindow`：断言报暂停、播放器照放。
+  group('pauseDriftedAfterRealign', () {
+    bool drifted(Duration from, Duration to, {bool appPlaying = false}) =>
+        pauseDriftedAfterRealign(
+          startPosition: from,
+          position: to,
+          appPlaying: appPlaying,
+        );
+
+    test('app 侧暂停、位置自己走了 1 秒 —— 漂了（15:50 真机形态）', () {
+      expect(
+        drifted(
+          const Duration(seconds: 447),
+          const Duration(seconds: 448),
+        ),
+        isTrue,
+      );
+    });
+
+    test('刚 seek 完的落点抖动（400ms 内）不算', () {
+      expect(
+        drifted(
+          const Duration(milliseconds: 447900),
+          const Duration(milliseconds: 448200),
+        ),
+        isFalse,
+      );
+    });
+
+    test('app 侧自己在播：位置该走，不算漂', () {
+      expect(
+        drifted(
+          const Duration(seconds: 447),
+          const Duration(seconds: 450),
+          appPlaying: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('seek 回关键帧导致位置倒退不算', () {
+      expect(
+        drifted(
+          const Duration(seconds: 448),
+          const Duration(seconds: 441),
+        ),
+        isFalse,
+      );
+    });
+  });
 }

@@ -1841,6 +1841,70 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return null;
   }
 
+  /// 暂停态补重建之后的兜底窗口（见 [PlayerTuning.resumePauseRealignWindow]）。
+  Timer? _resumePauseRealignTimer;
+
+  /// app 侧自己发过播放/暂停就 +1，窗口立刻让位。
+  ///
+  /// 不能只靠 `playerStatus` 判断"用户是不是点了播放"：[play] 要等
+  /// `_videoPlayerController?.play()` 回来才翻状态，中间那段窗口里播放器已经
+  /// 起跑、app 侧还是暂停，采样正好落在里面就会把用户刚点起来的那一下按回去。
+  int _resumePauseEpoch = 0;
+
+  /// 断言暂停之后挂一会儿，盯着播放器有没有自己跑起来。
+  ///
+  /// 判据不用 `ctr.state.playing`：2026-10-22 15:50 那趟 `set hwdec` 重建轨道
+  /// 之后 mpv 早就开始出声，media_kit 的 `playing` 属性却一次都没再发事件
+  /// （6.6 秒后心跳仍是 `播放中 false`），只有 `time-pos` 在走。所以看**位置有没有
+  /// 自己往前走**；`ctr.state.playing` 只写进日志当旁证。
+  void _armResumePauseRealign(Player ctr) {
+    _resumePauseRealignTimer?.cancel();
+    final epoch = _resumePauseEpoch;
+    final startedAt = DateTime.now();
+    final startPosition = ctr.state.position;
+    _resumePauseRealignTimer = Timer.periodic(
+      PlayerTuning.resumePauseRealignInterval,
+      (timer) {
+        void stop() {
+          timer.cancel();
+          if (identical(_resumePauseRealignTimer, timer)) {
+            _resumePauseRealignTimer = null;
+          }
+        }
+
+        // 播放器换了、页面拆了、用户自己动过播放 —— 这扇窗都不该再管。
+        if (!identical(_videoPlayerController, ctr) ||
+            _disposed ||
+            epoch != _resumePauseEpoch) {
+          stop();
+          return;
+        }
+        if (DateTime.now().difference(startedAt) >=
+            PlayerTuning.resumePauseRealignWindow) {
+          stop();
+          return;
+        }
+        // seek 落点抖动在几十毫秒内；走过 500ms 才算真放起来了。
+        final position = ctr.state.position;
+        if (!pauseDriftedAfterRealign(
+          startPosition: startPosition,
+          position: position,
+          appPlaying: playerStatus.isPlaying,
+        )) {
+          return;
+        }
+        stop();
+        debugPrint(
+          '后台省电: 补重建后暂停漂了（位置 '
+          '${startPosition.inMilliseconds / 1000} → '
+          '${position.inMilliseconds / 1000}s，app 侧 ${playerStatus.name}、'
+          '库 playing ${ctr.state.playing}），再断言一次',
+        );
+        unawaited(ctr.pause());
+      },
+    );
+  }
+
   /// 回前台续播前，把硬解会话重建一遍：iOS 退后台会把 VideoToolbox 会话作废，
   /// 直接续播会先来一波 `vd: Error while decoding frame (hardware decoding)!`
   /// 掉帧（画面抽动）。趁还在暂停态拨一下 hwdec，会话变新，续播才干净。
@@ -1879,6 +1943,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (wasPaused) {
         await ctr.pause();
         debugPrint('后台省电: 补重建后重新断言暂停（原位 ${pos.toStringAsFixed(3)}s）');
+        // 断言这一次不一定黏住（见 [PlayerTuning.resumePauseRealignWindow]）。
+        // 只在 app 侧也认为暂停时才挂窗：view 的后台续播路径同样会走到这里，
+        // 那条路马上要 play，不该被当成漂移。
+        if (!playerStatus.isPlaying) _armResumePauseRealign(ctr);
       }
     } catch (_) {
       // 切 hwdec / seek 失败宁可带旧会话续播，也别把返回动作搞丢。
@@ -2850,6 +2918,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 播放视频
   Future<void> play({bool repeat = false, bool hideControls = true}) async {
     if (_playerCount == 0) return;
+    // 用户/页面真要播放了，补重建后那扇暂停兜底窗立刻让位。
+    _resumePauseEpoch++;
     // 播放时自动隐藏控制条
     controls = !hideControls;
     // repeat为true，将从头播放
@@ -2870,6 +2940,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   /// 暂停播放
   Future<void> pause({bool notify = true, bool isInterrupt = false}) async {
+    _resumePauseEpoch++;
     await _videoPlayerController?.pause();
     playerStatus = .paused;
 
@@ -3325,6 +3396,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 从这里开始才是完整拆解；上面的部分拆解永远不置这个标记。
     _disposed = true;
     _playerCount = 0;
+    _resumePauseRealignTimer?.cancel();
+    _resumePauseRealignTimer = null;
     _bgVideoSuspendTimer?.cancel();
     _bgVideoSuspendTimer = null;
     _videoSuspendedForBackground = false;
