@@ -1659,6 +1659,13 @@ void main() {
     void openNoVideoGates() {
       pc
         ..position.value = 100
+        // 余量健康（30s）且远低于失真线（`cache-secs` 30 × 3 = 90）：这是「纯渲染
+        // 上下文死锁」那一局的形态 —— 流是喂得饱的，画面还是不出来。`buffered`
+        // 存的是缓存末端的绝对时刻，所以是 position + 30。
+        ..buffered.value = 130
+        // `buffer` 跨用例留下过 '0'（别的组用它关掉失真判据），这里钉回 30 让
+        // `telemetryDiverged` 有确定的门槛可算。
+        ..buffer['cache-secs'] = '30'
         ..isBuffering.value = false
         ..isSeeking.value = false
         ..onlyPlayAudio.value = false
@@ -1686,7 +1693,12 @@ void main() {
     /// 里"位置在推进"那一半就不成立。
     void beat(Duration by, {int? pos}) {
       clock = clock.add(by);
-      if (pos != null) pc.position.value = pos;
+      if (pos != null) {
+        pc.position.value = pos;
+        // 余量跟着位置走（30s）：判据里新增的 `bufferedAhead <= 0` 那道门测的是
+        // 「流喂不喂得饱」，不该被"假时钟推了位置却忘了抬 buffered"绊倒。
+        pc.buffered.value = pos + 30;
+      }
       pc.debugCheckNoVideoTrack(clock);
     }
 
@@ -2034,7 +2046,7 @@ void main() {
       );
     });
 
-    test('七道门逐道关窗：旧窗口攒的时间不算到新一轮头上', () {
+    test('九道门逐道关窗：旧窗口攒的时间不算到新一轮头上', () {
       // 每道门单独摆一次，验证两件事：(1) 摆上就把窗口关掉；(2) 关掉之后重新攒，
       // 上一轮的时间不进新窗口。判别力在第二段：重开门时若旧窗口没被关掉，累计
       // 已够 3s，这一拍就会报出来。
@@ -2050,6 +2062,12 @@ void main() {
         'isSeeking': () => pc.isSeeking.value = true,
         'rebuilding': () => pc.debugRebuildingRenderContext = true,
         'isBuffering': () => pc.isBuffering.value = true,
+        // 2026-10-22 新增的两道（log 17）：余量饿到 0 是**流**没喂到；余量离谱地
+        // 大于缓存上限是音频把 buffered 抬起来的伪读数，说明视频轨那条 URL 坏了。
+        // 两种都有换源那条路管，这里定罪只会拿同一条坏 URL 白烧重建额度。
+        'bufferedAhead<=0': () => pc.buffered.value = pc.position.value,
+        'telemetryDiverged': () =>
+            pc.buffered.value = pc.position.value + 200,
       };
 
       for (final entry in gates.entries) {
@@ -2091,6 +2109,67 @@ void main() {
               '\n${log.text}',
         );
       }
+    });
+
+    // ---- 2026-10-22：饿着 / 遥测失真时不定罪（log 17 的现场）----
+    //
+    // log 17 里画面一直黑着，而 `余量 0s` 与 `CDN 遥测失真` 交替刷了好几轮 ——
+    // 那是**流**的账（视频轨那条 URL 坏了、buffered 被音频抬到 137s/237s）。
+    // 判据当时只看 seek/缓冲/后台，于是把它当成渲染上下文死锁，两次就地重建
+    // 额度全砸在同一条坏 URL 上，URL 没换，画面一直到换源才回来。
+
+    test('余量 0（饿着）一直不定罪：空画面是流的账，换源那条路管', () {
+      closeNoVideoWindow();
+      openNoVideoGates();
+      pc.debugNoVideoStrongOverride = () => true;
+
+      // 位置由音频时钟推着走、余量始终趴在 0：正是"喂不饱"的样子。强指纹本该
+      // 3s 定罪，这里给到 9s 都不许报。
+      void starvedBeat(Duration by, int pos) {
+        clock = clock.add(by);
+        pc
+          ..position.value = pos
+          ..buffered.value = pos
+          ..debugCheckNoVideoTrack(clock);
+      }
+
+      var pos = 100;
+      starvedBeat(Duration.zero, pos);
+      for (var i = 0; i < 9; i++) {
+        starvedBeat(const Duration(seconds: 1), ++pos);
+      }
+      expect(
+        log.has('无视频轨:'),
+        isFalse,
+        reason: '余量 0 时定罪等于拿坏 URL 白烧重建额度：\n${log.text}',
+      );
+      expect(pc.debugNoVideoRebuilds, 0);
+    });
+
+    test('遥测失真（余量 > 3× cache-secs）不定罪：buffered 是音频抬上去的', () {
+      closeNoVideoWindow();
+      openNoVideoGates(); // cache-secs 30 ⇒ 失真线 90s
+      pc.debugNoVideoStrongOverride = () => true;
+
+      void divergedBeat(Duration by, int pos) {
+        clock = clock.add(by);
+        pc
+          ..position.value = pos
+          ..buffered.value = pos + 200 // 余量 200s ≫ 90s
+          ..debugCheckNoVideoTrack(clock);
+      }
+
+      var pos = 100;
+      divergedBeat(Duration.zero, pos);
+      for (var i = 0; i < 9; i++) {
+        divergedBeat(const Duration(seconds: 1), ++pos);
+      }
+      expect(
+        log.has('无视频轨:'),
+        isFalse,
+        reason: '遥测失真时重建是错的救援方向，换源才是：\n${log.text}',
+      );
+      expect(pc.debugNoVideoRebuilds, 0);
     });
   });
 

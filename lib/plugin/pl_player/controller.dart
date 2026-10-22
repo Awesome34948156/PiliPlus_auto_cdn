@@ -2276,7 +2276,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         // 重建期间 ticker 会被 _startListeners 重新挂上，而那时画面本来就还没
         // 起来 —— 不放过的话会把自己刚做完的动作当成新的死锁再探一轮。
         _rebuildingRenderContext ||
-        isBuffering.value;
+        isBuffering.value ||
+        // 饿着 / 遥测失真时不定罪：这两种情况下画面空着是**流**的账，不是渲染
+        // 上下文死锁，两边各有自己的救援（低余量 → 卡顿/饥饿换源；余量被音频
+        // 抬到缓存上限的数倍 → 遥测失真换源），而且都在 `_CdnTrigger.bypassesGates`
+        // 里。在这里定罪只会拿同一条坏 URL 白烧重建额度 —— 2026-10-12 log 17
+        // 两次就地重建全落在「余量 0s」和「余量 137s + 遥测失真」上，URL 没换，
+        // 画面一直黑到换源。口径与 `stream.error` 那条路（见上方）一致。
+        bufferedAhead <= 0 ||
+        telemetryDiverged;
     // 闸门与「画面已起来」的求值顺序是 `gated || _hasVideoTrack`（短路）：
     // 闸门关着时不去碰播放器状态，与旧代码逐字一致。
     final verdict = _noVideoDetector.sample(
