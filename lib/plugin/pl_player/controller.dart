@@ -1650,7 +1650,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 判据是 _ownReload 而不是 _rebuildingRenderContext：用户**恰好在重建窗口里**
     // 换集时后者也是 true，会把用户这次装载的额度白白吃掉（新媒体一上来就背着
     // 上一个媒体烧完的账）。
-    if (!_ownReload) {
+    //
+    // **读到即作废**（一次一用）：[_runRenderContextRebuild] 只把凭证交给自己那次
+    // `reload()`，它的调用链是同步的，所以这里读到的必是"我们自己"。早先写成
+    // 时间窗时，窗口里插进来的用户装载会把凭证吃掉 —— 结果正好相反。
+    final ownReload = _ownReload;
+    _ownReload = false;
+    if (!ownReload) {
       _noVideoRebuilds = 0;
     }
 
@@ -2167,6 +2173,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// （那时 [_rebuildingRenderContext] 也还是 true），只能靠这个标志区分：
   /// 额度只在用户发起的装载上重新给，我们自己的重载不能给自己续命 —— 否则就是
   /// "探满 → 重建 → 探满 → …" 的无限重建。
+  ///
+  /// 它是**一次性凭证**，不是时间窗：[_createVideoController] 读到就清。早先的
+  /// 写法是从 `await reload()` 之前一直置真到它返回，于是窗口里真插进来一个
+  /// 用户装载（换集/换画质/换源）时，吃掉凭证的会是**用户那次** —— 用户那一次
+  /// 不重置额度、我们那次反倒重置了，正好反了。调用链是同步的
+  /// （`reload()` → `playerInit` → `setDataSource` → [_createVideoController]，
+  /// 中间没有 await），所以凭证一定被我们自己那一次读到。
   bool _ownReload = false;
 
   /// 旧 [Player] 正在拆（[Player.dispose] 里有 `VideoOutputManager.Dispose` +
@@ -2421,6 +2434,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // null，否则 _startListeners 的 assert 会炸、旧订阅也会泄漏），两个字段
       // 都置空后 _initPlayer 的两条 assert 才成立。
       _removeListeners();
+      // 旧流那条「打不开」的证词在重建之后就没有意义了：新链会用**当前 URL**
+      // 重新开。不清的话，这个 3 秒定时器会活过重建，然后在刚建好的播放器上
+      // 再 `refreshPlayer()` 一次（备份重启，落点还是新链刚起来的位置）。
+      _cancelErrorReload();
       final old = _videoPlayerController!;
       _videoPlayerController = null;
       _videoController = null;
@@ -2435,19 +2452,35 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 不让他们复用正在拆的对象），让他们在 [_initPlayer] 开头等这一件事。
       final teardown = old.dispose();
       _playerTeardown = teardown;
-      await teardown;
-      if (identical(_playerTeardown, teardown)) {
-        _playerTeardown = null;
+      try {
+        await teardown;
+      } finally {
+        // 拆**失败**也要摘掉：这个 Future 只留在这里给并发装载者等，一旦它带着
+        // 异常落定，后面的每一次 [_initPlayer] 都会 `await` 到同一个异常并抛出
+        // —— 页面从此再也装不起来（而重建是 `unawaited` 的，报错没人看见）。
+        if (identical(_playerTeardown, teardown)) {
+          _playerTeardown = null;
+        }
       }
       _noVideoWindowStart = null;
       if (_playerCount == 0) {
         return;
       }
-      // 请页面重载。用户在这段 await 里自己换了集也无妨：页面那次 playerInit
-      // 会先建成新 player，我们这轮再 playerInit 只是把它重新 open 一遍
-      // （_createVideoController 见 player != null 就复用），不会出现两个 Player。
-      // _ownReload 让 _createVideoController 分清"这是我们自己的重载"与"用户发起的
-      // 装载"—— 两者在它眼里都带着 _rebuildingRenderContext == true。
+      // 拆旧的那几百毫秒里有人开始装载了：那一次正停在 [_initPlayer] 的
+      // `await _playerTeardown` 上，拆完它会建**自己的**渲染上下文。我们这轮
+      // 到此为止 —— 再请页面重载就会与它并发各建一个 [Player]（两路音频、
+      // 进度条在两集之间来回跳），谁后完成谁赢，输的那个原生句柄永远不释放。
+      //
+      // `_processing` 正是这条线索：它由 [setDataSource] 置真，而能被阻塞在这里
+      // 的装载必然还在 [setDataSource] 的 try 里（重建开始前它是假的，见
+      // [_renderRebuildBlocker]）。用户这次装载会自己重置额度，我们不欠什么。
+      if (_processing) {
+        debugPrint('就地重建: 跳过重载（拆除期间已有装载在途）');
+        return;
+      }
+      // 请页面重载。_ownReload 让 _createVideoController 分清"这是我们自己的重载"
+      // 与"用户发起的装载"—— 两者在它眼里都带着 _rebuildingRenderContext == true。
+      // 它是一次性凭证：`reload()` 的调用链同步走到 _createVideoController 的入口。
       _ownReload = true;
       for (final reload in _renderReloadClaimants.values.toList()) {
         await reload();
