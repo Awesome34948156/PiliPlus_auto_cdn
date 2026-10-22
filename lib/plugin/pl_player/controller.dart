@@ -20,6 +20,7 @@ import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/background_video_suspend.dart';
 import 'package:PiliPlus/plugin/pl_player/health/decode_ledger.dart';
+import 'package:PiliPlus/plugin/pl_player/health/no_video_track_detector.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/double_tap_type.dart';
@@ -2127,27 +2128,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _startStallTicker();
   }
 
-  /// 「闸门全开 + 画面为空」这段状态的起点；null = 没有正在累积的窗口。
+  /// 「闸门全开 + 画面为空」的窗口状态机。
   ///
-  /// 它是旧的 `_noVideoProbes` 计数器的替身：每一个旧代码把计数清零的返回点，现在
-  /// 都改成把它置空（见 [_resetNoVideoWindow] 与各处复位点）。**一处都不能漏** ——
-  /// 漏了窗口就会跨装载存活，新装载第一拍就定罪。
-  DateTime? _noVideoWindowStart;
-
-  /// 上一拍时的播放位置，给"强指纹"加一条"位置真的在推进"的保险
-  /// （见 [_noVideoStrongFingerprint]）。
-  ///
-  /// 位置冻住**不关窗**（旧弱指纹路本来也不看位置），只是让强指纹不成立 ⇒ 这次定罪
-  /// 自动落到 [PlayerTuning.noVideoWindowWeak] 那档、上报行也不带 ` [强指纹]` 后缀。别改成
-  /// "冻住就关窗"：位置冻住 + 不在缓冲正是卡顿看门狗抓不到的盲区（它的判据要
-  /// `isBuffering && bufferedAhead == 0`），那样会静默地收窄这张网。
-  int _noVideoLastPosition = 0;
+  /// 2026-10-22 评审 Phase 5 / S2 整块搬出，见 [NoVideoTrackDetector]。
+  /// 八道闸的求值、强指纹怎么算、定罪之后做什么，都仍留在本文件。
+  final NoVideoTrackDetector _noVideoDetector = NoVideoTrackDetector();
 
   /// 关掉正在累积的窗口。任何一道门成立、或画面起来了，都必须调它。
-  void _resetNoVideoWindow() {
-    _noVideoWindowStart = null;
-    _noVideoLastPosition = 0;
-  }
+  void _resetNoVideoWindow() => _noVideoDetector.reset();
 
   /// 本媒体已经就地重建过几次渲染上下文。每换一次媒体在 [_createVideoController]
   /// 里重置（但**绕开**自己那次重建，理由见那里）。见 [PlayerTuning.noVideoRebuildMax]。
@@ -2227,47 +2215,30 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// —— 中间那一档「钉住输出尺寸」2026-10-15 已删（见 [_rebuildRenderContextOnNoVideo]
   /// 上方的墓碑注释）。
   void _checkNoVideoTrack(DateTime now) {
-    if (_videoSuspendedForBackground ||
+    final pos = position.value;
+    final gated =
+        _videoSuspendedForBackground ||
         onlyPlayAudio.value ||
         isLive ||
-        position.value <= 0 ||
+        pos <= 0 ||
         isSeeking.value ||
         _processing ||
         // 重建期间 ticker 会被 _startListeners 重新挂上，而那时画面本来就还没
         // 起来 —— 不放过的话会把自己刚做完的动作当成新的死锁再探一轮。
         _rebuildingRenderContext ||
-        isBuffering.value) {
-      _resetNoVideoWindow();
+        isBuffering.value;
+    // 闸门与「画面已起来」的求值顺序是 `gated || _hasVideoTrack`（短路）：
+    // 闸门关着时不去碰播放器状态，与旧代码逐字一致。
+    final verdict = _noVideoDetector.sample(
+      now: now,
+      positionSecs: pos,
+      shouldReset: gated || _hasVideoTrack,
+      strongFingerprint: () => _noVideoStrongFingerprint,
+    );
+    if (verdict == NoVideoVerdict.none) {
       return;
     }
-    if (_hasVideoTrack) {
-      _resetNoVideoWindow();
-      return;
-    }
-    final start = _noVideoWindowStart;
-    if (start == null) {
-      // 开窗那一拍不定罪：这一拍之前画面空了多久是无从知道的（最多一拍），
-      // 拿它当账去凑窗口就是白送。
-      _noVideoWindowStart = now;
-      _noVideoLastPosition = position.value;
-      return;
-    }
-    // 强指纹每拍重算（不跨拍记忆），再叠一条"位置真的比上一拍大"做双保险
-    // —— 音频在推进本来已由上面 `position.value <= 0` 那道门保证，这里只是
-    // 把"推进"这件事钉在第一手证据上。指纹不成立（含位置冻住）就走长窗那一档。
-    final strong =
-        _noVideoStrongFingerprint && position.value > _noVideoLastPosition;
-    _noVideoLastPosition = position.value;
-    if (now.difference(start) <
-        (strong
-            ? PlayerTuning.noVideoWindow
-            : PlayerTuning.noVideoWindowWeak)) {
-      return;
-    }
-    // 重新开窗：下一次定罪要再攒满一个窗口。额度用尽之后就靠这个节奏在日志里
-    // 留痕（每窗一行）。**这里不需要"距上次重建至少隔多久"的冷却** —— 窗口长度
-    // 本身就是那个冷却，理由见 [PlayerTuning.noVideoWindow]。
-    _noVideoWindowStart = now;
+    final strong = verdict == NoVideoVerdict.strong;
     debugPrint(
       '无视频轨: 音频正常但画面始终为空 (audio ${_safeProp('audio-codec')} '
       'video ${_safeProp('video-codec')} hwdec ${_safeProp('hwdec-current')} '
@@ -2371,7 +2342,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 里（测试够不到）、要么靠用例自己走一遍判据去关。用例 setUp / tearDown 里都要
   /// 主动关一次窗（借 `position.value <= 0` 那道门）。
   @visibleForTesting
-  DateTime? get debugNoVideoWindowStart => _noVideoWindowStart;
+  DateTime? get debugNoVideoWindowStart => _noVideoDetector.windowStart;
 
   /// 强指纹注入缝。
   ///
@@ -2454,7 +2425,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           _playerTeardown = null;
         }
       }
-      _noVideoWindowStart = null;
+      _noVideoDetector.clearWindowStart();
       if (_playerCount == 0) {
         return;
       }
@@ -2480,7 +2451,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     } finally {
       _ownReload = false;
       _rebuildingRenderContext = false;
-      _noVideoWindowStart = null;
+      _noVideoDetector.clearWindowStart();
       _resetStallWatchdog();
     }
   }
