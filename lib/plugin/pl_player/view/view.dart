@@ -347,6 +347,10 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
         // 后台播放关着时，退后台亮 8 秒暂停卡片，给用户手动续播的机会。
         plPlayerController.showBackgroundGraceCard();
       } else {
+        if (state == AppLifecycleState.resumed) {
+          // 回前台：宽限卡的任务到此为止，收掉并把标志重置，让下趟退后台能重新亮。
+          plPlayerController.cancelBackgroundGraceCard();
+        }
         if (_pauseDueToPauseUponEnteringBackgroundMode) {
           _pauseDueToPauseUponEnteringBackgroundMode = false;
           plPlayerController.reinitDecoderAfterBackground(); // 先重建会话，再续播

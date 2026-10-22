@@ -22,7 +22,7 @@ import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:collection/collection.dart';
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:get/get.dart';
 import 'package:path/path.dart' as path;
 
@@ -239,9 +239,18 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   /// 只在 iOS、后台播放关着、且还没亮过时生效。
   void showGraceCard({required Duration position}) {
     if (!Platform.isIOS) return;
-    if (enableBackgroundPlay || _graceActive) return;
+    if (enableBackgroundPlay || _graceActive) {
+      debugPrint(
+        '宽限卡: 跳过（后台播放 $enableBackgroundPlay / 已在宽限 $_graceActive）',
+      );
+      return;
+    }
     final item = _lastKnownMediaItem;
-    if (item == null) return;
+    if (item == null) {
+      debugPrint('宽限卡: 跳过（没有可用的媒体条目缓存）');
+      return;
+    }
+    debugPrint('宽限卡: 亮 8 秒暂停卡（position ${position.inSeconds}s）');
     _graceActive = true;
     _item.add(item);
     setMediaItem(item);
@@ -462,7 +471,13 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     playbackState.add(PlaybackState(processingState: .idle));
   }
 
-  void _endGrace() {
+  void _endGrace() => cancelGrace();
+
+  /// 收起宽限卡并重置宽限状态。两个入口：8 秒到点（[_endGrace]）、回前台
+  /// （[PlPlayerController.cancelBackgroundGraceCard]），后者让下趟退后台不被
+  /// 残留的 `_graceActive` 挡掉。
+  void cancelGrace() {
+    _graceTimer?.cancel();
     _graceTimer = null;
     if (!_graceActive) return;
     _graceActive = false;

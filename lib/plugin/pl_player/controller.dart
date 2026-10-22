@@ -1402,6 +1402,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     } else if (Platform.isIOS && autoPiP && IOSPipHelper.isAvailable) {
       _isAutoEnterPip = true;
     }
+
+    // 新会话开始时，把 handler 的门控拉回存储里的真实值。handler 是单例、不跟着
+    // 本控制器一起销毁，宽限升级那次「临时开后台播放」（activateBackgroundPlayFromGrace）
+    // 只改内存、不落盘；若不在这里清掉，下一段播放的 `enableBackgroundPlay` 会残留成
+    // true，退后台的宽限卡就再也亮不起来（真机：有时候出不来）。
+    if (Platform.isIOS) {
+      videoPlayerServiceHandler?.enableBackgroundPlay =
+          Pref.continuePlayInBackground;
+    }
   }
 
   void _onUserLeaveHint() {
@@ -3480,6 +3489,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 退后台 8 秒宽限：亮一张暂停卡片（后台播放关着时）。
   void showBackgroundGraceCard() {
     if (!Platform.isIOS) return;
+    // 退后台那一刻 mpv 可能已停下音频输出、Now Playing guard 也歇了；先把会话
+    // 重新激活（fire-and-forget），卡片才推得上去。失败不影响主流程。
+    audioSessionHandler?.setActive(true).catchError((_) => false);
     videoPlayerServiceHandler?.showGraceCard(
       position: _videoPlayerController?.state.position ?? Duration.zero,
     );
@@ -3493,6 +3505,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (appInBackground) {
       _onBackgroundForVideoTrack();
     }
+  }
+
+  /// 回前台时收起宽限卡并重置宽限状态，免得下趟退后台被残留的 `_graceActive`
+  /// 挡掉（8 秒窗口没走完就回前台，紧接着再退后台那一次会因标志还在而跳过）。
+  void cancelBackgroundGraceCard() {
+    if (!Platform.isIOS) return;
+    videoPlayerServiceHandler?.cancelGrace();
   }
 
   void setContinuePlayInBackground() {
