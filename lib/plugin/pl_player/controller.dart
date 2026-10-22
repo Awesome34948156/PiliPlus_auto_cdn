@@ -561,12 +561,24 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // hidden → paused 会连发两次，第二次不能把计时推后。
     if (_bgVideoSuspendTimer != null) return;
 
+    final delay = _backgroundSuspendDelay(ifOverdue: Duration.zero);
+    _bgVideoSuspendTimer = Timer(delay, _onBackgroundVideoSuspendTimer);
+    debugPrint('后台省电: 进入后台，${delay.inSeconds}s 后关闭视频轨（音频继续）');
+  }
+
+  /// 本后台会话还剩多久该关视频轨。
+  ///
+  /// 两处调用只差"已经超过等待时长"时怎么办 —— [_onBackgroundForVideoTrack] 当场
+  /// 就关（[Duration.zero]），[_rearmBackgroundVideoSuspendAfterLoad] 给新文件 1 秒
+  /// 让首帧和播放状态稳定。**这两个兜底不要合并**：装载边界上立刻关会关掉还没
+  /// 起来的首帧。
+  Duration _backgroundSuspendDelay({required Duration ifOverdue}) {
+    final now = DateTime.now();
+    _backgroundEnteredAt ??= now;
     final remaining =
         PlayerTuning.backgroundVideoSuspendDelay -
         now.difference(_backgroundEnteredAt!);
-    final delay = remaining.isNegative ? Duration.zero : remaining;
-    _bgVideoSuspendTimer = Timer(delay, _onBackgroundVideoSuspendTimer);
-    debugPrint('后台省电: 进入后台，${delay.inSeconds}s 后关闭视频轨（音频继续）');
+    return remaining.isNegative ? ifOverdue : remaining;
   }
 
   void _onForegroundForVideoTrack() {
@@ -743,6 +755,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_processing) return;
     await Future<void>.delayed(PlayerTuning.backgroundVideoResumeVerifyDelay);
     if (!identical(ctr, _videoPlayerController)) return;
+    // 这一等也要复查：`_processing` 是上一拍采的，这 500ms 里用户换集/换源的话，
+    // 下面的 `file-local-options/vid=no` 会落到**新文件**上 —— 正是上面注释里
+    // 说的那个"重挂的第一下"。新链本来就会自己建，交给看门狗兜底即可。
+    if (_processing) return;
     if (ctr.state.track.video.id != 'no') return;
 
     debugPrint('后台省电: 恢复失败（track.video.id 仍为 no），重挂视频轨');
@@ -783,13 +799,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (!_backgroundVideoSuspendEnabled) return;
     if (!_appInBackground || IOSPipHelper.needsUpdate) return;
 
-    final now = DateTime.now();
-    _backgroundEnteredAt ??= now;
-    final remaining =
-        PlayerTuning.backgroundVideoSuspendDelay -
-        now.difference(_backgroundEnteredAt!);
     // 已经超过等待时长的：新文件给 1 秒让首帧和播放状态稳定就关。
-    final delay = remaining.isNegative ? const Duration(seconds: 1) : remaining;
+    final delay = _backgroundSuspendDelay(
+      ifOverdue: const Duration(seconds: 1),
+    );
 
     _bgVideoSuspendTimer?.cancel();
     _bgVideoSuspendTimer = Timer(delay, _onBackgroundVideoSuspendTimer);
