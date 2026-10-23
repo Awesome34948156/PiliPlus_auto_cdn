@@ -3527,6 +3527,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  /// 把「宽限卡上临时打开的后台播放」还回去。
+  ///
+  /// 临时打开只在当时那条视频上成立；服务发现换到别的视频时调这里（见
+  /// `VideoPlayerServiceHandler.onVideoDetailChange`）。用户自己开着这个开关时
+  /// 不动 —— 那是真设置，不是临时态。
+  static void resetGraceBackgroundPlay() {
+    if (Pref.continuePlayInBackground) return;
+    final controller = _instance;
+    if (controller == null) return;
+    if (!controller.continuePlayInBackground.value) return;
+    controller.continuePlayInBackground.value = false;
+    debugPrint('宽限卡: 临时后台播放已还回去（换视频）');
+  }
+
   /// 回前台时收起宽限卡并重置宽限状态，免得下趟退后台被残留的 `_graceActive`
   /// 挡掉（8 秒窗口没走完就回前台，紧接着再退后台那一次会因标志还在而跳过）。
   void cancelBackgroundGraceCard() {

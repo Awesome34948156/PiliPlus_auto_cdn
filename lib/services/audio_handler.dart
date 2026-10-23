@@ -108,6 +108,13 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   bool _graceActive = false;
   Timer? _graceTimer;
 
+  /// [enableBackgroundPlay] 是不是「宽限卡上按了播放」临时打开的（只改内存）。
+  ///
+  /// 这种临时打开只对**当时那条视频**有效：换到别的视频必须还回去，否则整场
+  /// App 都变成后台播放开着 —— 用户反馈「从卡上按过一次播放之后，看别的视频
+  /// 退后台也一直在放了」就是这个漏出来的标记。
+  bool _graceBackgroundPlay = false;
+
   /// 前台播放期间是否已经把系统「正在播放」认领下来（仅 iOS、后台播放关着）。
   ///
   /// 系统只在 App **真的在放声音**的时候把「正在播放」交给它：退后台暂停之后
@@ -192,6 +199,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       _graceTimer = null;
       _cancelProbeTimers();
       enableBackgroundPlay = true;
+      // 记下这是「临时」打开的：换视频时要还回去（见 [onVideoDetailChange]）。
+      _graceBackgroundPlay = true;
       // 马上要真的出声了，音频本身就能把 App 撑住，后台执行时间可以还回去。
       _endGraceTask();
       // 宽限期间开的会话守卫到此为止，接下去由真实播放态（stream.playing）
@@ -613,6 +622,18 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       default:
         return;
     }
+    // 宽限卡上临时打开的后台播放只认「按卡那一晚」的那条视频：换到别的视频
+    // （换集/换片/直播/听视频都算）就还回去，别让它漏成整场 App 的设置。
+    if (_graceBackgroundPlay &&
+        _lastKnownMediaItem != null &&
+        _lastKnownMediaItem!.id != mediaItem.id) {
+      _graceBackgroundPlay = false;
+      enableBackgroundPlay = false;
+      // 认领（[_iosPlaybackClaim]）留着不动：卡片不用先收再推，换视频的
+      // 空档里系统也不会把我们换下去。
+      PlPlayerController.resetGraceBackgroundPlay();
+      debugPrint('宽限卡: 换到别的视频了，撤掉临时打开的后台播放');
+    }
     _lastKnownMediaItem = mediaItem;
     if (_canPush) {
       _item.add(mediaItem);
@@ -668,6 +689,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
 
     if (value) {
       enableBackgroundPlay = true;
+      // 用户自己开的开关：这就不是「宽限卡临时打开」了，换视频也别撤。
+      _graceBackgroundPlay = false;
       _lastConfig = null;
       _lastPos = null;
       // 只在确实还有播放器/播放页时恢复卡片，避免关掉服务后残留的旧条目
@@ -690,6 +713,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     if (Platform.isIOS &&
         PlPlayerController.getPlayerStatusIfExists() == PlayerStatus.playing) {
       enableBackgroundPlay = false;
+      _graceBackgroundPlay = false;
       _iosPlaybackClaim = true;
       _suspendedState = null;
       _lastConfig = null;
@@ -703,6 +727,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     _suspendedState = playbackState.value;
     _withdrawCard();
     enableBackgroundPlay = false;
+    _graceBackgroundPlay = false;
     _iosPlaybackClaim = false;
     _lastConfig = null;
     _lastPos = null;
