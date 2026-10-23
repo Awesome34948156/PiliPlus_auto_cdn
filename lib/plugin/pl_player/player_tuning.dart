@@ -179,7 +179,11 @@ abstract final class PlayerTuning {
   static const Duration backgroundVideoSuspendDelay = Duration(seconds: 10);
 
   /// 后台播放关着时，退后台留给「手动按播放续播」的暂停卡片存活时长。
-  static const Duration backgroundPlayGraceDuration = Duration(seconds: 8);
+  ///
+  /// 60 秒是用户定的（原来 8 秒，手慢一点就没了）。iOS 的后台任务额度只有
+  /// 30 秒左右，原生侧会续一次任务把窗口撑满；真被系统提前冻住，卡片本身
+  /// 还挂在锁屏上，到点收卡要等 App 被唤醒才会补做。
+  static const Duration backgroundPlayGraceDuration = Duration(seconds: 60);
 
   /// 到点时装载 / seek / 重建在途时的重试间隔。
   static const Duration backgroundVideoSuspendRetry = Duration(seconds: 5);

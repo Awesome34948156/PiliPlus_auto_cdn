@@ -683,19 +683,18 @@ final class NowPlayingProbePlugin: NSObject, FlutterPlugin {
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "beginGrace":
-      // 宽限窗的 8 秒必须活下来。后台播放关着时 mpv 一停音频，iOS 一两秒内就把
-      // App 冻住（真机 2026-10-23：退后台 0.3 秒后的日志就是最后一行，4 分半后
-      // 回前台所有超时定时器才一起补跑）——定时器、会话守卫、8 秒收卡全作废。
-      // 申请一个后台任务断言，系统给的那段时间足够覆盖 8 秒。
-      endGraceTask()
-      backgroundTask = UIApplication.shared.beginBackgroundTask(
-        withName: "grace-card"
-      ) { [weak self] in
-        // 系统收回额度：必须在这里结束，否则下次挂起前会被杀。
-        self?.endGraceTask()
-      }
+      // 宽限窗必须活下来。后台播放关着时 mpv 一停音频，iOS 一两秒内就把 App
+      // 冻住（真机 2026-10-23：退后台 0.3 秒后的日志就是最后一行，4 分半后
+      // 回前台所有超时定时器才一起补跑）——定时器、会话守卫、到点收卡全作废。
+      // 申请后台任务断言撑住窗口；一个任务只有 ~30 秒，窗口拉到 60 秒后要在
+      // 到期时续一次（renewals 封顶，别无限续）。
+      let ms = (call.arguments as? Int) ?? 8000
+      graceDeadline = Date().addingTimeInterval(Double(ms) / 1000)
+      renewals = 0
+      startGraceTask()
       result(Int(backgroundTask.rawValue))
     case "endGrace":
+      graceDeadline = nil
       endGraceTask()
       result(nil)
     case "snapshot":
@@ -706,6 +705,25 @@ final class NowPlayingProbePlugin: NSObject, FlutterPlugin {
   }
 
   private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+  /// 宽限窗的截止时刻（Dart 侧的窗口长度 + 2 秒余量），到期前允许续任务。
+  private var graceDeadline: Date?
+  private var renewals = 0
+
+  private func startGraceTask() {
+    endGraceTask()
+    backgroundTask = UIApplication.shared.beginBackgroundTask(
+      withName: "grace-card"
+    ) { [weak self] in
+      guard let self else { return }
+      // 系统收回额度：窗口还没到就换一个新任务接着撑，否则按规矩结束。
+      if let deadline = graceDeadline, Date() < deadline, renewals < 4 {
+        renewals += 1
+        startGraceTask()
+      } else {
+        endGraceTask()
+      }
+    }
+  }
 
   private func endGraceTask() {
     guard backgroundTask != .invalid else { return }

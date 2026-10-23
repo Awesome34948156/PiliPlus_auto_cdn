@@ -2077,7 +2077,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           // 双击播放、续播、打断恢复这些不经过 play() 的路径也能覆盖到。
           audioSessionHandler?.startNowPlayingGuard(this);
           // 后台播放关着时，趁声音还在放先把系统「正在播放」认领下来：
-          // 退后台暂停之后才写的暂停卡系统不认，8 秒宽限卡就是哑在这。
+          // 退后台暂停之后才写的暂停卡系统不认，宽限卡就是哑在这。
           claimNowPlayingWhilePlaying();
           _stopWakeLockTimer();
           _updatePlaybackState();
@@ -3503,7 +3503,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     );
   }
 
-  /// 退后台 8 秒宽限：亮一张暂停卡片（后台播放关着时）。
+  /// 退后台宽限窗：亮一张暂停卡片（后台播放关着时）。
   void showBackgroundGraceCard() {
     if (!Platform.isIOS) return;
     // 退后台那一刻 mpv 可能已停下音频输出、Now Playing guard 也歇了；先把会话
@@ -3542,7 +3542,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   /// 回前台时收起宽限卡并重置宽限状态，免得下趟退后台被残留的 `_graceActive`
-  /// 挡掉（8 秒窗口没走完就回前台，紧接着再退后台那一次会因标志还在而跳过）。
+  /// 挡掉（窗口没走完就回前台，紧接着再退后台那一次会因标志还在而跳过）。
   void cancelBackgroundGraceCard() {
     if (!Platform.isIOS) return;
     videoPlayerServiceHandler?.cancelGrace();
