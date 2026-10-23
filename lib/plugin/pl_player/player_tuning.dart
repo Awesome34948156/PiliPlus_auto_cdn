@@ -178,12 +178,15 @@ abstract final class PlayerTuning {
   /// 别往 0 改：那等于每次锁屏都关一次，而收益要在分钟尺度上才看得出来。
   static const Duration backgroundVideoSuspendDelay = Duration(seconds: 10);
 
-  /// 后台播放关着时，退后台留给「手动按播放续播」的暂停卡片存活时长。
+  /// 后台播放关着时，亮出暂停卡后向 iOS 要的后台执行时间。
   ///
-  /// 60 秒是用户定的（原来 8 秒，手慢一点就没了）。iOS 的后台任务额度只有
-  /// 30 秒左右，原生侧会续一次任务把窗口撑满；真被系统提前冻住，卡片本身
-  /// 还挂在锁屏上，到点收卡要等 App 被唤醒才会补做。
-  static const Duration backgroundPlayGraceDuration = Duration(seconds: 60);
+  /// **这不是卡片的存活时长**：卡片不会到点自动收（用户要「一直挂着」），
+  /// 只有回前台或卡上按播放才收。这段后台时间只是撑住最初一分钟 —— 让会话
+  /// 守卫、探针跑完，用户在这一分钟内按播放时 App 也还没被冻住。之后 iOS
+  /// 照样会挂起我们，锁屏上那张卡是系统画的，不依赖 App 活着。
+  ///
+  /// iOS 一个后台任务只有 ~30 秒额度，原生侧按这个期限续一次把一分钟撑满。
+  static const Duration backgroundGraceKeepAlive = Duration(seconds: 60);
 
   /// 到点时装载 / seek / 重建在途时的重试间隔。
   static const Duration backgroundVideoSuspendRetry = Duration(seconds: 5);
