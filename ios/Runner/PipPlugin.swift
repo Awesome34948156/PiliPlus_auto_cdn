@@ -681,14 +681,43 @@ final class NowPlayingProbePlugin: NSObject, FlutterPlugin {
   }
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard call.method == "snapshot" else {
+    switch call.method {
+    case "beginGrace":
+      // 宽限窗的 8 秒必须活下来。后台播放关着时 mpv 一停音频，iOS 一两秒内就把
+      // App 冻住（真机 2026-10-23：退后台 0.3 秒后的日志就是最后一行，4 分半后
+      // 回前台所有超时定时器才一起补跑）——定时器、会话守卫、8 秒收卡全作废。
+      // 申请一个后台任务断言，系统给的那段时间足够覆盖 8 秒。
+      endGraceTask()
+      backgroundTask = UIApplication.shared.beginBackgroundTask(
+        withName: "grace-card"
+      ) { [weak self] in
+        // 系统收回额度：必须在这里结束，否则下次挂起前会被杀。
+        self?.endGraceTask()
+      }
+      result(Int(backgroundTask.rawValue))
+    case "endGrace":
+      endGraceTask()
+      result(nil)
+    case "snapshot":
+      result(snapshot())
+    default:
       result(FlutterMethodNotImplemented)
-      return
     }
+  }
+
+  private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+
+  private func endGraceTask() {
+    guard backgroundTask != .invalid else { return }
+    UIApplication.shared.endBackgroundTask(backgroundTask)
+    backgroundTask = .invalid
+  }
+
+  private func snapshot() -> [String: Any] {
     let center = MPNowPlayingInfoCenter.default()
     let info = center.nowPlayingInfo
     let session = AVAudioSession.sharedInstance()
-    let snapshot: [String: Any] = [
+    return [
       "hasInfo": info != nil,
       "title": info?[MPMediaItemPropertyTitle] as? String ?? "",
       "rate": (info?[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?.doubleValue ?? -1,
@@ -702,6 +731,5 @@ final class NowPlayingProbePlugin: NSObject, FlutterPlugin {
       "playEnabled": MPRemoteCommandCenter.shared().playCommand.isEnabled,
       "app": UIApplication.shared.applicationState.rawValue,
     ]
-    result(snapshot)
   }
 }

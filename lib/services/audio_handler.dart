@@ -119,7 +119,25 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   );
 
   /// 诊断用：重推一次暂停态，验证「首推太早（那时 mpv 还没真暂停）」这条假设。
-  static const bool _kRepushExperiment = true;
+  static const bool _kRepushExperiment = false;
+
+  /// 向原生申请一段后台执行时间，撑住整个宽限窗。
+  ///
+  /// 后台播放关着时 mpv 一停音频，iOS 一两秒内就把 App 冻住（真机 2026-10-23：
+  /// 退后台 0.3 秒那行就是最后一行，4 分半后回前台所有定时器才一起补跑）：
+  /// 8 秒收卡、会话守卫、探针全部作废。不申请这条断言，宽限卡在结构上就不可能成立。
+  void _beginGraceTask() {
+    _probeChannel.invokeMethod<int>('beginGrace').then(
+      (id) => debugPrint('宽限卡: 后台任务已申请 id=$id'),
+      onError: (Object e) => debugPrint('宽限卡: 后台任务申请失败 $e'),
+    );
+  }
+
+  void _endGraceTask() {
+    _probeChannel.invokeMethod<void>('endGrace').catchError((Object e) {
+      debugPrint('宽限卡: 后台任务结束失败 $e');
+    });
+  }
 
   void _probeNowPlaying(String label) {
     _probeChannel
@@ -165,6 +183,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       _graceTimer = null;
       _cancelProbeTimers();
       enableBackgroundPlay = true;
+      // 马上要真的出声了，音频本身就能把 App 撑住，后台执行时间可以还回去。
+      _endGraceTask();
       // 宽限期间开的会话守卫到此为止，接下去由真实播放态（stream.playing）
       // 重新认领，别让它残留成永久定时器。
       audioSessionHandler?.stopNowPlayingGuard(this);
@@ -295,6 +315,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     }
     debugPrint('宽限卡: 亮 8 秒暂停卡（position ${position.inSeconds}s）');
     _graceActive = true;
+    // 先把后台执行时间要下来，否则下面这些状态推完没多久 App 就被冻住了。
+    _beginGraceTask();
     // 宽限窗口内盯住音频会话：mpv 起音频输出时会把会话改回混音、退后台暂停后
     // iOS 也可能把会话 deactivate，任一下都会让系统卡片整个消失。守卫每秒把
     // 会话重新钉成独占 + active，8 秒内卡片才稳得住。
@@ -572,7 +594,8 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     _graceActive = false;
     // 「收卡」打出来 = 8 秒定时器真的跑到了（App 没被挂起）；不打 = 被挂起。
     debugPrint('宽限卡: 收卡');
-    // 宽限窗结束（8 秒到点 / 回前台），会话守卫不再需要。
+    // 宽限窗结束（8 秒到点 / 回前台），会话守卫和后台执行时间都不再需要。
+    _endGraceTask();
     audioSessionHandler?.stopNowPlayingGuard(this);
     if (enableBackgroundPlay) return;
     _withdrawCard();
