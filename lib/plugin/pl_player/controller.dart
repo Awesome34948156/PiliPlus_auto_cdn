@@ -18,6 +18,7 @@ import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
+import 'package:PiliPlus/plugin/pl_player/background_resume.dart';
 import 'package:PiliPlus/plugin/pl_player/background_video_suspend.dart';
 import 'package:PiliPlus/plugin/pl_player/health/decode_ledger.dart';
 import 'package:PiliPlus/plugin/pl_player/health/no_video_track_detector.dart';
@@ -1917,7 +1918,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 回前台续播前，把硬解会话重建一遍：iOS 退后台会把 VideoToolbox 会话作废，
   /// 直接续播会先来一波 `vd: Error while decoding frame (hardware decoding)!`
   /// 掉帧（画面抽动）。趁还在暂停态拨一下 hwdec，会话变新，续播才干净。
-  Future<void> reinitDecoderAfterBackground() async {
+  Future<void> reinitDecoderAfterBackground({
+    bool reassertPause = true,
+  }) async {
     // 先开窗再发命令：命令之后几百毫秒内就会冒出 `Missing Sequence Header` /
     // `Missing reference frame` + 成片 OBU 报错（真机实测 0.35s），窗口必须在那之前
     // 生效。软件解码（hw == 'no'）同样要开：从 GOP 中间续解与硬解会话无关。
@@ -1936,7 +1939,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       final pos = ctr.state.position.inMilliseconds / 1000.0;
       // 暂停着回前台才走这条路（见 [shouldReinitDecoderOnResume]），所以这一趟几乎
       // 总是暂停态；命根子是下面那句重新断言。
-      final wasPaused = !ctr.state.playing;
+      final wasPaused = reassertPause && !ctr.state.playing;
       final futures = [
         ctr.command(['set', 'hwdec', 'no']),
         ctr.command(['set', 'hwdec', hw]),
@@ -1959,6 +1962,34 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
     } catch (_) {
       // 切 hwdec / seek 失败宁可带旧会话续播，也别把返回动作搞丢。
+    }
+  }
+
+  /// 回前台时先补重建解码链，等它完成后再恢复原来的播放。
+  ///
+  /// 不能在视图里把这两个异步动作各发一次：重建内部要重新断言暂停，若 `play`
+  /// 抢在前面，重建结束后的 `pause` 又会把它按回去。等待期间用户可能手动暂停、
+  /// 切播放器或再次退后台，所以续播前必须重新核对现场。
+  Future<void> resumePlaybackAfterBackground() async {
+    final ctr = _videoPlayerController;
+    if (ctr == null) return;
+    final epoch = _resumePauseEpoch;
+    try {
+      final resumed = await reinitThenResumePlayback(
+        reinit: () => reinitDecoderAfterBackground(reassertPause: false),
+        canResume: () =>
+            !_disposed &&
+            _playerCount > 0 &&
+            !_appInBackground &&
+            identical(ctr, _videoPlayerController) &&
+            epoch == _resumePauseEpoch,
+        resume: play,
+      );
+      if (!resumed) {
+        debugPrint('后台省电: 重建完成时现场已变，取消自动续播');
+      }
+    } catch (e) {
+      debugPrint('后台省电: 回前台续播失败（$e）');
     }
   }
 

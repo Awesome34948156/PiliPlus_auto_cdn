@@ -354,8 +354,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
         }
         if (_pauseDueToPauseUponEnteringBackgroundMode) {
           _pauseDueToPauseUponEnteringBackgroundMode = false;
-          plPlayerController.reinitDecoderAfterBackground(); // 先重建会话，再续播
-          player?.play();
+          // 必须由控制器串行完成“重建 -> 复查现场 -> 续播”；在这里直接 play
+          // 会排在重建末尾的暂停断言前面，回来后又变成暂停。
+          unawaited(plPlayerController.resumePlaybackAfterBackground());
         }
       }
     } else if (state == AppLifecycleState.resumed) {
