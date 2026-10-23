@@ -19,5 +19,8 @@ import UIKit
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ICloudLogPlugin") {
       ICloudLogPlugin.register(with: registrar)
     }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "NowPlayingProbePlugin") {
+      NowPlayingProbePlugin.register(with: registrar)
+    }
   }
 }

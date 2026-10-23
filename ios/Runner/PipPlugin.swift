@@ -1,6 +1,7 @@
 import AVKit
 import CoreImage
 import Flutter
+import MediaPlayer
 import UIKit
 
 /// Picture-in-Picture for the video texture rendered by media_kit (mpv).
@@ -659,5 +660,48 @@ private enum TextureTracker {
     if !class_addMethod(cls, selector, imp, method_getTypeEncoding(method)) {
       method_setImplementation(method, imp)
     }
+  }
+}
+
+/// 诊断用：把系统「正在播放」那一侧的实际状态读给 Dart。
+///
+/// 宽限卡在 App 日志里「推了」却不出卡时，问题只可能在这一层：原生有没有收到
+/// nowPlayingInfo、会话是什么类别、遥控中心有没有被激活。**只读**，不改任何状态，
+/// 也不碰 audio_service fork 的插件实例。
+final class NowPlayingProbePlugin: NSObject, FlutterPlugin {
+  private static let channelName = "com.example.piliplus/nowplaying_probe"
+
+  static func register(with registrar: FlutterPluginRegistrar) {
+    let channel = FlutterMethodChannel(
+      name: channelName,
+      binaryMessenger: registrar.messenger()
+    )
+    let instance = NowPlayingProbePlugin()
+    registrar.addMethodCallDelegate(instance, channel: channel)
+  }
+
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard call.method == "snapshot" else {
+      result(FlutterMethodNotImplemented)
+      return
+    }
+    let center = MPNowPlayingInfoCenter.default()
+    let info = center.nowPlayingInfo
+    let session = AVAudioSession.sharedInstance()
+    let snapshot: [String: Any] = [
+      "hasInfo": info != nil,
+      "title": info?[MPMediaItemPropertyTitle] as? String ?? "",
+      "rate": (info?[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?.doubleValue ?? -1,
+      "elapsed": (info?[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? NSNumber)?.doubleValue ?? -1,
+      "duration": (info?[MPMediaItemPropertyPlaybackDuration] as? NSNumber)?.doubleValue ?? -1,
+      "state": Int(center.playbackState.rawValue),
+      "cat": session.category.rawValue,
+      "opts": Int(session.categoryOptions.rawValue),
+      "mode": session.mode.rawValue,
+      "otherAudio": session.isOtherAudioPlaying,
+      "playEnabled": MPRemoteCommandCenter.shared().playCommand.isEnabled,
+      "app": UIApplication.shared.applicationState.rawValue,
+    ]
+    result(snapshot)
   }
 }

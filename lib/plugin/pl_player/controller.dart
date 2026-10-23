@@ -3491,7 +3491,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (!Platform.isIOS) return;
     // 退后台那一刻 mpv 可能已停下音频输出、Now Playing guard 也歇了；先把会话
     // 重新激活（fire-and-forget），卡片才推得上去。失败不影响主流程。
-    audioSessionHandler?.setActive(true).catchError((_) => false);
+    audioSessionHandler?.setActive(true).then(
+      (ok) => debugPrint(ok ? '宽限卡: 会话已激活' : '宽限卡: 会话激活失败'),
+      onError: (Object e) => debugPrint('宽限卡: 会话激活异常 $e'),
+    );
     videoPlayerServiceHandler?.showGraceCard(
       position: _videoPlayerController?.state.position ?? Duration.zero,
     );

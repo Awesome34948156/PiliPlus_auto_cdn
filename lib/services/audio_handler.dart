@@ -24,6 +24,7 @@ import 'package:PiliPlus/services/service_locator.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:get/get.dart';
 import 'package:path/path.dart' as path;
 
@@ -107,7 +108,44 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   bool _graceActive = false;
   Timer? _graceTimer;
 
+  /// 诊断探针的定时器（宽限窗口内几拍快照），收卡时一并取消。
+  final List<Timer> _probeTimers = [];
+
   bool get _canPush => enableBackgroundPlay || _graceActive;
+
+  /// 诊断用：读系统「正在播放」那一侧的状态（原生 `NowPlayingProbePlugin`）。
+  static const _probeChannel = MethodChannel(
+    'com.example.piliplus/nowplaying_probe',
+  );
+
+  /// 诊断用：重推一次暂停态，验证「首推太早（那时 mpv 还没真暂停）」这条假设。
+  static const bool _kRepushExperiment = true;
+
+  void _probeNowPlaying(String label) {
+    _probeChannel
+        .invokeMethod<Map<dynamic, dynamic>>('snapshot')
+        .timeout(const Duration(milliseconds: 500))
+        .then((m) {
+          m ??= const {};
+          debugPrint(
+            '宽限卡探针[$label] info=${m['hasInfo']} title=${m['title']} '
+            'rate=${m['rate']} elapsed=${m['elapsed']} dur=${m['duration']} '
+            'state=${m['state']} cmd=${m['playEnabled']} cat=${m['cat']} '
+            'opts=${m['opts']} mode=${m['mode']} other=${m['otherAudio']} '
+            'app=${m['app']}',
+          );
+        })
+        .catchError((Object e) {
+          debugPrint('宽限卡探针[$label] 失败: $e');
+        });
+  }
+
+  void _cancelProbeTimers() {
+    for (final t in _probeTimers) {
+      t.cancel();
+    }
+    _probeTimers.clear();
+  }
 
   Future<void>? Function()? onPlay;
   Future<void>? Function()? onPause;
@@ -125,6 +163,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       _graceActive = false;
       _graceTimer?.cancel();
       _graceTimer = null;
+      _cancelProbeTimers();
       enableBackgroundPlay = true;
       // 宽限期间开的会话守卫到此为止，接下去由真实播放态（stream.playing）
       // 重新认领，别让它残留成永久定时器。
@@ -282,6 +321,37 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     );
     _graceTimer?.cancel();
     _graceTimer = Timer(PlayerTuning.backgroundPlayGraceDuration, _endGrace);
+
+    // 诊断：看这 8 秒里系统侧是什么样（info 有没有写进去、会话类别、遥控中心、
+    // App 有没有被挂起）。+6s 还有探针 = App 没被挂起。
+    _probeNowPlaying('t+0');
+    for (final ms in [300, 1200, 3000, 6000]) {
+      _probeTimers.add(
+        Timer(Duration(milliseconds: ms), () => _probeNowPlaying('t+$ms')),
+      );
+    }
+    if (_kRepushExperiment) {
+      _probeTimers.add(
+        Timer(const Duration(milliseconds: 1500), () {
+          // 原生只在字段真变时才重赋 nowPlayingInfo（AudioServicePlugin.m:300），
+          // 位置加 1ms 才真的重写一次。
+          debugPrint('宽限卡: 重推暂停态（实验）');
+          _updateState(
+            AudioProcessingState.ready,
+            false,
+            item.isLive ?? false,
+            position: position + const Duration(milliseconds: 1),
+            speed: 1.0,
+          );
+        }),
+      );
+      _probeTimers.add(
+        Timer(
+          const Duration(milliseconds: 1650),
+          () => _probeNowPlaying('t+1650'),
+        ),
+      );
+    }
   }
 
   Duration? _lastPos;
@@ -497,8 +567,11 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   void cancelGrace() {
     _graceTimer?.cancel();
     _graceTimer = null;
+    _cancelProbeTimers();
     if (!_graceActive) return;
     _graceActive = false;
+    // 「收卡」打出来 = 8 秒定时器真的跑到了（App 没被挂起）；不打 = 被挂起。
+    debugPrint('宽限卡: 收卡');
     // 宽限窗结束（8 秒到点 / 回前台），会话守卫不再需要。
     audioSessionHandler?.stopNowPlayingGuard(this);
     if (enableBackgroundPlay) return;
