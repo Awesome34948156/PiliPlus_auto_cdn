@@ -739,6 +739,22 @@ void main() {
     );
   });
 
+  test('playerInit 被更新请求取代时，旧轮不继续落点或宣布结果', () async {
+    hostA
+      ..initApplies = false
+      ..attachCdnSwitch();
+    _stall(hostA);
+
+    await _waitFor(() => hostA.initCalls == 1);
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    expect(log.has('第1次 ->'), isTrue);
+    expect(log.has('成功，已切到'), isFalse);
+    expect(log.has('未恢复'), isFalse);
+    expect(log.has('补一次 seek'), isFalse);
+    expect(log.has('放弃，'), isFalse);
+  });
+
   test('小卡顿的节流只在探测真起步后才消费（F7）', () async {
     // `_onPlayerRebuffer` 原来的顺序是"先落下时间戳、再交给闸门"。被 busy/冷却/
     // 进展闸挡下的那一次照样把接下来 30s 的小卡顿探测机会吃掉了 —— 而那几个闸
@@ -2066,8 +2082,7 @@ void main() {
         // 大于缓存上限是音频把 buffered 抬起来的伪读数，说明视频轨那条 URL 坏了。
         // 两种都有换源那条路管，这里定罪只会拿同一条坏 URL 白烧重建额度。
         'bufferedAhead<=0': () => pc.buffered.value = pc.position.value,
-        'telemetryDiverged': () =>
-            pc.buffered.value = pc.position.value + 200,
+        'telemetryDiverged': () => pc.buffered.value = pc.position.value + 200,
       };
 
       for (final entry in gates.entries) {
@@ -2155,7 +2170,9 @@ void main() {
         clock = clock.add(by);
         pc
           ..position.value = pos
-          ..buffered.value = pos + 200 // 余量 200s ≫ 90s
+          ..buffered.value =
+              pos +
+              200 // 余量 200s ≫ 90s
           ..debugCheckNoVideoTrack(clock);
       }
 
@@ -2579,6 +2596,7 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
 
   /// 非空时 [playerInit] 会卡在这里 —— 复现"重载播放器那几秒"的关键。
   Completer<void>? holdInit;
+  bool initApplies = true;
   int initCalls = 0;
   final List<bool?> initAutoplay = [];
 
@@ -2613,7 +2631,7 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
   PlPlayerController get plPlayerController => PlPlayerController.getInstance();
 
   @override
-  Future<void> playerInit({
+  Future<bool> playerInit({
     bool? autoplay,
     bool autoFullScreenFlag = false,
     // 只是为了让 @override 对得上：这条路的 P3 重建测试里触发不到（拆 Player 要
@@ -2624,6 +2642,7 @@ class _CdnHost extends GetxController with CdnSwitchMixin {
     initAutoplay.add(autoplay);
     final hold = holdInit;
     if (hold != null) await hold.future;
+    return initApplies;
   }
 }
 

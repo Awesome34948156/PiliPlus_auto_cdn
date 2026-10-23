@@ -744,7 +744,7 @@ class VideoDetailController extends GetxController
   }
 
   @override
-  Future<void> playerInit({
+  Future<bool> playerInit({
     bool? autoplay,
     bool autoFullScreenFlag = false,
     Duration? resumeAt,
@@ -763,7 +763,7 @@ class VideoDetailController extends GetxController
     // （`_segmentList..sort()` + 弹 skip toast + 消费 `skipOnce` 片段），
     // 当实参传进去会在"本来就该缓起播"的情况下也跑一遍 —— 那是行为回归。
     seek ??= getFirstSegment();
-    await plPlayerController.setDataSource(
+    final applied = await plPlayerController.setDataSource(
       isFileSource
           ? FileSource(
               dir: args['dirPath'],
@@ -798,7 +798,7 @@ class VideoDetailController extends GetxController
       autoFullScreenFlag: autoFullScreenFlag,
     );
 
-    if (isClosed) return;
+    if (!applied || isClosed) return false;
 
     if (plPlayerController.enableBlock) {
       initSkip();
@@ -815,6 +815,7 @@ class VideoDetailController extends GetxController
     }
 
     defaultST = null;
+    return true;
   }
 
   @override

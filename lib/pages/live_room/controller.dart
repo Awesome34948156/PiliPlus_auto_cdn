@@ -213,7 +213,7 @@ class LiveRoomController extends GetxController {
     }
   }
 
-  Future<void>? playerInit({
+  Future<bool>? playerInit({
     bool autoplay = true,
     bool autoFullScreenFlag = false,
   }) {

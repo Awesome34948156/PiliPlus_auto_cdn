@@ -386,7 +386,7 @@ mixin CdnSwitchMixin on GetxController {
 
   /// [resumeAt] 是**显式**的起播点，只有 P3 就地重建会传（见
   /// `utils/resume_seek.dart`）：它压过 [defaultST] / [playedTime]，但零值不算数。
-  Future<void> playerInit({
+  Future<bool> playerInit({
     bool? autoplay,
     bool autoFullScreenFlag = false,
     Duration? resumeAt,
@@ -1905,8 +1905,8 @@ mixin CdnSwitchMixin on GetxController {
     // 清掉它，让 playerInit 走 playedTime 分支 seek 回原位置。
     defaultST = null;
 
-    await playerInit(autoplay: wasPlaying);
-    if (!_roundLive(generation)) return null;
+    final applied = await playerInit(autoplay: wasPlaying);
+    if (!applied || !_roundLive(generation)) return null;
     if (_openFailedFor(service, switchedAt)) {
       // 流都没打开，落点永远是 0：补 seek 只会换来一串 `error running command`。
       // 这一轮照常算换过（落点交回去），交给 [_awaitRecovery] 立刻收尾、换下一个候选。

@@ -32,6 +32,7 @@ import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
+import 'package:PiliPlus/plugin/pl_player/playback_load_queue.dart';
 import 'package:PiliPlus/plugin/pl_player/player_tuning.dart';
 import 'package:PiliPlus/plugin/pl_player/reload_strategy.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/danmaku_options.dart';
@@ -1428,14 +1429,19 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       .._playerCount += 1;
   }
 
-  bool _processing = false;
-  bool get processing => _processing;
+  final PlaybackLoadQueue _loadQueue = PlaybackLoadQueue();
+  bool get processing => _loadQueue.busy;
+  bool get _processing => processing;
 
   // offline
   bool get isFileSource => dataSource is FileSource;
 
   // 初始化资源
-  Future<void> setDataSource(
+  /// 装载一份新媒体；返回 true 表示这次请求是最新且已成功落地。
+  ///
+  /// 旧请求被新请求取代时返回 false。页面据此跳过 playurl 查询、片头片尾初始化
+  /// 等后续动作，CDN 换源也不会把一次已被用户操作取代的装载当成成功。
+  Future<bool> setDataSource(
     DataSource dataSource, {
     bool isLive = false,
     bool autoplay = true,
@@ -1459,79 +1465,98 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     VoidCallback? onInit,
     Volume? volume,
     bool autoFullScreenFlag = false,
-  }) async {
-    try {
-      _processing = true;
-      // 新装载：上一条流的「打不开」证词作废。换源时页面拿装载开始时刻比
-      // [lastOpenFailureAt]，清得越早，旧流的晚到报错越不可能算到新镜像头上。
-      lastOpenFailureAt = null;
-      lastOpenFailure = null;
-      // 装载会让 buffered 归零，显式重置看门狗：切换可能在 1 s 内结束，
-      // ticker 来不及采样到 _processing。
-      _resetStallWatchdog();
-      this.isLive = isLive;
-      _videoType = videoType ?? VideoType.ugc;
-      this.width = width;
-      this.height = height;
-      this.dataSource = dataSource;
-      _autoPlay = autoplay;
-      // 初始化数据加载状态
-      dataStatus.value = DataStatus.loading;
-      // 初始化全屏方向
-      _isVertical = isVertical ?? false;
-      _aid = aid;
-      _bvid = bvid;
-      this.cid = cid;
-      _epid = epid;
-      _seasonId = seasonId;
-      _pgcType = pgcType;
+  }) {
+    // 新装载一开始就撤掉旧媒体安排的错误重载，避免它醒来后重开新视频。
+    _cancelErrorReload();
+    var applied = false;
+    final completed = _loadQueue.run((isCurrent) async {
+      try {
+        if (!isCurrent()) return;
+        // 新装载：上一条流的「打不开」证词作废。换源时页面拿装载开始时刻比
+        // [lastOpenFailureAt]，清得越早，旧流的晚到报错越不可能算到新镜像头上。
+        lastOpenFailureAt = null;
+        lastOpenFailure = null;
+        // 装载会让 buffered 归零，显式重置看门狗：切换可能在 1 s 内结束，
+        // ticker 来不及采样到 _processing。
+        _resetStallWatchdog();
+        this.isLive = isLive;
+        _videoType = videoType ?? VideoType.ugc;
+        this.width = width;
+        this.height = height;
+        this.dataSource = dataSource;
+        _autoPlay = autoplay;
+        // 初始化数据加载状态
+        dataStatus.value = DataStatus.loading;
+        // 初始化全屏方向
+        _isVertical = isVertical ?? false;
+        _aid = aid;
+        _bvid = bvid;
+        this.cid = cid;
+        _epid = epid;
+        _seasonId = seasonId;
+        _pgcType = pgcType;
 
-      if (showSeekPreview) {
-        _clearPreview();
+        if (showSeekPreview) {
+          _clearPreview();
+        }
+        cancelLongPressTimer();
+        if (_videoPlayerController != null &&
+            _videoPlayerController!.state.playing) {
+          await pause(notify: false);
+          if (!isCurrent()) return;
+        }
+
+        if (_playerCount == 0) return;
+        // 配置Player 音轨、字幕等等
+        await _createVideoController(
+          dataSource,
+          seekTo,
+          volume,
+          isCurrent: isCurrent,
+        );
+        if (!isCurrent()) return;
+
+        if (_playerCount == 0) {
+          _removeListeners();
+          _videoPlayerController?.dispose();
+          _videoPlayerController = null;
+          _videoController = null;
+          return;
+        }
+
+        updateDuration(duration ?? _videoPlayerController!.state.duration);
+        position.value = buffered.value = seekTo?.inSeconds ?? 0;
+
+        dataStatus.value = .loaded;
+
+        if (autoFullScreenFlag && autoEnterFullScreen) {
+          triggerFullScreen(status: true);
+        }
+
+        await _initializePlayer(isCurrent: isCurrent);
+        if (!isCurrent()) return;
+        onInit?.call();
+        applied = true;
+      } catch (err, stackTrace) {
+        if (!isCurrent()) return;
+        dataStatus.value = DataStatus.error;
+        if (kDebugMode) {
+          debugPrint(stackTrace.toString());
+          debugPrint('plPlayer err:  $err');
+        }
+      } finally {
+        // 后台装载（换集/换源/错误重载）会让 file-local 的 `vid=no` 随旧文件复位，
+        // 视频轨又回来了 —— 只有最新请求有权重排后台关轨。
+        if (isCurrent()) {
+          try {
+            _rearmBackgroundVideoSuspendAfterLoad();
+          } catch (e) {
+            debugPrint('装载完成后重排后台关轨失败（$e）');
+          }
+        }
       }
-      cancelLongPressTimer();
-      if (_videoPlayerController != null &&
-          _videoPlayerController!.state.playing) {
-        await pause(notify: false);
-      }
-
-      if (_playerCount == 0) {
-        return;
-      }
-      // 配置Player 音轨、字幕等等
-      await _createVideoController(dataSource, seekTo, volume);
-
-      if (_playerCount == 0) {
-        _removeListeners();
-        _videoPlayerController?.dispose();
-        _videoPlayerController = null;
-        _videoController = null;
-        return;
-      }
-
-      updateDuration(duration ?? _videoPlayerController!.state.duration);
-      position.value = buffered.value = seekTo?.inSeconds ?? 0;
-
-      dataStatus.value = .loaded;
-
-      if (autoFullScreenFlag && autoEnterFullScreen) {
-        triggerFullScreen(status: true);
-      }
-
-      await _initializePlayer();
-      onInit?.call();
-    } catch (err, stackTrace) {
-      dataStatus.value = DataStatus.error;
-      if (kDebugMode) {
-        debugPrint(stackTrace.toString());
-        debugPrint('plPlayer err:  $err');
-      }
-    } finally {
-      _processing = false;
-      // 后台装载（换集/换源/错误重载）会让 file-local 的 `vid=no` 随旧文件复位，
-      // 视频轨又回来了 —— 按原后台会话的剩余时间重新关。
-      _rearmBackgroundVideoSuspendAfterLoad();
-    }
+    });
+    return completed.then((_) => applied);
   }
 
   String? shadersDirPath;
@@ -1694,8 +1719,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Future<void> _createVideoController(
     DataSource dataSource,
     Duration? seekTo,
-    Volume? volume,
-  ) async {
+    Volume? volume, {
+    required bool Function() isCurrent,
+  }) async {
     isBuffering.value = false;
     _heartDuration = 0;
     danmakuController?.clear();
@@ -1722,6 +1748,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
     if (player == null) {
       player = await _ensurePlayerInitialized();
+      if (!isCurrent()) return;
       if (_playerCount == 0) {
         _removeListeners();
         player.dispose();
@@ -1732,8 +1759,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _videoPlayerController = player;
       if (isAnim && superResolutionType.value != .disable) {
         await setShader();
+        if (!isCurrent()) return;
       }
     }
+    if (!isCurrent()) return;
 
     final Map<String, String> extras = {
       if (dataSource is FileSource)
@@ -1994,20 +2023,24 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   // 开始播放
-  Future<void> _initializePlayer() async {
+  Future<void> _initializePlayer({
+    required bool Function() isCurrent,
+  }) async {
     if (_instance == null) return;
     // 设置倍速
     if (_videoPlayerController != null) {
       final speed = isLive ? 1.0 : playbackSpeed;
       if (_videoPlayerController!.state.rate != speed) {
         await setPlaybackSpeed(speed);
+        if (!isCurrent()) return;
       }
     }
+    if (!isCurrent()) return;
     _initVideoFit();
 
     // 自动播放
     if (_autoPlay) {
-      playIfExists();
+      await playIfExists();
     }
   }
 
@@ -3539,10 +3572,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (!Platform.isIOS) return;
     // 退后台那一刻 mpv 可能已停下音频输出、Now Playing guard 也歇了；先把会话
     // 重新激活（fire-and-forget），卡片才推得上去。失败不影响主流程。
-    audioSessionHandler?.setActive(true).then(
-      (ok) => debugPrint(ok ? '宽限卡: 会话已激活' : '宽限卡: 会话激活失败'),
-      onError: (Object e) => debugPrint('宽限卡: 会话激活异常 $e'),
-    );
+    audioSessionHandler
+        ?.setActive(true)
+        .then(
+          (ok) => debugPrint(ok ? '宽限卡: 会话已激活' : '宽限卡: 会话激活失败'),
+          onError: (Object e) => debugPrint('宽限卡: 会话激活异常 $e'),
+        );
     videoPlayerServiceHandler?.showGraceCard(
       position: _videoPlayerController?.state.position ?? Duration.zero,
     );
