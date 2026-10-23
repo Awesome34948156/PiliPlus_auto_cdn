@@ -687,7 +687,8 @@ final class NowPlayingProbePlugin: NSObject, FlutterPlugin {
       // 冻住（真机 2026-10-23：退后台 0.3 秒后的日志就是最后一行，4 分半后
       // 回前台所有超时定时器才一起补跑）——定时器、会话守卫、到点收卡全作废。
       // 申请后台任务断言撑住窗口；一个任务只有 ~30 秒，窗口拉到 60 秒后要在
-      // 到期时续一次（renewals 封顶，别无限续）。
+      // 到期时续一次（renewals 封顶，别无限续）。真机实测续任务换不来第二段
+      // 30 秒：亮卡后 30.005 秒 App 被挂起，卡也跟着消失。续任务留着当兜底。
       let ms = (call.arguments as? Int) ?? 8000
       graceDeadline = Date().addingTimeInterval(Double(ms) / 1000)
       renewals = 0

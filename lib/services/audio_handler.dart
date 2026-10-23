@@ -106,8 +106,9 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
 
   /// 宽限卡片是否亮着（后台播放关着、退后台后）。
   ///
-  /// 卡片**不会到点自动收**：用户要求「一直挂着」。收卡只有两个入口 —— 回前台
-  /// （`cancelBackgroundGraceCard`）和卡上按播放（[play]）。
+  /// 卡片**没有到点自动收的定时器**，主动收卡只有两个入口 —— 回前台
+  /// （`cancelBackgroundGraceCard`）和卡上按播放（[play]）。但 App 被挂起后
+  /// 系统会自己把卡收走，实测约 30 秒（见 `PlayerTuning.backgroundGraceKeepAlive`）。
   bool _graceActive = false;
 
   /// [enableBackgroundPlay] 是不是「宽限卡上按了播放」临时打开的（只改内存）。
@@ -144,10 +145,10 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   /// 后台播放关着时 mpv 一停音频，iOS 一两秒内就把 App 冻住（真机 2026-10-23：
   /// 退后台 0.3 秒那行就是最后一行，4 分半后回前台所有定时器才一起补跑）。
   /// 不申请这条断言，会话守卫和探针连头几秒都撑不过，用户在卡上按播放时
-  /// 也得先把 App 唤醒。**这笔额度不负责卡片存活**：没有任何定时器用它的长度，
-  /// 时间到了 App 被挂起，锁屏上那张卡仍然挂着（系统画的）。
+  /// 也得先把 App 唤醒。
   ///
-  /// 真机实测（+5614）只拿到 ~30 秒：t+15000 的探针在，t+30000 的没有。
+  /// 真机实测（+5614）：这笔额度只有 ~30 秒，t+15000 的探针在、t+30000 的是
+  /// 最后一行；到期 App 被挂起，iOS 收走音频会话，锁屏上的卡也跟着消失。
   void _beginGraceTask() {
     // 把额度长度一起带过去：原生靠这个期限决定到期还要不要续任务（实测
     // 续了也换不来第二段 30 秒，这个 60 秒如今只是上限）。
@@ -371,9 +372,9 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
 
   /// 退后台亮一张「暂停 + 播放键」的卡片，给用户手动续播的机会。
   ///
-  /// 只在 iOS、后台播放关着、且还没亮过时生效。卡片亮上就**一直挂着**，
-  /// 不到点自动收：收卡只在回前台（[cancelGrace]）和卡上按播放（[play]）
-  /// 两个入口发生。
+  /// 只在 iOS、后台播放关着、且还没亮过时生效。没有到点自动收的定时器，
+  /// 主动收卡只在回前台（[cancelGrace]）和卡上按播放（[play]）两个入口发生；
+  /// 但 App 被挂起后系统会自己收走，实测寿命 ≈ 后台额度 30 秒。
   void showGraceCard({required Duration position}) {
     if (!Platform.isIOS) return;
     if (enableBackgroundPlay || _graceActive) {
@@ -387,7 +388,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       debugPrint('宽限卡: 跳过（没有可用的媒体条目缓存）');
       return;
     }
-    debugPrint('宽限卡: 亮暂停卡（一直挂着，position ${position.inSeconds}s）');
+    debugPrint('宽限卡: 亮暂停卡（position ${position.inSeconds}s，后台额度约 30s）');
     _graceActive = true;
     // 认领从此归宽限状态自己管（`_canPush` 里那条），标志清掉，免得两个
     // 来源同时为真、收卡时又被另一条推回来。
@@ -667,12 +668,12 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     playbackState.add(PlaybackState(processingState: .idle));
   }
 
-  /// 收起宽限卡并重置宽限状态。唯一入口：回前台
+  /// 收起宽限卡并重置宽限状态。主动收卡的唯一入口：回前台
   /// （`PlPlayerController.cancelBackgroundGraceCard`），它同时让下趟退后台不被
   /// 残留的 `_graceActive` 挡掉。
   ///
-  /// 卡片没有「到点自动收」—— 用户要它一直挂着，所以这里只由回前台触发。
-  /// 卡上按播放走的是 [play] 的宽限分支，不经过这里。
+  /// 没有「到点自动收」的定时器；另一条收卡路径是系统在挂起 App 时收走
+  /// （实测约 30 秒）。卡上按播放走的是 [play] 的宽限分支，不经过这里。
   void cancelGrace() {
     _cancelProbeTimers();
     if (!_graceActive) return;

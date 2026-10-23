@@ -344,7 +344,8 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
           _pauseDueToPauseUponEnteringBackgroundMode = true;
           player.pause();
         }
-        // 后台播放关着时，退后台亮一张暂停卡片（一直挂着），给用户手动续播的机会。
+        // 后台播放关着时，退后台亮一张暂停卡片（直到回前台或按播放；实测后台
+        // 额度 ~30 秒，之后系统会收走），给用户手动续播的机会。
         plPlayerController.showBackgroundGraceCard();
       } else {
         if (state == AppLifecycleState.resumed) {
