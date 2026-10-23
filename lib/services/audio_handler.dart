@@ -108,10 +108,19 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   bool _graceActive = false;
   Timer? _graceTimer;
 
+  /// 前台播放期间是否已经把系统「正在播放」认领下来（仅 iOS、后台播放关着）。
+  ///
+  /// 系统只在 App **真的在放声音**的时候把「正在播放」交给它：退后台暂停之后
+  /// 再从后台写 `nowPlayingInfo` 一律不认（2026-10-21 实验：卡片被系统交给别的
+  /// App 后，后台每 3 秒完整重新认领一次也抢不回来）。所以宽限卡要亮得起来，
+  /// 认领必须发生在声音还在放的时候 —— 见 [claimPlaybackWhilePlaying]。
+  bool _iosPlaybackClaim = false;
+
   /// 诊断探针的定时器（宽限窗口内几拍快照），收卡时一并取消。
   final List<Timer> _probeTimers = [];
 
-  bool get _canPush => enableBackgroundPlay || _graceActive;
+  bool get _canPush =>
+      enableBackgroundPlay || _graceActive || _iosPlaybackClaim;
 
   /// 诊断用：读系统「正在播放」那一侧的状态（原生 `NowPlayingProbePlugin`）。
   static const _probeChannel = MethodChannel(
@@ -297,6 +306,49 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     if (!mediaItem.isClosed) mediaItem.add(newMediaItem);
   }
 
+  /// iOS、后台播放关着时，在**声音还在放的时候**先把系统「正在播放」认领下来。
+  ///
+  /// 这一步是宽限卡能不能出现的前提：退后台时我们先暂停、再写 Now Playing，
+  /// 而系统不把「已经从后台才认领的暂停卡」当成正在播放的 App —— 真机 2026-10-23
+  /// 那局 8 秒里 `info=true state=2 cmd=true cat=playback opts=0` 全对，三处却
+  /// 一张卡都没有。改在播放期间就认领（此刻会话真在出声），退后台那一暂停才被
+  /// 系统当成「同一个 App 暂停了」，卡片留得下来。代价是前台播放时锁屏/控制
+  /// 中心也会有这张卡（暂停键可用）。
+  void claimPlaybackWhilePlaying({required Duration position}) {
+    if (!Platform.isIOS) return;
+    if (enableBackgroundPlay || _iosPlaybackClaim || _graceActive) return;
+    final item = _lastKnownMediaItem;
+    if (item == null) return;
+    debugPrint('宽限卡: 播放中先认领「正在播放」（position ${position.inSeconds}s）');
+    _iosPlaybackClaim = true;
+    _item.add(item);
+    setMediaItem(item);
+    _lastPos = position;
+    _updateState(
+      AudioProcessingState.ready,
+      true,
+      item.isLive ?? false,
+      position: position,
+      speed: 1.0,
+    );
+    _probeNowPlaying('claim');
+  }
+
+  /// 播放器销毁 / 离开播放页时把认领还回去。
+  ///
+  /// 幂等：宽限卡亮着时由 [cancelGrace] 负责收，这里不插手。
+  void releasePlaybackClaim() {
+    if (!_iosPlaybackClaim) return;
+    _iosPlaybackClaim = false;
+    if (_graceActive) return;
+    if (playbackState.value.processingState == .idle) return;
+    debugPrint('宽限卡: 释放「正在播放」认领');
+    _withdrawCard();
+    _item.clear();
+    _lastConfig = null;
+    _lastPos = null;
+  }
+
   /// 退后台 8 秒宽限：亮一张「暂停 + 播放键」的卡片，给用户手动续播的机会。
   ///
   /// 只在 iOS、后台播放关着、且还没亮过时生效。
@@ -315,6 +367,9 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     }
     debugPrint('宽限卡: 亮 8 秒暂停卡（position ${position.inSeconds}s）');
     _graceActive = true;
+    // 认领从此归宽限状态自己管（`_canPush` 里那条），标志清掉：8 秒到点收卡时
+    // 不能再有一个「已认领」把卡片推回来。
+    _iosPlaybackClaim = false;
     // 先把后台执行时间要下来，否则下面这些状态推完没多久 App 就被冻住了。
     _beginGraceTask();
     // 宽限窗口内盯住音频会话：mpv 起音频输出时会把会话改回混音、退后台暂停后
@@ -629,18 +684,32 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       return;
     }
 
+    // 关的是「后台播放」，不是「别再放声音」：正在前台播放就把卡片留着，
+    // 认领从「后台播放开关」换成 [claimPlaybackWhilePlaying] 那一支 ——
+    // 收掉再重推不如根本不收（卡片一闪，系统还可能把我们换下去）。
+    if (Platform.isIOS &&
+        PlPlayerController.getPlayerStatusIfExists() == PlayerStatus.playing) {
+      enableBackgroundPlay = false;
+      _iosPlaybackClaim = true;
+      _suspendedState = null;
+      _lastConfig = null;
+      _lastPos = null;
+      return;
+    }
+
     // audio_service 只在「非 idle → idle」时调用 stopService；Darwin 端由此
     // 把 nowPlayingInfo 置 nil 并收回遥控。单独 mediaItem.add(null) 没用，
     // audio_service 的 _observeMediaItem 会直接忽略 null。
     _suspendedState = playbackState.value;
     _withdrawCard();
     enableBackgroundPlay = false;
+    _iosPlaybackClaim = false;
     _lastConfig = null;
     _lastPos = null;
   }
 
   void onVideoDetailDispose(String herotag) {
-    if (!enableBackgroundPlay) return;
+    if (!_canPush) return;
 
     if (_item.isNotEmpty) {
       _item.removeWhere((item) => item.id.endsWith(herotag));
@@ -654,12 +723,12 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   }
 
   void clearIfNeeded() {
-    if (!enableBackgroundPlay) return;
+    if (!_canPush) return;
     if (_item.isEmpty) clear();
   }
 
   void clear() {
-    if (!enableBackgroundPlay) return;
+    if (!_canPush) return;
     mediaItem.add(null);
     _item.clear();
     _lastPos = null;

@@ -2076,6 +2076,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           // iOS 就不认我们为「正在播放」）。挂在真实播放状态上，
           // 双击播放、续播、打断恢复这些不经过 play() 的路径也能覆盖到。
           audioSessionHandler?.startNowPlayingGuard(this);
+          // 后台播放关着时，趁声音还在放先把系统「正在播放」认领下来：
+          // 退后台暂停之后才写的暂停卡系统不认，8 秒宽限卡就是哑在这。
+          claimNowPlayingWhilePlaying();
           _stopWakeLockTimer();
           _updatePlaybackState();
           WakelockPlus.enable();
@@ -3469,6 +3472,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _instance = null;
     }
     videoPlayerServiceHandler?.clear();
+    // clear() 之后：前台播放期间认领的「正在播放」到这儿才还回去
+    // （顺序反了会让 clear() 因为 `_canPush` 变假而跳过收卡）。
+    videoPlayerServiceHandler?.releasePlaybackClaim();
     audioSessionHandler?.stopNowPlayingGuard(this);
 
     // iOS：会话一直留到播放器真正销毁，锁屏卡片才能在暂停后继续存在。
@@ -3484,6 +3490,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     } else {
       _instance?._playerCount -= 1;
     }
+  }
+
+  /// 前台播放期间先认领系统「正在播放」（仅 iOS、后台播放关着）。
+  ///
+  /// 系统只在 App 真在出声的时候把它当成正在播放的 App；退后台暂停之后再写
+  /// 暂停卡是认不出来的。认领一直挂到播放器销毁，由服务自己释放。
+  void claimNowPlayingWhilePlaying() {
+    if (!Platform.isIOS) return;
+    videoPlayerServiceHandler?.claimPlaybackWhilePlaying(
+      position: _videoPlayerController?.state.position ?? Duration.zero,
+    );
   }
 
   /// 退后台 8 秒宽限：亮一张暂停卡片（后台播放关着时）。
