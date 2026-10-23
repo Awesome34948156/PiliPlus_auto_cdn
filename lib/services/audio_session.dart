@@ -3,10 +3,11 @@ import 'dart:io' show Platform;
 
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/services/now_playing_guard.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
 
-class AudioSessionHandler {
+class AudioSessionHandler implements NowPlayingGuard {
   late AudioSession session;
   late final Future<void> _ready;
   bool _playInterrupted = false;
@@ -33,6 +34,12 @@ class AudioSessionHandler {
   ///
   /// 这里每秒看一眼实际选项，真被改坏了才重新配置 —— 只在需要时动手，
   /// 免得反复 setCategory 白白打断声音。
+  @override
+  void start(Object holder) => startNowPlayingGuard(holder);
+
+  @override
+  void stop(Object holder) => stopNowPlayingGuard(holder);
+
   void startNowPlayingGuard(Object holder) {
     _guardHolders.add(holder);
     if (!Platform.isIOS || _mixGuard != null) return;

@@ -16,11 +16,11 @@ import 'package:PiliPlus/pages/video/introduction/ugc/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/player_tuning.dart';
+import 'package:PiliPlus/services/now_playing_guard.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/image_utils.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
-import 'package:PiliPlus/services/service_locator.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
@@ -96,6 +96,9 @@ List<MediaControl> buildMediaControls({
 
 class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   static final List<MediaItem> _item = [];
+
+  /// 由 service locator 在 AudioSessionHandler 建好后注入。
+  NowPlayingGuard? nowPlayingGuard;
   // iOS 上设置里已把「后台音频服务」并进「后台播放」，这里跟着同一个开关走。
   bool enableBackgroundPlay = Platform.isIOS
       ? Pref.continuePlayInBackground
@@ -217,7 +220,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       _endGraceTask();
       // 宽限期间开的会话守卫到此为止，接下去由真实播放态（stream.playing）
       // 重新认领，别让它残留成永久定时器。
-      audioSessionHandler?.stopNowPlayingGuard(this);
+      nowPlayingGuard?.stop(this);
       PlPlayerController.instance?.activateBackgroundPlayFromGrace();
     }
     return onPlay?.call() ??
@@ -398,7 +401,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     // 亮卡期间盯住音频会话：mpv 起音频输出时会把会话改回混音、退后台暂停后
     // iOS 也可能把会话 deactivate，任一下都会让系统卡片整个消失。守卫每秒把
     // 会话重新钉成独占 + active，卡片才稳得住。
-    audioSessionHandler?.startNowPlayingGuard(this);
+    nowPlayingGuard?.start(this);
     _item.add(item);
     setMediaItem(item);
     _lastPos = position;
@@ -681,7 +684,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     debugPrint('宽限卡: 收卡（回前台）');
     // 回前台了，会话守卫和后台执行时间都不再需要。
     _endGraceTask();
-    audioSessionHandler?.stopNowPlayingGuard(this);
+    nowPlayingGuard?.stop(this);
     if (enableBackgroundPlay) return;
     _withdrawCard();
     _item.clear();
