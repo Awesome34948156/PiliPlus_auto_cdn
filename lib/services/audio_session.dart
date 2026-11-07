@@ -6,14 +6,145 @@ import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/now_playing_guard.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
+
+/// The audio-session operations used by [AudioSessionHandler].
+///
+/// Production uses the `audio_session` plugin. Tests inject a fake without
+/// initializing platform channels or waiting for real audio hardware.
+abstract interface class AudioSessionPort {
+  Future<void> get ready;
+
+  Future<AVAudioSessionCategory> get category;
+
+  Future<AVAudioSessionCategoryOptions> get categoryOptions;
+
+  Stream<AudioInterruptionEvent> get interruptionEvents;
+
+  Stream<void> get becomingNoisyEvents;
+
+  Future<void> configureMusic();
+
+  Future<bool> setActive(
+    bool active, {
+    AVAudioSessionSetActiveOptions? avAudioSessionSetActiveOptions,
+  });
+}
+
+/// Player actions needed while handling an audio interruption.
+///
+/// Kept behind a small interface so the interruption ordering can be tested
+/// without constructing the global video player controller.
+abstract interface class AudioInterruptionActions {
+  PlayerStatus? get playerStatus;
+
+  void duckVolume(bool down);
+
+  void pauseAsInterruption();
+
+  void resumeAfterInterruption();
+
+  void pauseForNoisyRoute();
+}
+
+class _PluginAudioSessionPort implements AudioSessionPort {
+  late final Future<AudioSession> _session = AudioSession.instance;
+
+  @override
+  Future<void> get ready async {
+    await _session;
+  }
+
+  @override
+  Future<AVAudioSessionCategory> get category => AVAudioSession().category;
+
+  @override
+  Future<AVAudioSessionCategoryOptions> get categoryOptions =>
+      AVAudioSession().categoryOptions;
+
+  @override
+  Stream<AudioInterruptionEvent> get interruptionEvents =>
+      Stream.fromFuture(_session).asyncExpand(
+        (session) => session.interruptionEventStream,
+      );
+
+  @override
+  Stream<void> get becomingNoisyEvents =>
+      Stream.fromFuture(_session).asyncExpand(
+        (session) => session.becomingNoisyEventStream,
+      );
+
+  @override
+  Future<void> configureMusic() async {
+    final session = await _session;
+    await session.configure(const AudioSessionConfiguration.music());
+  }
+
+  @override
+  Future<bool> setActive(
+    bool active, {
+    AVAudioSessionSetActiveOptions? avAudioSessionSetActiveOptions,
+  }) async {
+    final session = await _session;
+    return session.setActive(
+      active,
+      avAudioSessionSetActiveOptions: avAudioSessionSetActiveOptions,
+    );
+  }
+}
+
+class _PlayerAudioInterruptionActions implements AudioInterruptionActions {
+  @override
+  PlayerStatus? get playerStatus =>
+      PlPlayerController.getPlayerStatusIfExists();
+
+  @override
+  void duckVolume(bool down) {
+    PlPlayerController.setVolumeIfExists(
+      (PlPlayerController.getVolumeIfExists() ?? 0) * (down ? 0.5 : 2),
+      showIndicator: false,
+    );
+  }
+
+  @override
+  void pauseAsInterruption() {
+    PlPlayerController.pauseIfExists(isInterrupt: true);
+  }
+
+  @override
+  void resumeAfterInterruption() {
+    PlPlayerController.playIfExists();
+  }
+
+  @override
+  void pauseForNoisyRoute() {
+    PlPlayerController.pauseIfExists();
+  }
+}
 
 class AudioSessionHandler implements NowPlayingGuard {
-  late AudioSession session;
+  AudioSessionHandler({
+    AudioSessionPort? port,
+    AudioInterruptionActions? actions,
+    bool? isIOS,
+  }) : _port = port ?? _PluginAudioSessionPort(),
+       _actions = actions ?? _PlayerAudioInterruptionActions(),
+       _isIOS = isIOS ?? Platform.isIOS {
+    _ready = initSession();
+  }
+
+  final AudioSessionPort _port;
+  final AudioInterruptionActions _actions;
+  final bool _isIOS;
   late final Future<void> _ready;
   bool _playInterrupted = false;
+  bool _externalInterruption = false;
 
   /// 播放期间盯住会话选项的定时器，见 [startNowPlayingGuard]。
   Timer? _mixGuard;
+
+  /// Incremented whenever an in-flight guard check must become stale.
+  int _guardEpoch = 0;
 
   /// 当前持有守卫的宿主（视频控制器 / 音频页控制器）。
   ///
@@ -42,10 +173,20 @@ class AudioSessionHandler implements NowPlayingGuard {
 
   void startNowPlayingGuard(Object holder) {
     _guardHolders.add(holder);
-    if (!Platform.isIOS || _mixGuard != null) return;
+    _ensureNowPlayingGuard();
+  }
+
+  void _ensureNowPlayingGuard() {
+    if (!_isIOS ||
+        _externalInterruption ||
+        _guardHolders.isEmpty ||
+        _mixGuard != null) {
+      return;
+    }
+    final epoch = _guardEpoch;
     _mixGuard = Timer.periodic(
       const Duration(seconds: 1),
-      (_) => _assertExclusive(),
+      (_) => _assertExclusive(epoch),
     );
   }
 
@@ -56,28 +197,45 @@ class AudioSessionHandler implements NowPlayingGuard {
   void stopNowPlayingGuard(Object holder) {
     _guardHolders.remove(holder);
     if (_guardHolders.isNotEmpty) return;
+    _guardEpoch++;
     _mixGuard?.cancel();
     _mixGuard = null;
   }
 
-  Future<void> _assertExclusive() async {
-    if (_mixGuard == null) return;
+  bool _guardCanRun(int epoch) =>
+      _isIOS &&
+      !_externalInterruption &&
+      _guardEpoch == epoch &&
+      _mixGuard != null;
+
+  Future<void> _assertExclusive(int epoch) async {
+    if (!_guardCanRun(epoch)) return;
     try {
-      await _ready;
-      final av = AVAudioSession();
-      final options = await av.categoryOptions;
-      final category = await av.category;
-      if (_mixGuard == null) return;
+      await _port.ready;
+      if (!_guardCanRun(epoch)) return;
+      final options = await _port.categoryOptions;
+      if (!_guardCanRun(epoch)) return;
+      final category = await _port.category;
+      if (!_guardCanRun(epoch)) return;
       if (options.contains(AVAudioSessionCategoryOptions.mixWithOthers) ||
           category != AVAudioSessionCategory.playback) {
-        await session.configure(const AudioSessionConfiguration.music());
+        await _port.configureMusic();
+        if (!_guardCanRun(epoch)) {
+          await _releaseAfterStaleGuard();
+          return;
+        }
         debugPrint('[锁屏控制] mpv 把会话改回了混音，已重新钉成独占');
       }
       // mpv 每重建一次音频输出，就会先把会话 deactivate 再 activate。回主页后
       // 它重建时如果没把我们重新激活，iOS 就不再把我们当选「正在播放」——
       // 卡片直接换成上一个播放器（真机 2026-10-21：回主页几秒后变苹果音乐）。
       // 激活是幂等的，活动期间每拍都确认一次。
-      final active = await session.setActive(true);
+      if (!_guardCanRun(epoch)) return;
+      final active = await _port.setActive(true);
+      if (!_guardCanRun(epoch)) {
+        await _releaseAfterStaleGuard();
+        return;
+      }
       if (!active) debugPrint('[锁屏控制] 会话重新激活失败');
       // 2026-10-21 实验结论：后台每 3 秒做一次完整「重新认领」（钉会话 +
       // 重写 Now Playing + 拿回遥控）**抢不回卡片** —— 系统一旦把「正在播放」
@@ -88,77 +246,115 @@ class AudioSessionHandler implements NowPlayingGuard {
     }
   }
 
-  Future<bool> setActive(bool active) async {
+  Future<void> _releaseAfterStaleGuard() async {
+    if (!_externalInterruption) return;
+    try {
+      await _port.setActive(
+        false,
+        avAudioSessionSetActiveOptions:
+            AVAudioSessionSetActiveOptions.notifyOthersOnDeactivation,
+      );
+    } catch (_) {
+      // The interruption may already have deactivated the session.
+    }
+  }
+
+  Future<bool> setActive(
+    bool active, {
+    AVAudioSessionSetActiveOptions? avAudioSessionSetActiveOptions,
+  }) async {
     // 构造是同步的、initSession 是异步的；不等它就可能撞上 `late session`。
     await _ready;
     try {
-      return await session.setActive(active);
+      final options = !active && _isIOS
+          ? avAudioSessionSetActiveOptions ??
+                AVAudioSessionSetActiveOptions.notifyOthersOnDeactivation
+          : avAudioSessionSetActiveOptions;
+      return await _port.setActive(
+        active,
+        avAudioSessionSetActiveOptions: options,
+      );
     } catch (e) {
-      if (Platform.isIOS) debugPrint('[锁屏控制] setActive($active) 失败: $e');
+      if (_isIOS) debugPrint('[锁屏控制] setActive($active) 失败: $e');
       rethrow;
     }
   }
 
-  AudioSessionHandler() {
-    _ready = initSession();
-  }
-
   Future<void> initSession() async {
-    session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration.music());
+    await _port.ready;
+    await _port.configureMusic();
 
-    session.interruptionEventStream.listen((event) {
-      final playerStatus = PlPlayerController.getPlayerStatusIfExists();
-      // final player = PlPlayerController.getInstance();
-      if (event.begin) {
-        if (playerStatus != PlayerStatus.playing) return;
-        // if (!player.playerStatus.playing) return;
-        switch (event.type) {
-          case AudioInterruptionType.duck:
-            PlPlayerController.setVolumeIfExists(
-              (PlPlayerController.getVolumeIfExists() ?? 0) * 0.5,
-              showIndicator: false,
-            );
-            // player.setVolume(player.volume.value * 0.5);
-            break;
-          case AudioInterruptionType.pause:
-            PlPlayerController.pauseIfExists(isInterrupt: true);
-            // player.pause(isInterrupt: true);
-            _playInterrupted = true;
-            break;
-          case AudioInterruptionType.unknown:
-            PlPlayerController.pauseIfExists(isInterrupt: true);
-            // player.pause(isInterrupt: true);
-            _playInterrupted = true;
-            break;
-        }
-      } else {
-        switch (event.type) {
-          case AudioInterruptionType.duck:
-            PlPlayerController.setVolumeIfExists(
-              (PlPlayerController.getVolumeIfExists() ?? 0) * 2,
-              showIndicator: false,
-            );
-            // player.setVolume(player.volume.value * 2);
-            break;
-          case AudioInterruptionType.pause:
-            if (_playInterrupted) PlPlayerController.playIfExists();
-            //player.play();
-            break;
-          case AudioInterruptionType.unknown:
-            break;
-        }
-        _playInterrupted = false;
-      }
-    });
+    _port.interruptionEvents.listen(_handleInterruption);
 
     // 耳机拔出暂停
-    session.becomingNoisyEventStream.listen((_) {
-      PlPlayerController.pauseIfExists();
-      // final player = PlPlayerController.getInstance();
-      // if (player.playerStatus.playing) {
-      //   player.pause();
-      // }
-    });
+    _port.becomingNoisyEvents.listen((_) => _actions.pauseForNoisyRoute());
+  }
+
+  void _handleInterruption(AudioInterruptionEvent event) {
+    if (event.begin) {
+      _suspendNowPlayingGuardForInterruption();
+      final playerStatus = _actions.playerStatus;
+      if (playerStatus != PlayerStatus.playing) return;
+      switch (event.type) {
+        case AudioInterruptionType.duck:
+          _actions.duckVolume(true);
+        case AudioInterruptionType.pause || AudioInterruptionType.unknown:
+          _actions.pauseAsInterruption();
+          _playInterrupted = true;
+      }
+      return;
+    }
+
+    _externalInterruption = false;
+    switch (event.type) {
+      case AudioInterruptionType.duck:
+        _actions.duckVolume(false);
+      case AudioInterruptionType.pause:
+        if (_playInterrupted) _actions.resumeAfterInterruption();
+      case AudioInterruptionType.unknown:
+        break;
+    }
+    _playInterrupted = false;
+    if (_shouldResumeGuardAfterInterruption()) {
+      _ensureNowPlayingGuard();
+      debugPrint('[锁屏控制] 中断结束，恢复会话守卫');
+    }
+  }
+
+  void _suspendNowPlayingGuardForInterruption() {
+    if (_externalInterruption) return;
+    _externalInterruption = true;
+    _guardEpoch++;
+    _mixGuard?.cancel();
+    _mixGuard = null;
+    debugPrint('[锁屏控制] 外部音频中断，停止重抢会话');
+    if (!_isIOS) return;
+    unawaited(_releaseAudioSessionForInterruption());
+  }
+
+  Future<void> _releaseAudioSessionForInterruption() async {
+    try {
+      final active = await setActive(
+        false,
+        avAudioSessionSetActiveOptions:
+            AVAudioSessionSetActiveOptions.notifyOthersOnDeactivation,
+      );
+      debugPrint(
+        active ? '[锁屏控制] 会话已让出（notifyOthersOnDeactivation）' : '[锁屏控制] 会话本来已不活跃',
+      );
+    } catch (e) {
+      debugPrint('[锁屏控制] 让出音频会话失败: $e');
+    }
+  }
+
+  bool _shouldResumeGuardAfterInterruption() {
+    if (_guardHolders.isEmpty) return false;
+    if (_actions.playerStatus == PlayerStatus.playing) return true;
+    return switch (WidgetsBinding.instance.lifecycleState) {
+      AppLifecycleState.paused ||
+      AppLifecycleState.hidden ||
+      AppLifecycleState.detached => false,
+      _ => true,
+    };
   }
 }

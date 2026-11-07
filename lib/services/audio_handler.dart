@@ -95,17 +95,34 @@ List<MediaControl> buildMediaControls({
 }
 
 class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
+  VideoPlayerServiceHandler({
+    bool? enableBackgroundPlay,
+    bool? isIOS,
+    bool? enableDiagnostics,
+  }) : _isIOS = isIOS ?? Platform.isIOS,
+       _enableDiagnostics = enableDiagnostics ?? true,
+       enableBackgroundPlay =
+           enableBackgroundPlay ??
+           ((isIOS ?? Platform.isIOS)
+               ? Pref.continuePlayInBackground
+               : Pref.enableBackgroundPlay);
+
   static final List<MediaItem> _item = [];
 
   /// 由 service locator 在 AudioSessionHandler 建好后注入。
   NowPlayingGuard? nowPlayingGuard;
   // iOS 上设置里已把「后台音频服务」并进「后台播放」，这里跟着同一个开关走。
-  bool enableBackgroundPlay = Platform.isIOS
-      ? Pref.continuePlayInBackground
-      : Pref.enableBackgroundPlay;
+  bool enableBackgroundPlay;
+  final bool _isIOS;
+  final bool _enableDiagnostics;
 
   /// 后台播放关着时，也缓存当前媒体条目，供退后台宽限卡片用。
   MediaItem? _lastKnownMediaItem;
+
+  @visibleForTesting
+  void debugSetLastKnownMediaItem(MediaItem item) {
+    _lastKnownMediaItem = item;
+  }
 
   /// 宽限卡片是否亮着（后台播放关着、退后台后）。
   ///
@@ -147,12 +164,13 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   ///
   /// 后台播放关着时 mpv 一停音频，iOS 一两秒内就把 App 冻住（真机 2026-10-23：
   /// 退后台 0.3 秒那行就是最后一行，4 分半后回前台所有定时器才一起补跑）。
-  /// 不申请这条断言，会话守卫和探针连头几秒都撑不过，用户在卡上按播放时
-  /// 也得先把 App 唤醒。
+  /// 不申请这条断言，宽限卡状态和探针连头几秒都撑不过，用户在卡上按播放时
+  /// 也得先把 App 唤醒。会话守卫不在这里启动，避免和录音抢麦克风。
   ///
   /// 真机实测（+5614）：这笔额度只有 ~30 秒，t+15000 的探针在、t+30000 的是
   /// 最后一行；到期 App 被挂起，iOS 收走音频会话，锁屏上的卡也跟着消失。
   void _beginGraceTask() {
+    if (!_enableDiagnostics) return;
     // 把额度长度一起带过去：原生靠这个期限决定到期还要不要续任务（实测
     // 续了也换不来第二段 30 秒，这个 60 秒如今只是上限）。
     _probeChannel
@@ -167,12 +185,14 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   }
 
   void _endGraceTask() {
+    if (!_enableDiagnostics) return;
     _probeChannel.invokeMethod<void>('endGrace').catchError((Object e) {
       debugPrint('宽限卡: 后台任务结束失败 $e');
     });
   }
 
   void _probeNowPlaying(String label) {
+    if (!_enableDiagnostics) return;
     _probeChannel
         .invokeMethod<Map<dynamic, dynamic>>('snapshot')
         .timeout(const Duration(milliseconds: 500))
@@ -218,9 +238,6 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
       _graceBackgroundPlay = true;
       // 马上要真的出声了，音频本身就能把 App 撑住，后台执行时间可以还回去。
       _endGraceTask();
-      // 宽限期间开的会话守卫到此为止，接下去由真实播放态（stream.playing）
-      // 重新认领，别让它残留成永久定时器。
-      nowPlayingGuard?.stop(this);
       PlPlayerController.instance?.activateBackgroundPlayFromGrace();
     }
     return onPlay?.call() ??
@@ -379,7 +396,7 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
   /// 主动收卡只在回前台（[cancelGrace]）和卡上按播放（[play]）两个入口发生；
   /// 但 App 被挂起后系统会自己收走，实测寿命 ≈ 后台额度 30 秒。
   void showGraceCard({required Duration position}) {
-    if (!Platform.isIOS) return;
+    if (!_isIOS) return;
     if (enableBackgroundPlay || _graceActive) {
       debugPrint(
         '宽限卡: 跳过（后台播放 $enableBackgroundPlay / 已在宽限 $_graceActive）',
@@ -398,10 +415,9 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     _iosPlaybackClaim = false;
     // 先把后台执行时间要下来，否则下面这些状态推完没多久 App 就被冻住了。
     _beginGraceTask();
-    // 亮卡期间盯住音频会话：mpv 起音频输出时会把会话改回混音、退后台暂停后
-    // iOS 也可能把会话 deactivate，任一下都会让系统卡片整个消失。守卫每秒把
-    // 会话重新钉成独占 + active，卡片才稳得住。
-    nowPlayingGuard?.start(this);
+    // 暂停卡不是正在播放的音频，不能持有会话守卫。否则微信开始录音后，守卫会
+    // 每秒把 Playback 会话重新激活，把录音反复打断；麦克风兼容优先，卡片仅在
+    // 系统允许时保留。
     _item.add(item);
     setMediaItem(item);
     _lastPos = position;
@@ -425,12 +441,14 @@ class VideoPlayerServiceHandler extends BaseAudioHandler with SeekHandler {
     // 诊断：看系统侧是什么样（info 有没有写进去、会话类别、遥控中心、
     // App 有没有被挂起）。15s/30s/45s 还有探针 = 后台任务续上了、App 没被冻住。
     _probeNowPlaying('t+0');
-    for (final ms in [300, 1200, 3000, 6000, 15000, 30000, 45000]) {
-      _probeTimers.add(
-        Timer(Duration(milliseconds: ms), () => _probeNowPlaying('t+$ms')),
-      );
+    if (_enableDiagnostics) {
+      for (final ms in [300, 1200, 3000, 6000, 15000, 30000, 45000]) {
+        _probeTimers.add(
+          Timer(Duration(milliseconds: ms), () => _probeNowPlaying('t+$ms')),
+        );
+      }
     }
-    if (_kRepushExperiment) {
+    if (_kRepushExperiment && _enableDiagnostics) {
       _probeTimers.add(
         Timer(const Duration(milliseconds: 1500), () {
           // 原生只在字段真变时才重赋 nowPlayingInfo（AudioServicePlugin.m:300），

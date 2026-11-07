@@ -1,6 +1,18 @@
 import 'package:PiliPlus/services/audio_handler.dart';
+import 'package:PiliPlus/services/now_playing_guard.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+class _FakeNowPlayingGuard implements NowPlayingGuard {
+  int starts = 0;
+  int stops = 0;
+
+  @override
+  void start(Object holder) => starts++;
+
+  @override
+  void stop(Object holder) => stops++;
+}
 
 void main() {
   List<MediaAction> actions({
@@ -106,5 +118,29 @@ void main() {
       ),
       [MediaAction.play],
     );
+  });
+
+  testWidgets('宽限卡不再占用会话守卫', (tester) async {
+    final guard = _FakeNowPlayingGuard();
+    final handler =
+        VideoPlayerServiceHandler(
+            enableBackgroundPlay: false,
+            isIOS: true,
+            enableDiagnostics: false,
+          )
+          ..nowPlayingGuard = guard
+          ..debugSetLastKnownMediaItem(
+            const MediaItem(
+              id: 'video',
+              title: 'test',
+              duration: Duration(seconds: 100),
+            ),
+          )
+          ..showGraceCard(position: const Duration(seconds: 12));
+
+    expect(guard.starts, 0);
+    expect(handler.playbackState.value.playing, isFalse);
+
+    handler.cancelGrace();
   });
 }

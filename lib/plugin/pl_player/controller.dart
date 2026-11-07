@@ -3570,14 +3570,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 退后台宽限窗：亮一张暂停卡片（后台播放关着时）。
   void showBackgroundGraceCard() {
     if (!Platform.isIOS) return;
-    // 退后台那一刻 mpv 可能已停下音频输出、Now Playing guard 也歇了；先把会话
-    // 重新激活（fire-and-forget），卡片才推得上去。失败不影响主流程。
-    audioSessionHandler
-        ?.setActive(true)
-        .then(
-          (ok) => debugPrint(ok ? '宽限卡: 会话已激活' : '宽限卡: 会话激活失败'),
-          onError: (Object e) => debugPrint('宽限卡: 会话激活异常 $e'),
-        );
+    // 这里不再重新激活音频会话。暂停卡若因此被系统收走可以接受；反过来重新
+    // 激活会让微信录音被本应用反复打断，直到宽限后台任务耗尽。
     videoPlayerServiceHandler?.showGraceCard(
       position: _videoPlayerController?.state.position ?? Duration.zero,
     );
